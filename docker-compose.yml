@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: llm_gateway
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d llm_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # 仅本地开发需要直连数据库；生产环境删除此映射
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  gateway:
+    # 运行时镜像：本机 cargo build --release 后打包（见 Dockerfile.runtime / scripts/deploy-local-binary.sh）
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    ports:
+      - "8443:443"
+      - "8080:80"
+    environment:
+      # 覆盖 .env 中的本机开发地址/连接串（容器内必须 0.0.0.0 才能端口映射；DB 走 compose 网络）
+      GATEWAY_DATABASE_URL: postgres://gateway:gateway@postgres:5432/llm_gateway
+      GATEWAY_TLS_CERT: /certs/cert.pem
+      GATEWAY_TLS_KEY: /certs/key.pem
+      GATEWAY_HTTPS_ADDR: 0.0.0.0:443
+      GATEWAY_HTTP_ADDR: 0.0.0.0:80
+      # 容器内 https 端口是 443，但外部映射 8443 → 重定向 Location 用外部端口
+      GATEWAY_REDIRECT_HTTPS_PORT: 8443
+      # true = 8080 仅 301 重定向到 https；false = 8080 直接服务明文应用（测试/内网用）
+      GATEWAY_HTTP_REDIRECT: "false"
+      # 覆盖 .env 的 127.0.0.1:3890（容器内环回不是宿主机）
+      LDAP_URL: ldap://host.docker.internal:3890
+    env_file: .env
+    volumes:
+      - ./certs:/certs:ro
+    # 容器内访问宿主机服务（mock 上游 9001、LDAP 3890）统一走 host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 可选：冒烟测试/演示用的 OpenLDAP（osixia 镜像内置 memberOf overlay）
+  # 启用后：docker-compose --profile ldap up -d ldap && bash scripts/seed-ldap.sh
+  # 注意：osixia 启动脚本会消费并删除挂载的 bootstrap ldif（sed -i/rm），
+  # 因此种子数据用 seed-ldap.sh 显式导入，不在 compose 中挂载。
+  ldap:
+    image: osixia/openldap:1.5.0
+    profiles: ["ldap"]
+    environment:
+      LDAP_ORGANISATION: Example
+      LDAP_DOMAIN: example.org
+      LDAP_ADMIN_PASSWORD: adminpw
+      # 冒烟环境用明文 ldap://（osixia 镜像 TLS 模板与自定义 ldif 挂载冲突）
+      LDAP_TLS: "false"
+    ports:
+      - "127.0.0.1:3890:389"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

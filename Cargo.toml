@@ -1,0 +1,34 @@
+[package]
+name = "llm_gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-none", "postgres", "migrate", "macros", "chrono", "uuid"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+aes-gcm = "0.10"
+rand = "0.8"
+thiserror = "2"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+tokio-rustls = "0.26"
+tower-service = "0.3"
+futures-util = "0.3"
+parking_lot = "0.12"
+bytes = "1"
+jsonwebtoken = "9"
+argon2 = "0.5"
+ldap3 = { version = "0.11", default-features = false, features = ["tls-rustls"] }

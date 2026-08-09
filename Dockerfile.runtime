@@ -1,0 +1,10 @@
+# 运行时镜像：仅打包本机编译产物（glibc 2.39 与宿主机 Ubuntu 24.04 匹配）
+# 用法: cargo build --release && docker-compose up -d --build gateway
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY target/release/llm_gateway /usr/local/bin/llm_gateway
+COPY web/dist /app/web/dist
+ENV GATEWAY_WEB_DIR=/app/web/dist
+EXPOSE 443 80
+ENTRYPOINT ["llm_gateway"]

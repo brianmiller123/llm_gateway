@@ -1,0 +1,34 @@
+# OpenLDAP 冒烟测试种子数据（手动导入：docker cp + ldapadd，见 scripts/seed-ldap.sh）
+# 用户：alice / alicepw（普通用户），bob / bobpw（admins 组成员）
+# 组：admins（groupOfNames；osixia 镜像内置 memberOf overlay 自动维护）
+
+dn: ou=people,dc=example,dc=org
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=example,dc=org
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=alice,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Example
+sn: Example
+givenName: Alice
+mail: alice@example.org
+userPassword: alicepw
+
+dn: uid=bob,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Example
+sn: Example
+givenName: Bob
+mail: bob@example.org
+userPassword: bobpw
+
+dn: cn=admins,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: admins
+member: uid=bob,ou=people,dc=example,dc=org

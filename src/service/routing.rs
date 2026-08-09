@@ -1,0 +1,60 @@
+use crate::state::AppState;
+use crate::store::upstream::ModelRoute;
+
+/// 路由匹配：精确命中优先；无精确命中时按 priority 升序取首个通配命中（routes 已按 priority,id 排序）
+pub fn resolve_route<'a>(routes: &'a [ModelRoute], model: &str) -> Option<&'a ModelRoute> {
+    routes
+        .iter()
+        .find(|r| r.model_pattern == model)
+        .or_else(|| routes.iter().find(|r| matches_pattern(&r.model_pattern, model)))
+}
+
+/// 通配匹配：仅支持尾缀 `*`（与路由规则同语义）；精确相等也命中
+pub fn matches_pattern(pattern: &str, model: &str) -> bool {    if let Some(prefix) = pattern.strip_suffix('*') {
+        model.starts_with(prefix)
+    } else {
+        pattern == model
+    }
+}
+
+/// 用户访问授权判定（白名单）：
+/// - admin 用户不受限
+/// - 用户无任何规则 = 默认放行（兼容既有账号）
+/// - 有规则：命中任一 (provider_id IS NULL=任意, model_pattern IS NULL=全部模型) 组合即放行
+pub fn user_can_use(st: &AppState, user_id: i64, provider_id: i64, model: &str) -> bool {
+    let access = st.user_access.read();
+    let Some(rules) = access.get(&user_id) else {
+        return true;
+    };
+    if rules.is_empty() {
+        return true;
+    }
+    rules.iter().any(|r| {
+        (r.provider_id.is_none() || r.provider_id == Some(provider_id))
+            && (r.model_pattern.is_none()
+                || r.model_pattern
+                    .as_deref()
+                    .is_some_and(|p| matches_pattern(p, model)))
+    })
+}
+
+/// 计算计费金额：cost = in/1e6 * p_in + out/1e6 * p_out；无单价记 0
+pub fn compute_cost(
+    st: &AppState,
+    model: &str,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+) -> f64 {
+    let prices = st.prices.read();
+    let Some(price) = prices.get(model) else {
+        return 0.0;
+    };
+    let mut cost = 0.0;
+    if let (Some(t), Some(p)) = (input_tokens, price.input_price_per_m) {
+        cost += t as f64 / 1e6 * p;
+    }
+    if let (Some(t), Some(p)) = (output_tokens, price.output_price_per_m) {
+        cost += t as f64 / 1e6 * p;
+    }
+    cost
+}

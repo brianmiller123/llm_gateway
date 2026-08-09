@@ -1,0 +1,14 @@
+# 构建上下文瘦身
+.git
+target
+!target/release/llm_gateway
+certs
+.env
+docs
+scripts
+node_modules
+web/node_modules
+web/dist
+!web/dist/index.html
+!web/dist/assets
+*.log
