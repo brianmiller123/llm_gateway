@@ -34,6 +34,17 @@ pub async fn find_by_id(pool: &PgPool, id: i64) -> Result<Option<UserRow>, sqlx:
         .await
 }
 
+/// 锁定用户行（与强制下线/重置密码的 token_version 更新串行化）
+pub async fn find_by_id_for_update(
+    conn: &mut sqlx::PgConnection,
+    id: i64,
+) -> Result<Option<UserRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+}
+
 /// 创建本地用户（控制台/管理员创建、break-glass 种子共用）
 pub async fn create_local_user(
     pool: &PgPool,
@@ -94,15 +105,6 @@ pub async fn touch_last_login(pool: &PgPool, user_id: i64) -> Result<(), sqlx::E
 pub async fn set_status(pool: &PgPool, user_id: i64, status: i16) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE users SET status = $1 WHERE id = $2")
         .bind(status)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// 强制下线：token_version + 1，使所有已签发 access token 失效
-pub async fn bump_token_version(pool: &PgPool, user_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
         .bind(user_id)
         .execute(pool)
         .await?;

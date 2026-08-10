@@ -58,10 +58,15 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Unauthorized("invalid username or password".into()))?;
-    let Some(hash) = &user.password_hash else {
+    let Some(hash) = user.password_hash.clone() else {
         return Err(AppError::Unauthorized("invalid username or password".into()));
     };
-    if !session::verify_password(password, hash) {
+    let password = password.to_string();
+    // argon2 为纯 CPU 同步计算，移出 tokio worker 线程（防并发登录阻塞整个 runtime）
+    let ok = tokio::task::spawn_blocking(move || session::verify_password(&password, &hash))
+        .await
+        .map_err(AppError::internal)?;
+    if !ok {
         return Err(AppError::Unauthorized("invalid username or password".into()));
     }
     issue_session(st, user).await
@@ -89,26 +94,40 @@ async fn issue_session(st: &AppState, user: users::UserRow) -> Result<Session, A
     })
 }
 
-/// 刷新：校验旧 token（未吊销/未过期）→ 用户状态/版本 → 旋转（吊销旧的，发新的）
+/// 刷新：事务内原子旋转（条件吊销 + 用户行锁），并发刷新只有一个成功，
+/// 与强制下线（force_logout）串行化，防止已吊销 token 换发新会话。
 pub async fn refresh(st: &AppState, refresh_token: &str) -> Result<Session, AppError> {
     let hash = hex::encode(sha2::Sha256::digest(refresh_token.as_bytes()));
-    let row = tokens::find_active(&st.pool, &hash)
+    let mut tx = st.pool.begin().await.map_err(AppError::internal)?;
+    // 原子单次使用：仅当未吊销且未过期时才吊销并返回行
+    let row = tokens::revoke_if_active(&mut tx, &hash)
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Unauthorized("invalid or expired refresh token".into()))?;
-
-    let user = users::find_by_id(&st.pool, row.user_id)
+    // 锁定用户行：与 force_logout 的 token_version+1 串行化
+    let user = users::find_by_id_for_update(&mut tx, row.user_id)
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Unauthorized("user not found".into()))?;
     if user.status != 1 {
-        tokens::revoke(&st.pool, row.id).await.map_err(AppError::internal)?;
         return Err(AppError::Forbidden("account disabled".into()));
     }
 
-    // 旋转：旧 token 一次性
-    tokens::revoke(&st.pool, row.id).await.map_err(AppError::internal)?;
-    issue_session(st, user).await
+    let access_token = session::issue_access(&st.cfg.jwt_secret, &user, st.cfg.access_token_ttl)?;
+    let (refresh_token, refresh_hash) = session::new_refresh_token();
+    let expires_at = Utc::now() + chrono::Duration::seconds(st.cfg.refresh_token_ttl);
+    tokens::insert_tx(&mut tx, user.id, &refresh_hash, expires_at)
+        .await
+        .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    users::touch_last_login(&st.pool, user.id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Session {
+        access_token,
+        refresh_token,
+        user,
+    })
 }
 
 pub async fn logout(st: &AppState, refresh_token: &str) -> Result<(), AppError> {

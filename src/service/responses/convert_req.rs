@@ -117,11 +117,27 @@ fn validate_unsupported_fields(req: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// instructions → 文本：string 原样；parts 数组拼接各 part 的 text（与 content 同语义）；
+/// 其余类型回退为 JSON 文本。
+fn instructions_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
 /// instructions + input → messages
 fn request_messages_to_chat(req: &Value) -> Result<Vec<MessageOut>, String> {
     let mut messages: Vec<MessageOut> = Vec::new();
     if let Some(instructions) = raw_present(req.get("instructions")) {
-        let text = value_to_string(instructions);
+        // instructions 支持 string 或 content parts 数组：数组扁平化为文本
+        // （原 value_to_string 会把数组序列化成字面 JSON 当 system prompt）
+        let text = instructions_text(instructions);
         if !text.trim().is_empty() {
             messages.push(MessageOut {
                 role: "system".into(),
@@ -191,12 +207,18 @@ fn input_item_to_chat_messages(item: &Value, mut messages: Vec<MessageOut>) -> R
             });
         }
         _ => {
+            // 无 content 的 item（reasoning / web_search_call / computer_call 等）在
+            // responses→chat 回传场景中跳过，避免生成空 content 的 user 消息
+            // （上游会对空消息 400，或污染会话顺序）
+            let Some(content) = item.get("content") else {
+                return Ok(messages);
+            };
             let role = item
                 .get("role")
                 .and_then(|r| r.as_str())
                 .filter(|r| !r.trim().is_empty())
                 .unwrap_or("user");
-            let content = input_content_to_chat_content(item.get("content"))?;
+            let content = input_content_to_chat_content(Some(content))?;
             messages.push(MessageOut {
                 role: role.to_string(),
                 content: Some(content),

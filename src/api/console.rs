@@ -148,9 +148,17 @@ struct LoginReq {
 async fn login(
     State(st): State<AppState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<impl IntoResponse, AppError> {
-    // 暴力破解防护：每用户名 10 次/分 + 每 IP 30 次/分（成功后重置计数）
+    // 暴力破解防护：每用户名 10 次/分 + 每来源 IP 30 次/分（成功后重置计数）
+    // 反代部署下对端地址是 Nginx，IP 桶用 X-Forwarded-For 首值（假定可信反代）
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next().map(str::trim))
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .unwrap_or(addr.ip());
     let username = req.username.trim().to_string();
     if let Err(secs) = st
         .limiter
@@ -160,14 +168,14 @@ async fn login(
     }
     if let Err(secs) = st
         .limiter
-        .check(&format!("login:ip:{}", addr.ip()), 30.0, 30.0)
+        .check(&format!("login:ip:{client_ip}"), 30.0, 30.0)
     {
         return Err(AppError::RateLimited(secs));
     }
     let session = console::login(&st, &req.username, &req.password).await?;
     // 登录成功：重置失败计数（令牌桶直接清空）
     st.limiter.reset(&format!("login:user:{username}"));
-    st.limiter.reset(&format!("login:ip:{}", addr.ip()));
+    st.limiter.reset(&format!("login:ip:{client_ip}"));
     Ok(Json(json!({
         "access_token": session.access_token,
         "refresh_token": session.refresh_token,
@@ -995,7 +1003,13 @@ async fn create_user(
         .display_name
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let hash = crate::service::session::hash_password(&req.password);
+    let password = req.password.clone();
+    // argon2 为纯 CPU 同步计算，移出 tokio worker 线程
+    let hash = tokio::task::spawn_blocking(move || {
+        crate::service::session::hash_password(&password)
+    })
+    .await
+    .map_err(AppError::internal)?;
     let created = match users::create_local_user(
         &st.pool,
         &username,
@@ -1088,10 +1102,8 @@ async fn force_logout(
     {
         return Err(AppError::BadRequest("user not found".into()));
     }
-    users::bump_token_version(&st.pool, id)
-        .await
-        .map_err(AppError::internal)?;
-    crate::store::tokens::revoke_all_for_user(&st.pool, id)
+    // 事务内 token_version+1 + 全量吊销 refresh token（与并发 refresh 的用户行锁串行化）
+    crate::store::force_logout(&st.pool, id)
         .await
         .map_err(AppError::internal)?;
     audit::log(
@@ -1130,15 +1142,18 @@ async fn reset_password(
     if req.password.len() < 8 {
         return Err(AppError::BadRequest("password must be at least 8 chars".into()));
     }
-    let hash = crate::service::session::hash_password(&req.password);
+    let password = req.password.clone();
+    // argon2 为纯 CPU 同步计算，移出 tokio worker 线程
+    let hash = tokio::task::spawn_blocking(move || {
+        crate::service::session::hash_password(&password)
+    })
+    .await
+    .map_err(AppError::internal)?;
     users::set_password_hash(&st.pool, id, &hash)
         .await
         .map_err(AppError::internal)?;
-    // 重置后强制重新登录
-    users::bump_token_version(&st.pool, id)
-        .await
-        .map_err(AppError::internal)?;
-    crate::store::tokens::revoke_all_for_user(&st.pool, id)
+    // 重置后强制重新登录（事务内 bump + 全量吊销）
+    crate::store::force_logout(&st.pool, id)
         .await
         .map_err(AppError::internal)?;
     audit::log(

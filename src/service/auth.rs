@@ -5,6 +5,17 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::store::keys::find_by_prefix;
 
+/// 常数时间字节比较（等长输入）
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// 提取并校验 Bearer API Key，返回 (user_id, api_key_id)
 ///
 /// auth_mode = None 时直接放行（本地开发）。
@@ -37,9 +48,9 @@ pub async fn authenticate(
         return Err(AppError::Auth("invalid api key".into()));
     };
 
-    // 常数时间比较哈希
+    // 常数时间比较哈希（长度固定 64 hex，防时序侧信道；原 != 为非常数时间）
     let digest = hex::encode(Sha256::digest(key.as_bytes()));
-    if digest != row.key_hash {
+    if !constant_time_eq(digest.as_bytes(), row.key_hash.as_bytes()) {
         tracing::warn!(prefix, "api key hash mismatch");
         return Err(AppError::Auth("invalid api key".into()));
     }

@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -16,6 +18,78 @@ use crate::service::usage;
 use crate::state::AppState;
 use crate::store::upstream::Provider;
 use crate::store::usage::{Usage, UsageMeta};
+
+/// 流式上游 body 空闲超时:连续 120s 无任何 chunk 即终止。
+/// 上游发完响应头后停流(半开连接/中间设备丢包)时,请求不再无限挂起,
+/// 由网关主动断流,避免客户端长时间无响应。
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 对流式上游响应体施加空闲超时;超时/上游错误统一映射为 Box<dyn Error> 流
+pub fn with_idle_timeout<S>(
+    inner: S,
+    idle: Duration,
+) -> impl Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    IdleTimeoutStream {
+        inner: Box::pin(inner),
+        idle,
+        wait: None,
+        timed_out: false,
+    }
+}
+
+/// 空闲超时包装流：每个 chunk 到达后重置 120s 计时器；超时以错误项终止
+struct IdleTimeoutStream<S> {
+    inner: Pin<Box<S>>,
+    idle: Duration,
+    wait: Option<Pin<Box<tokio::time::Sleep>>>,
+    timed_out: bool,
+}
+
+impl<S> Stream for IdleTimeoutStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    type Item = Result<Bytes, Box<dyn Error + Send + Sync>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // 全字段 Unpin（Pin<Box<S>> 亦 Unpin），get_mut 安全
+        let this = self.get_mut();
+        if this.timed_out {
+            return Poll::Ready(None);
+        }
+        if this.wait.is_none() {
+            this.wait = Some(Box::pin(tokio::time::sleep(this.idle)));
+        }
+        if let Some(wait) = &mut this.wait {
+            if wait.as_mut().poll(cx).is_ready() {
+                this.timed_out = true;
+                return Poll::Ready(Some(Err(Box::<dyn Error + Send + Sync>::from(
+                    "upstream stream idle timeout",
+                ))));
+            }
+        }
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                // 收到数据：重置空闲窗口
+                this.wait = Some(Box::pin(tokio::time::sleep(this.idle)));
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.wait = Some(Box::pin(tokio::time::sleep(this.idle)));
+                Poll::Ready(Some(Err(Box::<dyn Error + Send + Sync>::from(e))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
 
 /// 代理请求的端点描述
 #[derive(Debug, Clone, Copy)]
@@ -172,7 +246,7 @@ pub async fn proxy(
             let stream = crate::service::responses::stream::wrap_chat_stream_to_responses(
                 st.clone(),
                 meta,
-                resp.bytes_stream(),
+                with_idle_timeout(resp.bytes_stream(), STREAM_IDLE_TIMEOUT),
                 latency,
                 status.as_u16(),
                 format!("resp_{request_id}"),
@@ -191,7 +265,14 @@ pub async fn proxy(
         }
         // 非 2xx：不透传 usage 计费（错误体里的 usage 不可信），按真实状态记账、token 记 0
         let capture_usage = status.is_success();
-        let stream = wrap_stream(st.clone(), meta, resp.bytes_stream(), latency, status.as_u16(), capture_usage);
+        let stream = wrap_stream(
+            st.clone(),
+            meta,
+            with_idle_timeout(resp.bytes_stream(), STREAM_IDLE_TIMEOUT),
+            latency,
+            status.as_u16(),
+            capture_usage,
+        );
         tracing::info!(
             request_id = %request_id, model = %model, provider = %provider.name,
             streamed = true, status = %status, "proxying stream"
@@ -365,18 +446,64 @@ fn content_type_of(resp: &reqwest::Response) -> String {
         .to_string()
 }
 
+/// 客户端中断/流被丢弃时的兜底记账（与 tail 通过 recorded 标志互斥，只记一次）
+struct BillingOnDrop {
+    st: AppState,
+    meta: UsageMeta,
+    recorded: Arc<AtomicBool>,
+    captured: Arc<parking_lot::Mutex<Option<Usage>>>,
+    status: u16,
+    latency: i64,
+}
+
+impl Drop for BillingOnDrop {
+    fn drop(&mut self) {
+        if !self.recorded.swap(true, Ordering::SeqCst) {
+            let st = self.st.clone();
+            let meta = self.meta.clone();
+            let usage = self.captured.lock().take();
+            let status = self.status;
+            let latency = self.latency;
+            // 尽力而为：客户端中断后无法确认上游实际消耗，按已捕获 usage 记账
+            tokio::spawn(async move {
+                tracing::warn!(request_id = %meta.request_id, "stream dropped before completion; billing best-effort");
+                usage::record(&st, &meta, usage.as_ref(), status, latency).await;
+            });
+        }
+    }
+}
+
+/// 带兜底记账的透传流（BillingOnDrop 与流同生命周期）
+struct BillingStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>>,
+    _billing: BillingOnDrop,
+}
+
+impl Stream for BillingStream {
+    type Item = Result<Bytes, Box<dyn Error + Send + Sync>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // BillingStream 全字段 Unpin，get_mut 安全
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
 /// 流式透传 + 流内 usage 捕获与记账：
 /// - capture_usage = true（上游 2xx）：捕获到 usage 或 [DONE] 时立即记账（仅一次），字节流原样透传
 /// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
-/// - 流异常中断时由 chain 兜底记账（usage 未知）
+/// - 流异常中断时由 chain 兜底记账（usage 未知）；客户端断开由 BillingOnDrop 兜底
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
-    upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    upstream: impl Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send + 'static,
     latency: i64,
     record_status: u16,
     capture_usage: bool,
-) -> impl Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send {
+) -> BillingStream {
     let recorded = Arc::new(AtomicBool::new(false));
     let captured: Arc<parking_lot::Mutex<Option<Usage>>> = Arc::new(parking_lot::Mutex::new(None));
     let buf: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -394,7 +521,7 @@ fn wrap_stream(
             let st = st.clone();
             let meta = meta.clone();
             async move {
-                let chunk = chunk.map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
+                let chunk = chunk?;
                 let (usage, done) = if capture_usage {
                     feed_sse(&mut buf.lock(), &chunk)
                 } else {
@@ -428,7 +555,17 @@ fn wrap_stream(
         }
     });
 
-    main.chain(tail)
+    BillingStream {
+        inner: Box::pin(main.chain(tail)),
+        _billing: BillingOnDrop {
+            st,
+            meta,
+            recorded,
+            captured,
+            status: record_status,
+            latency,
+        },
+    }
 }
 
 /// 从 OpenAI 兼容响应体解析 usage

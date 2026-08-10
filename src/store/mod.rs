@@ -10,6 +10,7 @@ pub mod users;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::crypto::encrypt;
@@ -18,6 +19,9 @@ use crate::crypto::encrypt;
 pub async fn init(cfg: &AppConfig) -> Result<PgPool, sqlx::Error> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
+        // 池满时快速失败而非挂约 30s（sqlx 默认 acquire_timeout）；取连接前校验健康
+        .acquire_timeout(Duration::from_secs(5))
+        .test_before_acquire(true)
         .connect(&cfg.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -34,7 +38,12 @@ async fn seed_admin(pool: &PgPool, cfg: &AppConfig) -> Result<(), sqlx::Error> {
     if users::has_local_admin(pool).await? {
         return Ok(());
     }
-    let hash = crate::service::session::hash_password(password);
+    let password = password.to_string();
+    let hash = tokio::task::spawn_blocking(move || {
+        crate::service::session::hash_password(&password)
+    })
+    .await
+    .map_err(|e| sqlx::Error::Protocol(format!("argon2 task failed: {e}")))?;
     users::create_local_user(pool, username, username, &hash, true).await?;
     tracing::info!("seeded local admin '{username}'");
     Ok(())
@@ -75,4 +84,22 @@ async fn seed(pool: &PgPool, cfg: &AppConfig) -> Result<(), sqlx::Error> {
         .await?;
     tracing::info!("seeded provider '{name}' at {base_url} with route '{pattern}'");
     Ok(())
+}
+
+/// 强制下线：token_version + 1 与全量吊销 refresh token 在同一事务。
+/// 与并发 refresh 的用户行锁（find_by_id_for_update）串行化，
+/// 防止新签发的 refresh token 在吊销之后插入而逃过强制下线。
+pub async fn force_logout(pool: &PgPool, user_id: i64) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }

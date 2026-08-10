@@ -203,8 +203,9 @@ async fn test_connection(
         config::replace_provider_models(&st.pool, pid, &models)
             .await
             .map_err(AppError::internal)?;
-        // 自动兜底路由立即生效（无需等 30s 周期重载）
-        let _ = st.reload().await;
+        // 自动兜底路由立即生效（无需等 30s 周期重载）；失败必须暴露：
+        // DB 已变更但内存未更新，静默会长期不一致
+        st.reload().await.map_err(AppError::internal)?;
         audit::log(
             &st.pool,
             Some(admin.0.id),
@@ -276,8 +277,8 @@ async fn refresh_models(State(st): State<AppState>, admin: Admin) -> Result<Resp
                 let count = config::replace_provider_models(&st.pool, pid, &models)
                     .await
                     .map_err(AppError::internal)?;
-                // 自动兜底路由立即生效（无需等 30s 周期重载）
-                let _ = st.reload().await;
+                // 自动兜底路由立即生效（无需等 30s 周期重载）；失败必须暴露
+                st.reload().await.map_err(AppError::internal)?;
                 audit::log(
                     &st.pool,
                     Some(admin.0.id),

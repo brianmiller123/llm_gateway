@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use parking_lot::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -28,9 +28,14 @@ impl RateLimiter {
     /// 检查并消耗一个令牌；失败返回需等待的秒数
     pub fn check(&self, key: &str, rpm: f64, burst: f64) -> Result<(), f64> {
         let mut map = self.buckets.lock();
-        // 简单防膨胀：满员时清空（代价：限流状态重置，可接受）
+        // 防膨胀：满员时先驱逐超过 1 小时未活动的桶；仍满才整体清空
+        // （整体清空会重置全部限流状态，攻击者可用随机 key 触发，故仅在驱逐无效时兜底）
         if map.len() >= MAX_BUCKETS {
-            map.clear();
+            let now = Instant::now();
+            map.retain(|_, b| now.duration_since(b.last) < Duration::from_secs(3600));
+            if map.len() >= MAX_BUCKETS {
+                map.clear();
+            }
         }
         let now = Instant::now();
         let bucket = map.entry(key.to_string()).or_insert(Bucket {

@@ -2,7 +2,7 @@ pub mod admin_config;
 pub mod console;
 pub mod v1;
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -24,6 +24,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         // SPA 深层路由（浏览器导航）→ index.html；API 未匹配路径 → JSON 404
         .fallback(spa_fallback)
+        // LLM 请求体（长上下文 prompt）可远超 axum 默认 2MB 限制，放宽到 32MB
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
 }
 

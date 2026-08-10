@@ -8,8 +8,10 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -687,19 +689,65 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
 // 流转换管线（代理接入点）
 // ---------------------------------------------------------------------------
 
+/// 客户端中断/流被丢弃时的兜底记账（与 tail 通过 recorded 标志互斥，只记一次）
+struct BillingOnDrop {
+    st: AppState,
+    meta: UsageMeta,
+    recorded: Arc<AtomicBool>,
+    state: Arc<Mutex<ChatToResponsesStreamState>>,
+    status: u16,
+    latency: i64,
+}
+
+impl Drop for BillingOnDrop {
+    fn drop(&mut self) {
+        if !self.recorded.swap(true, Ordering::SeqCst) {
+            let st = self.st.clone();
+            let meta = self.meta.clone();
+            let usage = self.state.lock().billing_usage();
+            let status = self.status;
+            let latency = self.latency;
+            // 尽力而为：客户端中断后按已累积的 usage 记账
+            tokio::spawn(async move {
+                tracing::warn!(request_id = %meta.request_id, "responses stream dropped before completion; billing best-effort");
+                crate::service::usage::record(&st, &meta, usage.as_ref(), status, latency).await;
+            });
+        }
+    }
+}
+
+/// 带兜底记账的转换流（BillingOnDrop 与流同生命周期）
+pub struct BillingStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>>,
+    _billing: BillingOnDrop,
+}
+
+impl Stream for BillingStream {
+    type Item = Result<Bytes, Box<dyn Error + Send + Sync>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // BillingStream 全字段 Unpin，get_mut 安全
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
 /// 上游 Chat SSE → 客户端 Responses SSE：
 /// - 逐帧解析 → `ChatToResponsesStreamState` 转换 → `event: {type}\ndata: {json}\n\n` 透传
 /// - 遇 `[DONE]` 立即补发终态事件并记账（usage 取自累积 chunk）
-/// - 流异常中断由尾帧兜底：补发终态事件 + 记账（usage 未知）
+/// - 流异常中断由尾帧兜底：补发终态事件 + 记账（usage 未知）；客户端断开由 BillingOnDrop 兜底
 pub fn wrap_chat_stream_to_responses(
     st: AppState,
     meta: UsageMeta,
-    upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    upstream: impl Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send + 'static,
     latency: i64,
     record_status: u16,
     response_id: String,
     model: String,
-) -> impl Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send {
+) -> BillingStream {
     let recorded = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
     let state: Arc<Mutex<ChatToResponsesStreamState>> =
@@ -721,7 +769,7 @@ pub fn wrap_chat_stream_to_responses(
             let state = state.clone();
             let parser = parser.clone();
             async move {
-                let chunk = chunk.map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
+                let chunk = chunk?;
                 let mut out: Vec<u8> = Vec::new();
                 let terminal = {
                     let mut parser = parser.lock();
@@ -799,7 +847,17 @@ pub fn wrap_chat_stream_to_responses(
         }
     });
 
-    main.chain(tail)
+    BillingStream {
+        inner: Box::pin(main.chain(tail)),
+        _billing: BillingOnDrop {
+            st,
+            meta,
+            recorded,
+            state,
+            status: record_status,
+            latency,
+        },
+    }
 }
 
 #[cfg(test)]

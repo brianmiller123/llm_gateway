@@ -117,7 +117,8 @@ pub fn chat_response_to_responses(
 /// finish_reason → (status, incomplete_details)
 pub fn finish_reason_to_status(finish_reason: &str) -> (String, Option<IncompleteDetailsOut>) {
     match finish_reason.trim() {
-        FINISH_REASON_LENGTH => (
+        // 兼容部分供应商的非标准截断变体（max_tokens/token_limit）
+        FINISH_REASON_LENGTH | "max_tokens" | "token_limit" => (
             "incomplete".into(),
             Some(IncompleteDetailsOut {
                 reason: INCOMPLETE_REASON_MAX_TOKENS.into(),
@@ -179,12 +180,12 @@ fn chat_tool_call_to_responses_output(tc: &Value, response_id: &str, index: usiz
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
-    // arguments 以 JSON 字符串输出（`"{\"city\":\"Paris\"}"`）
+    // arguments 以 JSON 字符串输出（`"{\"city\":\"Paris\"}"`）；
+    // 部分上游发 object 形态，用 arguments_string 序列化（原实现直接丢弃）
     let arguments = tc
         .pointer("/function/arguments")
-        .and_then(|a| a.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(super::dto::arguments_string)
+        .unwrap_or_default();
 
     ResponsesOutputOut {
         r#type: if tool_type.is_empty() || tool_type == "function" {

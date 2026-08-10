@@ -236,7 +236,7 @@ pub async fn update_rate_rule(
     sqlx::query_as::<_, AdminRateRule>(
         "UPDATE rate_limit_rules SET \
             scope = COALESCE($2, scope), \
-            scope_id = CASE WHEN $8 THEN $3 ELSE scope_id END, \
+            scope_id = CASE WHEN $7 THEN $3 ELSE scope_id END, \
             rpm = COALESCE($4, rpm), \
             burst = COALESCE($5, burst), \
             enabled = COALESCE($6, enabled), \
@@ -250,7 +250,7 @@ pub async fn update_rate_rule(
     .bind(rpm)
     .bind(burst)
     .bind(enabled)
-    .bind(scope_id.is_some()) // $8：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
+    .bind(scope_id.is_some()) // $7：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
     .fetch_optional(pool)
     .await
 }
@@ -451,11 +451,22 @@ pub async fn replace_provider_models(
         {
             continue;
         }
-        sqlx::query("INSERT INTO model_routes (model_pattern, provider_id) VALUES ($1, $2)")
-            .bind(m)
-            .bind(provider_id)
-            .execute(&mut *tx)
-            .await?;
+        // 复用同 provider 已禁用的精确路由（避免重复行），否则新建
+        let res = sqlx::query(
+            "UPDATE model_routes SET enabled = TRUE \
+             WHERE model_pattern = $1 AND provider_id = $2 AND enabled = FALSE",
+        )
+        .bind(m)
+        .bind(provider_id)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            sqlx::query("INSERT INTO model_routes (model_pattern, provider_id) VALUES ($1, $2)")
+                .bind(m)
+                .bind(provider_id)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     tx.commit().await?;
     Ok(models.len())

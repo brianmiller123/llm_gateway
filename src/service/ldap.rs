@@ -209,7 +209,10 @@ pub async fn test_connection(settings: &LdapSettings) -> Result<String, String> 
     }
 }
 
-/// 管理员判定：memberOf 精确 DN / CN 后缀匹配；无 memberOf 时补充组搜索
+/// 管理员判定：memberOf 命中即管理员；memberOf 缺失（目录未启用 overlay）时
+/// 对 groupOfNames 做补充搜索。目录已提供 memberOf 且无命中 → 直接判定非管理员
+/// （避免每次登录多开一条 LDAP 连接，也避免 10s+10s 超时叠加导致登录卡顿）。
+/// 搜索复用 authenticate 的外层 10s 总超时预算，不再单独包超时。
 async fn match_admin_groups(
     settings: &LdapSettings,
     member_of: &[String],
@@ -224,8 +227,8 @@ async fn match_admin_groups(
         .map(|g| {
             g.split(',')
                 .map(str::trim)
-                .find(|rdn| rdn.starts_with("cn="))
-                .map(|rdn| rdn.trim_start_matches("cn=").to_string())
+                .find(|rdn| rdn.to_ascii_lowercase().starts_with("cn="))
+                .map(|rdn| rdn[3..].to_string())
                 .unwrap_or_else(|| g.clone())
         })
         .collect();
@@ -235,14 +238,18 @@ async fn match_admin_groups(
             return Ok(true);
         }
     }
+    // CN 后缀匹配：逐 RDN 比较（原 ends_with 对嵌套 OU 的 DN 永远不命中）
     for m in member_of {
-        if cn_suffixes.iter().any(|cn| m.ends_with(&format!("cn={cn}"))) {
+        if dn_has_cn(m, &cn_suffixes) {
             return Ok(true);
         }
     }
+    // 目录已返回 memberOf 且无命中 → memberOf 为准，不再搜索
+    if !member_of.is_empty() {
+        return Ok(false);
+    }
 
-    // memberOf 未命中或目录未返回该属性：对 groupOfNames 做补充搜索
-    // （admin_groups 可能是完整 DN，只取其 CN 后缀做 (cn=...) 匹配）
+    // memberOf 缺失（未启用 overlay）：对 groupOfNames 做补充搜索
     let groups_filter = cn_suffixes
         .iter()
         .map(|cn| format!("(cn={cn})"))
@@ -266,9 +273,14 @@ async fn match_admin_groups(
         tracing::debug!(found = rs.0.len(), "admin group search result");
         Ok::<_, LdapError>(!rs.0.is_empty())
     };
-    match timeout(Duration::from_secs(10), search).await {
-        Ok(Ok(found)) => Ok(found),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(LdapError::Transport("LDAP group search timed out".into())),
-    }
+    // 外层 authenticate 已包 10s 总超时，此处直接 await（避免 10s+10s 叠加）
+    search.await
+}
+
+/// DN 是否含任一配置组 CN（逐 RDN 比较，大小写不敏感）
+fn dn_has_cn(dn: &str, cns: &[String]) -> bool {
+    cns.iter().any(|cn| {
+        let target = format!("cn={cn}");
+        dn.split(',').any(|rdn| rdn.trim().eq_ignore_ascii_case(&target))
+    })
 }

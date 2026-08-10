@@ -28,7 +28,8 @@ impl UsageCache {
     pub fn incr(&self, user_id: i64, month: &str, tokens: i64, cost: f64) {
         let mut map = self.monthly.lock();
         let e = map.entry((user_id, month.to_string())).or_insert((0, 0.0));
-        e.0 += tokens;
+        // 饱和加法防畸形 usage 把配额缓存拉成负数
+        e.0 = e.0.saturating_add(tokens);
         e.1 += cost;
     }
 

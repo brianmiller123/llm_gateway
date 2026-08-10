@@ -39,9 +39,9 @@ impl Usage {
         self.completion_tokens.or(self.output_tokens).unwrap_or(0)
     }
 
-    /// 全部 token（输入 + 输出）
+    /// 全部 token（输入 + 输出），饱和加法防畸形上游数值回绕
     pub fn total(&self) -> i64 {
-        self.input() + self.output()
+        self.input().saturating_add(self.output())
     }
 }
 
@@ -57,7 +57,8 @@ pub async fn record_usage(
     let (input, output) = usage
         .map(|u| (Some(u.input()), Some(u.output())))
         .unwrap_or((None, None));
-    let tokens = input.unwrap_or(0) + output.unwrap_or(0);
+    // 上游 usage 为外部输入，饱和加法防 i64 回绕为负
+    let tokens = input.unwrap_or(0).saturating_add(output.unwrap_or(0));
 
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -102,36 +103,45 @@ pub async fn record_usage(
 }
 
 /// 聚合任务：将增量 usage_logs 汇总进 usage_daily（水位线防重复）
+///
+/// 修复两个并发缺陷：
+/// 1. 漏计（单实例）：原实现 INSERT..SELECT 与 MAX(id) 在不同快照执行，
+///    期间新提交的行会被水位线跳过、永不聚合；改为单语句内取 MAX(id)（同一快照），
+///    水位线不可能越过本次实际聚合的最大 id。
+/// 2. 重复计（多实例）：水位行 FOR UPDATE 串行化并发聚合器。
 pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    let watermark: (i64,) = sqlx::query_as("SELECT watermark_id FROM aggregation_state WHERE id = 1")
-        .fetch_one(&mut *tx)
-        .await?;
+    // 串行化并发聚合器：后到者阻塞至此事务提交，读到新水位
+    let watermark: (i64,) = sqlx::query_as(
+        "SELECT watermark_id FROM aggregation_state WHERE id = 1 FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
 
+    // 单语句完成聚合 + 水位推进：整条语句共享同一快照
     sqlx::query(
-        "INSERT INTO usage_daily (user_id, model, stat_date, call_count, input_tokens, output_tokens, cost)
-         SELECT user_id, model, (created_at AT TIME ZONE 'UTC')::date,
-                COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost),0)
-         FROM usage_logs
-         WHERE id > $1
-         GROUP BY user_id, model, (created_at AT TIME ZONE 'UTC')::date
-         ON CONFLICT (user_id, model, stat_date) DO UPDATE SET
-           call_count    = usage_daily.call_count    + EXCLUDED.call_count,
-           input_tokens  = usage_daily.input_tokens  + EXCLUDED.input_tokens,
-           output_tokens = usage_daily.output_tokens + EXCLUDED.output_tokens,
-           cost          = usage_daily.cost          + EXCLUDED.cost",
+        "WITH m AS (\
+             SELECT COALESCE(MAX(id), $1) AS max_id FROM usage_logs\
+         ),\
+         agg AS (\
+             INSERT INTO usage_daily (user_id, model, stat_date, call_count, input_tokens, output_tokens, cost)\
+             SELECT user_id, model, (created_at AT TIME ZONE 'UTC')::date,\
+                    COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost),0)\
+             FROM usage_logs, m\
+             WHERE usage_logs.id > $1 AND usage_logs.id <= m.max_id\
+             GROUP BY user_id, model, (created_at AT TIME ZONE 'UTC')::date\
+             ON CONFLICT (user_id, model, stat_date) DO UPDATE SET\
+               call_count    = usage_daily.call_count    + EXCLUDED.call_count,\
+               input_tokens  = usage_daily.input_tokens  + EXCLUDED.input_tokens,\
+               output_tokens = usage_daily.output_tokens + EXCLUDED.output_tokens,\
+               cost          = usage_daily.cost          + EXCLUDED.cost\
+         )\
+         UPDATE aggregation_state SET watermark_id = (SELECT max_id FROM m) WHERE id = 1",
     )
     .bind(watermark.0)
     .execute(&mut *tx)
     .await?;
 
-    let max: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) FROM usage_logs")
-        .fetch_one(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE aggregation_state SET watermark_id = $1 WHERE id = 1")
-        .bind(max.0)
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await
 }

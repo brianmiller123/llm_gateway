@@ -237,7 +237,7 @@ impl Usage {
         self.completion_tokens.or(self.output_tokens).unwrap_or(0)
     }
     pub fn total(&self) -> i64 {
-        self.total_tokens.unwrap_or_else(|| self.input() + self.output())
+        self.total_tokens.unwrap_or_else(|| self.input().saturating_add(self.output()))
     }
 }
 
@@ -287,16 +287,17 @@ fn zero_completion_details() -> Value {
 }
 
 /// Chat `prompt_tokens_details` → Responses `input_tokens_details`（任一分量非零才携带）
+/// 仅当某已知分量值非零时才携带（原实现只匹配 key 前缀，全零 details 也会被搬运）
 fn nonzero_input_details(details: Option<&Value>) -> Option<Value> {
     let d = details?;
     let any_nonzero = match d {
         Value::Object(map) => map.iter().any(|(k, v)| {
-            k.starts_with("cached")
+            let known = k.starts_with("cached")
                 || k.starts_with("text")
                 || k.starts_with("audio")
                 || k.starts_with("image")
-                || k == "cache_write_tokens"
-                || v.as_i64().is_some_and(|n| n != 0)
+                || k == "cache_write_tokens";
+            known && v.as_i64().is_some_and(|n| n != 0)
         }),
         _ => false,
     };
