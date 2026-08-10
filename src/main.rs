@@ -76,7 +76,15 @@ async fn serve_https(app: Router, cfg: Arc<AppConfig>) -> Result<(), Box<dyn std
     tracing::info!("HTTPS listening on {}", cfg.https_addr);
 
     loop {
-        let (tcp, addr) = listener.accept().await?;
+        // accept 瞬时错误（EMFILE 等）只告警不退出，避免 HTTPS 服务整体挂掉
+        let (tcp, addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {

@@ -6,7 +6,7 @@ use crate::state::AppState;
 use crate::store::usage::{record_usage, Usage, UsageMeta};
 
 /// 月度用量计数缓存：key = (user_id, "YYYY-MM") → (tokens, cost)
-/// 记账事务提交后更新；配额预检查读取；30s 周期从 DB 重载兜底
+/// 记账事务提交后更新；配额预检查读取；启动/周期从 DB 重载兜底（防重启后配额清零）
 #[derive(Default)]
 pub struct UsageCache {
     monthly: Mutex<HashMap<(i64, String), (i64, f64)>>,
@@ -30,6 +30,23 @@ impl UsageCache {
         let e = map.entry((user_id, month.to_string())).or_insert((0, 0.0));
         e.0 += tokens;
         e.1 += cost;
+    }
+
+    /// 从 DB 全量重载当月计数（只覆盖不清理，避免并发 incr 在快照与写入之间丢失；
+    /// 条目数按 用户×月 增长，有界）。启动时与周期 reload 中调用。
+    pub async fn reload_from_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let month = chrono::Utc::now().format("%Y-%m").to_string();
+        let rows: Vec<(i64, i64, f64)> = sqlx::query_as(
+            "SELECT user_id, tokens, cost::float8 FROM user_monthly_usage WHERE month = $1",
+        )
+        .bind(&month)
+        .fetch_all(pool)
+        .await?;
+        let mut map = self.monthly.lock();
+        for (user_id, tokens, cost) in rows {
+            map.insert((user_id, month.clone()), (tokens, cost));
+        }
+        Ok(())
     }
 }
 

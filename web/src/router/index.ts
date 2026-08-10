@@ -45,6 +45,12 @@ const router = createRouter({
           component: () => import('@/views/Prices.vue'),
           meta: { title: '模型价格', admin: true },
         },
+        {
+          path: 'settings',
+          name: 'settings',
+          component: () => import('@/views/Settings.vue'),
+          meta: { title: '系统设置', admin: true },
+        },
       ],
     },
     { path: '/:pathMatch(.*)*', redirect: '/dashboard' },

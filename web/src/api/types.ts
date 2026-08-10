@@ -306,3 +306,27 @@ export interface ModelTestResp {
   ok: number
   failed: number
 }
+
+// ---------- 系统设置（LDAP） ----------
+
+export interface LdapSettingsResp {
+  url: string
+  starttls: boolean
+  bind_dn: string | null
+  base_dn: string
+  user_filter: string
+  admin_groups: string[]
+  /** bind 密码是否已保存（永不回显明文） */
+  has_password: boolean
+}
+
+export interface LdapSettingsInput {
+  url: string
+  starttls: boolean
+  bind_dn: string | null
+  /** 传空串 = 不修改已保存密码 */
+  bind_password: string
+  base_dn: string
+  user_filter: string
+  admin_groups: string[]
+}

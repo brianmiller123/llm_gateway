@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::AppError;
+use crate::service::ldap::LdapSettings;
 use crate::state::AppState;
 use crate::store::{audit, config, users};
 
@@ -77,7 +78,17 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/api/admin/models/test",
             post(test_models).layer(admin.clone()),
         )
-        .route("/api/admin/models/{id}", delete(delete_model).layer(admin))
+        .route(
+            "/api/admin/settings/ldap",
+            get(get_ldap_settings)
+                .put(put_ldap_settings)
+                .layer(admin.clone()),
+        )
+        .route("/api/admin/models/{id}", delete(delete_model).layer(admin.clone()))
+        .route(
+            "/api/admin/settings/ldap/test",
+            post(test_ldap_settings).layer(admin),
+        )
 }
 
 /// 管理员身份（require_admin 注入）
@@ -634,6 +645,28 @@ async fn create_route(
     if pattern.is_empty() || pattern.len() > 128 {
         return Err(AppError::BadRequest("model_pattern must be 1-128 chars".into()));
     }
+    // 主供应商与 fallback 必须存在（此前缺口：FK 违例直接 500）
+    if config::find_provider(&st.pool, req.provider_id)
+        .await
+        .map_err(AppError::internal)?
+        .is_none()
+    {
+        return Err(AppError::BadRequest(format!(
+            "provider {} not found",
+            req.provider_id
+        )));
+    }
+    for pid in &req.fallback_ids {
+        if config::find_provider(&st.pool, *pid)
+            .await
+            .map_err(AppError::internal)?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!(
+                "fallback provider {pid} not found"
+            )));
+        }
+    }
     let upstream_model = normalize_upstream_model(req.upstream_model.as_deref())?;
     let route = config::create_route(
         &st.pool,
@@ -678,6 +711,36 @@ async fn update_route(
     Path(id): Path<i64>,
     Json(req): Json<RoutePatch>,
 ) -> Result<Response, AppError> {
+    // 与 create 一致：pattern 长度/空值校验（此前缺口可写入空 pattern）
+    if let Some(p) = req.model_pattern.as_deref().map(str::trim) {
+        if p.is_empty() || p.len() > 128 {
+            return Err(AppError::BadRequest(
+                "model_pattern must be 1-128 chars".into(),
+            ));
+        }
+    }
+    if let Some(pid) = req.provider_id {
+        if config::find_provider(&st.pool, pid)
+            .await
+            .map_err(AppError::internal)?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!("provider {pid} not found")));
+        }
+    }
+    if let Some(ids) = req.fallback_ids.as_deref() {
+        for pid in ids {
+            if config::find_provider(&st.pool, *pid)
+                .await
+                .map_err(AppError::internal)?
+                .is_none()
+            {
+                return Err(AppError::BadRequest(format!(
+                    "fallback provider {pid} not found"
+                )));
+            }
+        }
+    }
     let upstream_model = req
         .upstream_model
         .map(|v| normalize_upstream_model(v.as_deref()))
@@ -791,6 +854,17 @@ async fn update_rate_limit(
     Path(id): Path<i64>,
     Json(req): Json<RateLimitPatch>,
 ) -> Result<Response, AppError> {
+    // 与 create 一致：更新同样校验（此前缺口可导致 rpm/burst <= 0 → 限流器除零/常拒）
+    if let Some(scope) = req.scope.as_deref().map(str::trim) {
+        if !matches!(scope, "global" | "user" | "api_key") {
+            return Err(AppError::BadRequest(
+                "scope must be global | user | api_key".into(),
+            ));
+        }
+    }
+    if req.rpm.is_some_and(|v| v <= 0) || req.burst.is_some_and(|v| v <= 0) {
+        return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
+    }
     let rule = config::update_rate_rule(
         &st.pool,
         id,
@@ -986,4 +1060,169 @@ async fn delete_price(
     .await
     .map_err(AppError::internal)?;
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ---------- 系统设置（LDAP） ----------
+
+/// GET 返回当前生效配置；bind 密码永不回显，仅暴露 has_password
+#[derive(serde::Serialize)]
+struct LdapSettingsResp {
+    url: String,
+    starttls: bool,
+    bind_dn: Option<String>,
+    base_dn: String,
+    user_filter: String,
+    admin_groups: Vec<String>,
+    has_password: bool,
+}
+
+/// PUT / test 请求体；bind_password 传空串 = 不修改（test 时回退现有密码）
+#[derive(Deserialize)]
+struct LdapSettingsReq {
+    url: String,
+    starttls: bool,
+    #[serde(default)]
+    bind_dn: Option<String>,
+    #[serde(default)]
+    bind_password: String,
+    base_dn: String,
+    user_filter: String,
+    #[serde(default)]
+    admin_groups: Vec<String>,
+}
+
+/// 校验并整理 LDAP 配置；返回 (settings, 是否需要写入新密码)
+fn validate_ldap_req(req: &LdapSettingsReq) -> Result<(LdapSettings, bool), AppError> {
+    let url = req.url.trim().to_string();
+    if !url.is_empty()
+        && !(url.starts_with("ldap://") || url.starts_with("ldaps://"))
+    {
+        return Err(AppError::BadRequest(
+            "LDAP URL 必须以 ldap:// 或 ldaps:// 开头".into(),
+        ));
+    }
+    if url.len() > 255 {
+        return Err(AppError::BadRequest("LDAP URL 过长".into()));
+    }
+    let user_filter = req.user_filter.trim().to_string();
+    // 过滤器必须保留 {0} 占位符，否则所有用户搜索都失败且难排查
+    if !url.is_empty() && !user_filter.contains("{0}") {
+        return Err(AppError::BadRequest(
+            "用户过滤器必须包含 {0} 占位符（登录名位置）".into(),
+        ));
+    }
+    if user_filter.len() > 255 {
+        return Err(AppError::BadRequest("用户过滤器过长".into()));
+    }
+    let admin_groups: Vec<String> = req
+        .admin_groups
+        .iter()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    Ok((
+        LdapSettings {
+            url: url.clone(),
+            starttls: req.starttls,
+            bind_dn: req
+                .bind_dn
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            bind_password: (!req.bind_password.is_empty())
+                .then(|| req.bind_password.clone()),
+            base_dn: req.base_dn.trim().to_string(),
+            user_filter,
+            admin_groups,
+        },
+        !req.bind_password.is_empty(),
+    ))
+}
+
+async fn get_ldap_settings(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
+    let db = config::load_ldap_settings(&st.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let has_password = !db.ldap_bind_password_enc.is_empty()
+        && crate::crypto::decrypt(&db.ldap_bind_password_enc, &st.cfg.master_key).is_ok();
+    let current = st.ldap.read().clone();
+    Ok(Json(json!(LdapSettingsResp {
+        url: current.url,
+        starttls: current.starttls,
+        bind_dn: current.bind_dn,
+        base_dn: current.base_dn,
+        user_filter: current.user_filter,
+        admin_groups: current.admin_groups,
+        has_password,
+    }))
+    .into_response())
+}
+
+async fn put_ldap_settings(
+    State(st): State<AppState>,
+    admin: Admin,
+    Json(req): Json<LdapSettingsReq>,
+) -> Result<Response, AppError> {
+    let (validated, new_password) = validate_ldap_req(&req)?;
+    let enc = if new_password {
+        Some(
+            crate::crypto::encrypt(
+                validated.bind_password.as_deref().unwrap_or("").as_bytes(),
+                &st.cfg.master_key,
+            )
+            .map_err(AppError::internal)?,
+        )
+    } else {
+        None
+    };
+    config::save_ldap_settings(
+        &st.pool,
+        &validated.url,
+        validated.starttls,
+        validated.bind_dn.as_deref().unwrap_or(""),
+        enc.as_deref(),
+        &validated.base_dn,
+        &validated.user_filter,
+        &validated.admin_groups,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    st.reload_ldap().await.map_err(AppError::internal)?;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "settings.ldap.update",
+        Some("settings"),
+        None,
+        Some(json!({
+            "ldap_enabled": !validated.url.is_empty(),
+            "admin_groups": validated.admin_groups.len()
+        })),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+/// 用表单实时值测试连接（未保存也可测）；密码留空回退已保存密码
+async fn test_ldap_settings(
+    State(st): State<AppState>,
+    _a: Admin,
+    Json(req): Json<LdapSettingsReq>,
+) -> Result<Response, AppError> {
+    let (mut validated, new_password) = validate_ldap_req(&req)?;
+    if !new_password {
+        let db = config::load_ldap_settings(&st.pool)
+            .await
+            .map_err(AppError::internal)?;
+        if !db.ldap_bind_password_enc.is_empty() {
+            validated.bind_password =
+                crate::crypto::decrypt(&db.ldap_bind_password_enc, &st.cfg.master_key).ok();
+        }
+    }
+    match crate::service::ldap::test_connection(&validated).await {
+        Ok(msg) => Ok(Json(json!({"ok": true, "message": msg})).into_response()),
+        Err(e) => Err(AppError::BadRequest(format!("LDAP 连接测试失败：{e}"))),
+    }
 }

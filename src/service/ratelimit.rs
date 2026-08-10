@@ -55,6 +55,11 @@ impl RateLimiter {
             Err((1.0 - bucket.tokens) / (bucket.rpm / 60.0))
         }
     }
+
+    /// 清除某 key 的桶（登录成功后重置失败计数）
+    pub fn reset(&self, key: &str) {
+        self.buckets.lock().remove(key);
+    }
 }
 
 /// 应用限流规则（api_key > user > global，命中即拒）

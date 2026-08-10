@@ -122,10 +122,10 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         }));
     };
 
-    // 1) 模型库（测试连接/手动刷新入库的模型）
+    // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商的模型
     let catalog: Vec<(String, i64)> = sqlx::query_as::<_, (String, i64)>(
         "SELECT m.model_id, m.provider_id FROM models m \
-         JOIN providers p ON p.id = m.provider_id",
+         JOIN providers p ON p.id = m.provider_id AND p.enabled",
     )
     .fetch_all(&st.pool)
     .await

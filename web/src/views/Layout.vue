@@ -48,6 +48,9 @@
             <el-menu-item index="/prices">
               <el-icon><Money /></el-icon><span>模型价格</span>
             </el-menu-item>
+            <el-menu-item index="/settings">
+              <el-icon><Setting /></el-icon><span>系统设置</span>
+            </el-menu-item>
           </el-sub-menu>
         </template>
       </el-menu>

@@ -88,6 +88,23 @@ impl AppConfig {
             other => return Err(format!("invalid GATEWAY_AUTH_MODE: {other}")),
         };
 
+        let reload_interval_secs: u64 = env("GATEWAY_RELOAD_INTERVAL", "30")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_RELOAD_INTERVAL: {e}"))?;
+        if reload_interval_secs == 0 {
+            // tokio::time::interval 对 0 周期会 panic
+            return Err("GATEWAY_RELOAD_INTERVAL must be >= 1 second".into());
+        }
+        let access_token_ttl: i64 = env("GATEWAY_ACCESS_TOKEN_TTL", "900")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_ACCESS_TOKEN_TTL: {e}"))?;
+        let refresh_token_ttl: i64 = env("GATEWAY_REFRESH_TOKEN_TTL", "2592000")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_REFRESH_TOKEN_TTL: {e}"))?;
+        if access_token_ttl <= 0 || refresh_token_ttl <= 0 {
+            return Err("GATEWAY_ACCESS/REFRESH_TOKEN_TTL must be > 0 seconds".into());
+        }
+
         Ok(Self {
             database_url: env(
                 "GATEWAY_DATABASE_URL",
@@ -111,9 +128,7 @@ impl AppConfig {
             tls_key: env("GATEWAY_TLS_KEY", "certs/key.pem"),
             master_key,
             auth_mode,
-            reload_interval_secs: env("GATEWAY_RELOAD_INTERVAL", "30")
-                .parse()
-                .map_err(|e| format!("invalid GATEWAY_RELOAD_INTERVAL: {e}"))?,
+            reload_interval_secs,
             web_dir: PathBuf::from(env("GATEWAY_WEB_DIR", "web/dist")),
             jwt_secret: {
                 let hex = env("GATEWAY_JWT_SECRET", "");
@@ -131,12 +146,8 @@ impl AppConfig {
                     out
                 }
             },
-            access_token_ttl: env("GATEWAY_ACCESS_TOKEN_TTL", "900")
-                .parse()
-                .map_err(|e| format!("invalid GATEWAY_ACCESS_TOKEN_TTL: {e}"))?,
-            refresh_token_ttl: env("GATEWAY_REFRESH_TOKEN_TTL", "2592000")
-                .parse()
-                .map_err(|e| format!("invalid GATEWAY_REFRESH_TOKEN_TTL: {e}"))?,
+            access_token_ttl,
+            refresh_token_ttl,
             ldap_url: std::env::var("LDAP_URL").ok(),
             ldap_starttls: env("LDAP_STARTTLS", "false") == "true",
             ldap_bind_dn: std::env::var("LDAP_BIND_DN").ok(),

@@ -32,22 +32,33 @@ export class ApiError extends Error {
   }
 }
 
+/** 并发 401 时共享同一个 refresh 请求：轮换后旧 token 失效，
+ *  多个请求同时重试会互相吊销导致误登出 */
+let refreshPromise: Promise<boolean> | null = null
+
 async function tryRefresh(): Promise<boolean> {
   const rt = tokenStorage.refresh
   if (!rt) return false
-  try {
-    const res = await fetch('/api/auth/refresh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: rt }),
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      try {
+        const res = await fetch('/api/auth/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: rt }),
+        })
+        if (!res.ok) return false
+        const data = (await res.json()) as LoginResp
+        tokenStorage.set(data.access_token, data.refresh_token)
+        return true
+      } catch {
+        return false
+      }
+    })().finally(() => {
+      refreshPromise = null
     })
-    if (!res.ok) return false
-    const data = (await res.json()) as LoginResp
-    tokenStorage.set(data.access_token, data.refresh_token)
-    return true
-  } catch {
-    return false
   }
+  return refreshPromise
 }
 
 /** 会话失效（refresh 也失败）→ 清存储回登录页 */

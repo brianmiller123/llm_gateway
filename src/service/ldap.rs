@@ -89,6 +89,22 @@ impl LdapSettings {
     }
 }
 
+/// 转义 LDAP 过滤器特殊字符（防过滤器注入；LDAP 转义码为小写十六进制）
+fn ldap_escape_filter(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\5c"),
+            '*' => out.push_str("\\2a"),
+            '(' => out.push_str("\\28"),
+            ')' => out.push_str("\\29"),
+            '\0' => out.push_str("\\00"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// 完整登录流程（服务账号搜索 + 用户 bind），LDAP 连接带 10s 超时
 pub async fn authenticate(
     settings: &LdapSettings,
@@ -112,7 +128,9 @@ pub async fn authenticate(
             ldap.simple_bind(dn, pw).await?;
         }
 
-        let filter = settings.user_filter.replace("{0}", username);
+        let filter = settings
+            .user_filter
+            .replace("{0}", &ldap_escape_filter(username));
         let attrs = ["dn", "cn", "mail", "displayName", "givenName", "memberOf"];
         let rs = ldap
             .search(&settings.base_dn, Scope::Subtree, &filter, attrs)
@@ -123,8 +141,11 @@ pub async fn authenticate(
         let entry = SearchEntry::construct(entry);
         let dn = entry.dn.clone();
 
-        // 用户凭据 bind
-        ldap.simple_bind(&dn, password).await?;
+        // 用户凭据 bind（simple_bind 不检查服务器响应码，必须显式校验 rc）
+        let bind_res = ldap.simple_bind(&dn, password).await?;
+        if bind_res.rc != 0 {
+            return Err(LdapError::BadCredentials);
+        }
         ldap.unbind().await.ok();
 
         let member_of = entry.attrs.get("memberOf").cloned().unwrap_or_default();
@@ -148,6 +169,46 @@ pub async fn authenticate(
     }
 }
 
+/// 连接测试：建连 +（可选）服务账号 bind + base_dn 根搜索，
+/// 返回 Ok(提示信息) / Err(人类可读失败原因)。10s 超时。
+pub async fn test_connection(settings: &LdapSettings) -> Result<String, String> {
+    if !settings.is_configured() {
+        return Err("LDAP URL 为空".into());
+    }
+    let work = async {
+        let (conn, mut ldap) =
+            LdapConnAsync::with_settings(LdapConnSettings::new().set_starttls(settings.starttls), &settings.url)
+                .await
+                .map_err(|e| format!("连接失败: {e}"))?;
+        ldap3::drive!(conn);
+
+        if let (Some(dn), Some(pw)) = (&settings.bind_dn, &settings.bind_password) {
+            let bind_res = ldap
+                .simple_bind(dn, pw)
+                .await
+                .map_err(|e| format!("服务账号 bind 失败: {e}"))?;
+            if bind_res.rc != 0 {
+                return Err(format!(
+                    "服务账号 bind 失败: {} (code {})",
+                    bind_res.text, bind_res.rc
+                ));
+            }
+        }
+
+        // base_dn 根搜索验证目录可读
+        let rs = ldap
+            .search(&settings.base_dn, Scope::Base, "(objectClass=*)", ["dn"])
+            .await
+            .map_err(|e| format!("搜索失败: {e}"))?;
+        ldap.unbind().await.ok();
+        Ok(format!("连接成功，base DN 可访问（{} 条结果）", rs.0.len()))
+    };
+    match timeout(Duration::from_secs(10), work).await {
+        Ok(r) => r,
+        Err(_) => Err("LDAP 操作超时（10s）".into()),
+    }
+}
+
 /// 管理员判定：memberOf 精确 DN / CN 后缀匹配；无 memberOf 时补充组搜索
 async fn match_admin_groups(
     settings: &LdapSettings,
@@ -157,10 +218,16 @@ async fn match_admin_groups(
     if settings.admin_groups.is_empty() {
         return Ok(false);
     }
-    let cn_suffixes: Vec<&str> = settings
+    let cn_suffixes: Vec<String> = settings
         .admin_groups
         .iter()
-        .map(|g| g.rsplit(',').next().unwrap_or(g))
+        .map(|g| {
+            g.split(',')
+                .map(str::trim)
+                .find(|rdn| rdn.starts_with("cn="))
+                .map(|rdn| rdn.trim_start_matches("cn=").to_string())
+                .unwrap_or_else(|| g.clone())
+        })
         .collect();
 
     for group in &settings.admin_groups {
@@ -175,25 +242,28 @@ async fn match_admin_groups(
     }
 
     // memberOf 未命中或目录未返回该属性：对 groupOfNames 做补充搜索
-    let groups_filter = settings
-        .admin_groups
+    // （admin_groups 可能是完整 DN，只取其 CN 后缀做 (cn=...) 匹配）
+    let groups_filter = cn_suffixes
         .iter()
-        .map(|g| format!("(cn={g})"))
+        .map(|cn| format!("(cn={cn})"))
         .collect::<Vec<_>>()
         .join("");
     let filter = format!(
         "(&(objectClass=groupOfNames)(|{groups_filter})(member={user_dn}))"
     );
+    tracing::debug!(filter, user_dn, "LDAP admin group check");
     let search = async {
         let (conn, mut ldap) =
             LdapConnAsync::with_settings(LdapConnSettings::new().set_starttls(settings.starttls), &settings.url).await?;
         ldap3::drive!(conn);
         if let (Some(dn), Some(pw)) = (&settings.bind_dn, &settings.bind_password) {
-            ldap.simple_bind(dn, pw).await?;
+            let r = ldap.simple_bind(dn, pw).await?;
+            tracing::debug!(rc = r.rc, "service bind rc");
         }
         let rs = ldap
             .search(&settings.base_dn, Scope::Subtree, &filter, ["dn"])
             .await?;
+        tracing::debug!(found = rs.0.len(), "admin group search result");
         Ok::<_, LdapError>(!rs.0.is_empty())
     };
     match timeout(Duration::from_secs(10), search).await {

@@ -64,7 +64,6 @@ async function onSubmit() {
     await auth.login(form.username.trim(), form.password)
     ElMessage.success(`欢迎，${auth.user?.display_name ?? form.username}`)
     const redirect = (route.query.redirect as string) || '/dashboard'
-    console.log('[login] redirect target:', redirect)
     router.push(redirect).catch((e) => console.error('[login] push failed:', e))
   } catch (e) {
     ElMessage.error(e instanceof ApiError ? e.message : '登录失败，请稍后重试')

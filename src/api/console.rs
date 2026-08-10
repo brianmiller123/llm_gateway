@@ -1,7 +1,7 @@
 //! 控制台 API：会话（登录/刷新/登出）、用户自助（me/keys/usage）、管理员（users/audit）。
 //! 所有端点均需 Bearer JWT；管理员端点额外校验 is_admin。
 
-use axum::extract::{FromRequestParts, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::header;
 use axum::middleware::{self, Next};
@@ -147,9 +147,27 @@ struct LoginReq {
 
 async fn login(
     State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> Result<impl IntoResponse, AppError> {
+    // 暴力破解防护：每用户名 10 次/分 + 每 IP 30 次/分（成功后重置计数）
+    let username = req.username.trim().to_string();
+    if let Err(secs) = st
+        .limiter
+        .check(&format!("login:user:{username}"), 10.0, 10.0)
+    {
+        return Err(AppError::RateLimited(secs));
+    }
+    if let Err(secs) = st
+        .limiter
+        .check(&format!("login:ip:{}", addr.ip()), 30.0, 30.0)
+    {
+        return Err(AppError::RateLimited(secs));
+    }
     let session = console::login(&st, &req.username, &req.password).await?;
+    // 登录成功：重置失败计数（令牌桶直接清空）
+    st.limiter.reset(&format!("login:user:{username}"));
+    st.limiter.reset(&format!("login:ip:{}", addr.ip()));
     Ok(Json(json!({
         "access_token": session.access_token,
         "refresh_token": session.refresh_token,

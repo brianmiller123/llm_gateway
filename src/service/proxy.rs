@@ -139,10 +139,12 @@ pub async fn proxy(
         let status = resp.status();
         let content_type = content_type_of(&resp);
         let latency = started.elapsed().as_millis() as i64;
-        let stream = wrap_stream(st.clone(), meta, resp.bytes_stream(), latency);
+        // 非 2xx：不透传 usage 计费（错误体里的 usage 不可信），按真实状态记账、token 记 0
+        let capture_usage = status.is_success();
+        let stream = wrap_stream(st.clone(), meta, resp.bytes_stream(), latency, status.as_u16(), capture_usage);
         tracing::info!(
             request_id = %request_id, model = %model, provider = %provider.name,
-            streamed = true, "proxying stream"
+            streamed = true, status = %status, "proxying stream"
         );
         Ok(Response::builder()
             .status(status)
@@ -153,7 +155,6 @@ pub async fn proxy(
     } else {
         // 非流式：429/5xx/超时/传输错误 → 按降级链重试；4xx 透明透传不重试
         let mut last_response: Option<(u16, Vec<u8>, String)> = None;
-        let mut any_transport_error = false;
         for provider in &candidates {
             meta.provider_id = provider.id;
             let provider_key = match crate::crypto::decrypt(
@@ -174,7 +175,6 @@ pub async fn proxy(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "upstream attempt failed");
-                    any_transport_error = true;
                     continue;
                 }
             };
@@ -191,7 +191,6 @@ pub async fn proxy(
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "upstream body read failed");
-                    any_transport_error = true;
                     continue;
                 }
             };
@@ -218,7 +217,6 @@ pub async fn proxy(
                 .body(Body::from(bytes))
                 .map_err(AppError::internal)?);
         }
-        let _ = any_transport_error;
         Err(AppError::Internal("all upstream attempts failed".into()))
     }
 }
@@ -237,7 +235,7 @@ fn resolve_candidates(st: &AppState, route: &crate::store::upstream::ModelRoute)
     list
 }
 
-/// 发送上游请求；timeout_ms 作用于响应头等待
+/// 发送上游请求；timeout_ms 作用于响应头等待；非流式额外施加请求总超时（含响应体）
 async fn send_upstream(
     st: &AppState,
     provider: &Provider,
@@ -261,6 +259,10 @@ async fn send_upstream(
         .body(body.to_vec());
     if streamed {
         req = req.header(header::ACCEPT, "text/event-stream");
+    } else {
+        // 非流式：reqwest 总超时覆盖 响应头+响应体（防慢速上游挂死连接池）
+        let total = Duration::from_millis(provider.timeout_ms.max(1_000) as u64 + 30_000);
+        req = req.timeout(total);
     }
     let timeout = Duration::from_millis(provider.timeout_ms.max(1_000) as u64);
     tokio::time::timeout(timeout, req.send())
@@ -278,13 +280,16 @@ fn content_type_of(resp: &reqwest::Response) -> String {
 }
 
 /// 流式透传 + 流内 usage 捕获与记账：
-/// - 捕获到 usage 或 [DONE] 时立即记账（仅一次），字节流原样透传
+/// - capture_usage = true（上游 2xx）：捕获到 usage 或 [DONE] 时立即记账（仅一次），字节流原样透传
+/// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
 /// - 流异常中断时由 chain 兜底记账（usage 未知）
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
     upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     latency: i64,
+    record_status: u16,
+    capture_usage: bool,
 ) -> impl Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send {
     let recorded = Arc::new(AtomicBool::new(false));
     let captured: Arc<parking_lot::Mutex<Option<Usage>>> = Arc::new(parking_lot::Mutex::new(None));
@@ -304,14 +309,18 @@ fn wrap_stream(
             let meta = meta.clone();
             async move {
                 let chunk = chunk.map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
-                let (usage, done) = feed_sse(&mut buf.lock(), &chunk);
+                let (usage, done) = if capture_usage {
+                    feed_sse(&mut buf.lock(), &chunk)
+                } else {
+                    (None, false)
+                };
                 let has_usage = usage.is_some();
                 if has_usage {
                     *captured.lock() = usage;
                 }
                 if (done || has_usage) && !recorded.swap(true, Ordering::SeqCst) {
                     let u = captured.lock().take();
-                    usage::record(&st, &meta, u.as_ref(), StatusCode::OK.as_u16(), latency).await;
+                    usage::record(&st, &meta, u.as_ref(), record_status, latency).await;
                 }
                 Ok::<Bytes, Box<dyn Error + Send + Sync>>(chunk)
             }
@@ -327,7 +336,7 @@ fn wrap_stream(
             // 上游未正常结束（无 [DONE]/usage）时兜底记账
             if !recorded.swap(true, Ordering::SeqCst) {
                 let u = captured.lock().take();
-                usage::record(&st, &meta, u.as_ref(), StatusCode::OK.as_u16(), latency).await;
+                usage::record(&st, &meta, u.as_ref(), record_status, latency).await;
             }
             Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::new())
         }

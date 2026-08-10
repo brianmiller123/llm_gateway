@@ -152,13 +152,19 @@ pub async fn update_route(
     upstream_model: Option<Option<String>>,
     enabled: Option<bool>,
 ) -> Result<Option<AdminRoute>, sqlx::Error> {
+    // upstream_model 语义：None = 不修改；Some(None) = 清空映射；Some(Some(v)) = 设置
+    // SQL 无法区分 NULL 与缺失，故用 $8 布尔标记（$6 为 NULL 时 CASE 决定保留/清空）
+    let (upstream_val, upstream_provided) = match upstream_model {
+        Some(inner) => (inner, true),
+        None => (None, false),
+    };
     sqlx::query_as::<_, AdminRoute>(
         "UPDATE model_routes SET \
             model_pattern = COALESCE($2, model_pattern), \
             provider_id = COALESCE($3, provider_id), \
             priority = COALESCE($4, priority), \
             fallback_ids = COALESCE($5, fallback_ids), \
-            upstream_model = COALESCE($6, upstream_model), \
+            upstream_model = CASE WHEN $8 THEN $6 ELSE upstream_model END, \
             enabled = COALESCE($7, enabled) \
          WHERE id = $1 \
          RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled",
@@ -168,8 +174,9 @@ pub async fn update_route(
     .bind(provider_id)
     .bind(priority)
     .bind(fallback_ids)
-    .bind(upstream_model)
+    .bind(upstream_val)
     .bind(enabled)
+    .bind(upstream_provided)
     .fetch_optional(pool)
     .await
 }
@@ -229,7 +236,7 @@ pub async fn update_rate_rule(
     sqlx::query_as::<_, AdminRateRule>(
         "UPDATE rate_limit_rules SET \
             scope = COALESCE($2, scope), \
-            scope_id = $3, \
+            scope_id = CASE WHEN $8 THEN $3 ELSE scope_id END, \
             rpm = COALESCE($4, rpm), \
             burst = COALESCE($5, burst), \
             enabled = COALESCE($6, enabled), \
@@ -243,6 +250,7 @@ pub async fn update_rate_rule(
     .bind(rpm)
     .bind(burst)
     .bind(enabled)
+    .bind(scope_id.is_some()) // $8：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
     .fetch_optional(pool)
     .await
 }
@@ -294,8 +302,8 @@ pub async fn upsert_quota(
         "INSERT INTO user_quotas (user_id, monthly_token_quota, monthly_cost_quota, billing_day, notify_percent, enabled) \
          VALUES ($1, COALESCE($2, NULL), COALESCE($3, NULL), COALESCE($4, 1), COALESCE($5, 80), COALESCE($6, TRUE)) \
          ON CONFLICT (user_id) DO UPDATE SET \
-            monthly_token_quota = $7, \
-            monthly_cost_quota = $8, \
+            monthly_token_quota = CASE WHEN $9 THEN $7 ELSE user_quotas.monthly_token_quota END, \
+            monthly_cost_quota  = CASE WHEN $10 THEN $8 ELSE user_quotas.monthly_cost_quota END, \
             billing_day = COALESCE($4, user_quotas.billing_day), \
             notify_percent = COALESCE($5, user_quotas.notify_percent), \
             enabled = COALESCE($6, user_quotas.enabled), \
@@ -309,6 +317,8 @@ pub async fn upsert_quota(
     .bind(enabled)
     .bind(monthly_token_quota) // $7
     .bind(monthly_cost_quota) // $8
+    .bind(monthly_token_quota.is_some()) // $9：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
+    .bind(monthly_cost_quota.is_some()) // $10
     .execute(pool)
     .await?;
 
@@ -457,4 +467,69 @@ pub async fn delete_model(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
+}
+
+// ---------- 系统设置（LDAP） ----------
+
+/// system_settings 行的 DB 表示；bind_password 为密文
+#[derive(Debug, Clone, FromRow)]
+pub struct LdapDbSettings {
+    pub ldap_url: String,
+    pub ldap_starttls: bool,
+    pub ldap_bind_dn: String,
+    pub ldap_bind_password_enc: String,
+    pub ldap_base_dn: String,
+    pub ldap_user_filter: String,
+    pub ldap_admin_groups: String,
+}
+
+/// 读取系统设置（单行表，迁移保证存在）
+pub async fn load_ldap_settings(pool: &PgPool) -> Result<LdapDbSettings, sqlx::Error> {
+    sqlx::query_as::<_, LdapDbSettings>(
+        "SELECT ldap_url, ldap_starttls, ldap_bind_dn, ldap_bind_password_enc, \
+         ldap_base_dn, ldap_user_filter, ldap_admin_groups \
+         FROM system_settings WHERE id = 1",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// 保存系统设置（单行 upsert）；bind_password_enc 传 None = 不修改。
+/// admin_groups 以 JSON 数组存 TEXT（DN 含逗号，不能用逗号分隔）
+pub async fn save_ldap_settings(
+    pool: &PgPool,
+    url: &str,
+    starttls: bool,
+    bind_dn: &str,
+    bind_password_enc: Option<&str>,
+    base_dn: &str,
+    user_filter: &str,
+    admin_groups: &[String],
+) -> Result<(), sqlx::Error> {
+    let groups_json = serde_json::to_string(admin_groups).unwrap_or_else(|_| "[]".into());
+    sqlx::query(
+        "INSERT INTO system_settings \
+           (id, ldap_url, ldap_starttls, ldap_bind_dn, ldap_bind_password_enc, \
+            ldap_base_dn, ldap_user_filter, ldap_admin_groups, updated_at) \
+         VALUES (1, $1, $2, $3, CASE WHEN $4 IS NULL THEN '' ELSE $4 END, $5, $6, $7, now()) \
+         ON CONFLICT (id) DO UPDATE SET \
+           ldap_url = EXCLUDED.ldap_url, \
+           ldap_starttls = EXCLUDED.ldap_starttls, \
+           ldap_bind_dn = EXCLUDED.ldap_bind_dn, \
+           ldap_bind_password_enc = CASE WHEN $4 IS NULL THEN system_settings.ldap_bind_password_enc ELSE $4 END, \
+           ldap_base_dn = EXCLUDED.ldap_base_dn, \
+           ldap_user_filter = EXCLUDED.ldap_user_filter, \
+           ldap_admin_groups = EXCLUDED.ldap_admin_groups, \
+           updated_at = now()",
+    )
+    .bind(url)
+    .bind(starttls)
+    .bind(bind_dn)
+    .bind(bind_password_enc)
+    .bind(base_dn)
+    .bind(user_filter)
+    .bind(groups_json)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

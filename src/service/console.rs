@@ -7,7 +7,7 @@ use chrono::Utc;
 use sha2::Digest;
 
 use crate::error::AppError;
-use crate::service::ldap::{self, LdapError, LdapSettings};
+use crate::service::ldap::{self, LdapError};
 use crate::service::session;
 use crate::state::AppState;
 use crate::store::{tokens, users};
@@ -24,7 +24,7 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
         return Err(AppError::BadRequest("username and password are required".into()));
     }
 
-    let ldap_settings = LdapSettings::from(&*st.cfg);
+    let ldap_settings = st.ldap.read().clone();
     if ldap_settings.is_configured() {
         match ldap::authenticate(&ldap_settings, username, password).await {
             Ok(identity) => {
