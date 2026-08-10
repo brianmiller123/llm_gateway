@@ -5,6 +5,8 @@ use sqlx::{FromRow, PgPool};
 pub struct Provider {
     pub id: i64,
     pub name: String,
+    /// 上游方言：openai（默认，Chat Completions 兼容）/ openai-responses（原生 Responses API）等
+    pub api_type: String,
     pub base_url: String,
     pub api_key_encrypted: String,
     pub timeout_ms: i32,
@@ -22,7 +24,7 @@ pub struct ModelRoute {
 
 pub async fn load_providers(pool: &PgPool) -> Result<Vec<Provider>, sqlx::Error> {
     sqlx::query_as::<_, Provider>(
-        "SELECT id, name, base_url, api_key_encrypted, timeout_ms FROM providers WHERE enabled = TRUE",
+        "SELECT id, name, api_type, base_url, api_key_encrypted, timeout_ms FROM providers WHERE enabled = TRUE",
     )
     .fetch_all(pool)
     .await

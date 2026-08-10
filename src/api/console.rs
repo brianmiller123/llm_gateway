@@ -571,6 +571,8 @@ struct TrendParams {
     days: Option<i64>,
     /// day（按天，默认）或 half_hour（近 24 小时每 30 分钟）
     granularity: Option<String>,
+    /// 按模型过滤（空/缺省 = 全部模型）
+    model: Option<String>,
 }
 
 /// 每 30 分钟趋势点（近 24h 用；stat_date 为对齐后的桶起点 UTC）
@@ -618,10 +620,11 @@ fn fill_half_hour_gaps(rows: Vec<HalfHourPoint>) -> Vec<HalfHourPoint> {
     out
 }
 
-/// 近 24h 每 30 分钟趋势（user_id 为 Some 时限定单用户）
+/// 近 24h 每 30 分钟趋势（user_id 为 Some 时限定单用户；model 为 Some 时限定模型）
 async fn fetch_trend_half_hour(
     pool: &sqlx::PgPool,
     user_id: Option<i64>,
+    model: Option<&str>,
 ) -> Result<Vec<HalfHourPoint>, AppError> {
     let rows: Vec<HalfHourPoint> = sqlx::query_as(
         "SELECT to_timestamp(floor(extract(epoch FROM created_at) / 1800) * 1800) AS stat_date, \
@@ -631,20 +634,23 @@ async fn fetch_trend_half_hour(
                 COALESCE(SUM(cost), 0)::float8 AS cost \
          FROM usage_logs \
          WHERE created_at >= now() - interval '24 hours' AND ($1::bigint IS NULL OR user_id = $1) \
+           AND ($2::text IS NULL OR model = $2) \
          GROUP BY 1 ORDER BY 1",
     )
     .bind(user_id)
+    .bind(model)
     .fetch_all(pool)
     .await
     .map_err(AppError::internal)?;
     Ok(fill_half_hour_gaps(rows))
 }
 
-/// 拉取近 N 天按日趋势（补零；user_id 为 Some 时限定单用户）
+/// 拉取近 N 天按日趋势（补零；user_id 为 Some 时限定单用户；model 为 Some 时限定模型）
 async fn fetch_trend_daily(
     pool: &sqlx::PgPool,
     days: i64,
     user_id: Option<i64>,
+    model: Option<&str>,
 ) -> Result<Vec<TrendPoint>, AppError> {
     sqlx::query_as::<_, TrendPoint>(
         "SELECT d::date AS stat_date, \
@@ -654,10 +660,12 @@ async fn fetch_trend_daily(
                 COALESCE(SUM(u.cost), 0)::float8 AS cost \
          FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, '1 day') AS d \
          LEFT JOIN usage_daily u ON u.stat_date = d::date AND ($2::bigint IS NULL OR u.user_id = $2) \
+                              AND ($3::text IS NULL OR u.model = $3) \
          GROUP BY d::date ORDER BY d::date",
     )
     .bind(days)
     .bind(user_id)
+    .bind(model)
     .fetch_all(pool)
     .await
     .map_err(AppError::internal)
@@ -679,6 +687,7 @@ struct UserTrendRow {
 async fn fetch_trend_by_user(
     pool: &sqlx::PgPool,
     days: i64,
+    model: Option<&str>,
 ) -> Result<Vec<UserTrend>, AppError> {
     let rows: Vec<UserTrendRow> = sqlx::query_as(
         "SELECT u.user_id, usr.username, usr.display_name, u.stat_date, \
@@ -688,10 +697,12 @@ async fn fetch_trend_by_user(
                 CAST(SUM(u.cost) AS FLOAT8) AS cost \
          FROM usage_daily u JOIN users usr ON usr.id = u.user_id \
          WHERE u.stat_date >= CURRENT_DATE - ($1::int - 1) \
+           AND ($2::text IS NULL OR u.model = $2) \
          GROUP BY u.user_id, usr.username, usr.display_name, u.stat_date \
          ORDER BY u.user_id, u.stat_date",
     )
     .bind(days)
+    .bind(model)
     .fetch_all(pool)
     .await
     .map_err(AppError::internal)?;
@@ -784,7 +795,10 @@ struct UserHalfHourRow {
     cost: f64,
 }
 
-async fn fetch_trend_by_user_half_hour(pool: &sqlx::PgPool) -> Result<Vec<UserTrendHalfHour>, AppError> {
+async fn fetch_trend_by_user_half_hour(
+    pool: &sqlx::PgPool,
+    model: Option<&str>,
+) -> Result<Vec<UserTrendHalfHour>, AppError> {
     let rows: Vec<UserHalfHourRow> = sqlx::query_as(
         "SELECT l.user_id, usr.username, usr.display_name, \
                 to_timestamp(floor(extract(epoch FROM l.created_at) / 1800) * 1800) AS stat_date, \
@@ -794,8 +808,10 @@ async fn fetch_trend_by_user_half_hour(pool: &sqlx::PgPool) -> Result<Vec<UserTr
                 COALESCE(SUM(l.cost), 0)::float8 AS cost \
          FROM usage_logs l JOIN users usr ON usr.id = l.user_id \
          WHERE l.created_at >= now() - interval '24 hours' \
+           AND ($1::text IS NULL OR l.model = $1) \
          GROUP BY l.user_id, usr.username, usr.display_name, 4 ORDER BY l.user_id, 4",
     )
+    .bind(model)
     .fetch_all(pool)
     .await
     .map_err(AppError::internal)?;
@@ -864,6 +880,20 @@ async fn fetch_trend_by_user_half_hour(pool: &sqlx::PgPool) -> Result<Vec<UserTr
     Ok(users)
 }
 
+/// 本月有调用的模型列表（下拉过滤用；user_id 为 Some 时限定单用户）
+async fn fetch_models(pool: &sqlx::PgPool, user_id: Option<i64>) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT model FROM usage_logs \
+         WHERE created_at >= date_trunc('month', now()) AND ($1::bigint IS NULL OR user_id = $1) \
+         ORDER BY model",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::internal)?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// 我的用量趋势：近 N 天按日（图表）
 async fn usage_trend(
     State(st): State<AppState>,
@@ -871,21 +901,25 @@ async fn usage_trend(
     user: ConsoleUser,
 ) -> Result<impl IntoResponse, AppError> {
     let days = params.days.unwrap_or(30).clamp(1, 90);
+    let model = params.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let models = fetch_models(&st.pool, Some(user.user.id)).await?;
     if params.granularity.as_deref() == Some("half_hour") {
-        let daily = fetch_trend_half_hour(&st.pool, Some(user.user.id)).await?;
+        let daily = fetch_trend_half_hour(&st.pool, Some(user.user.id), model).await?;
         return Ok(Json(json!({
             "days": 1,
             "granularity": "half_hour",
             "daily": daily,
             "by_user": [],
+            "models": models,
         })));
     }
-    let daily = fetch_trend_daily(&st.pool, days, Some(user.user.id)).await?;
+    let daily = fetch_trend_daily(&st.pool, days, Some(user.user.id), model).await?;
     Ok(Json(json!({
         "days": days,
         "granularity": "day",
         "daily": daily,
         "by_user": [],
+        "models": models,
     })))
 }
 
@@ -897,23 +931,27 @@ async fn admin_usage_trend(
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
     let days = params.days.unwrap_or(30).clamp(1, 90);
+    let model = params.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let models = fetch_models(&st.pool, None).await?;
     if params.granularity.as_deref() == Some("half_hour") {
-        let daily = fetch_trend_half_hour(&st.pool, None).await?;
-        let by_user = fetch_trend_by_user_half_hour(&st.pool).await?;
+        let daily = fetch_trend_half_hour(&st.pool, None, model).await?;
+        let by_user = fetch_trend_by_user_half_hour(&st.pool, model).await?;
         return Ok(Json(json!({
             "days": 1,
             "granularity": "half_hour",
             "daily": daily,
             "by_user": by_user,
+            "models": models,
         })));
     }
-    let daily = fetch_trend_daily(&st.pool, days, None).await?;
-    let by_user = fetch_trend_by_user(&st.pool, days).await?;
+    let daily = fetch_trend_daily(&st.pool, days, None, model).await?;
+    let by_user = fetch_trend_by_user(&st.pool, days, model).await?;
     Ok(Json(json!({
         "days": days,
         "granularity": "day",
         "daily": daily,
         "by_user": by_user,
+        "models": models,
     })))
 }
 

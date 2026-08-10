@@ -136,6 +136,8 @@ export interface TrendResp {
   granularity: 'day' | 'half_hour'
   daily: TrendPoint[]
   by_user: UserTrend[]
+  /** 本月有调用的模型列表（下拉过滤用） */
+  models?: string[]
 }
 
 export interface UserWithUsage {

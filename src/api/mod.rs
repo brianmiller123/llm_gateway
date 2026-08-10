@@ -40,7 +40,7 @@ async fn root(State(st): State<AppState>) -> Response {
             Json(json!({
                 "service": "llm_gateway",
                 "version": env!("CARGO_PKG_VERSION"),
-                "openai_compat": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models"]
+                "openai_compat": ["/v1/chat/completions", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/models"]
             })),
         )
             .into_response(),

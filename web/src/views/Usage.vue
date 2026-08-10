@@ -124,6 +124,21 @@
           <div class="card-header">
             <span>用户请求对比</span>
             <span class="card-tools">
+              <el-select
+                v-model="compareModel"
+                size="small"
+                clearable
+                placeholder="全部模型"
+                class="model-select"
+                @change="loadCompare"
+              >
+                <el-option
+                  v-for="m in compareTrend?.models ?? []"
+                  :key="m"
+                  :label="m"
+                  :value="m"
+                />
+              </el-select>
               <el-radio-group v-model="rankMode" size="small" @change="renderCompareChart">
                 <el-radio-button value="top">请求最多 Top 10</el-radio-button>
                 <el-radio-button value="bottom">请求最少 Bottom 10</el-radio-button>
@@ -210,6 +225,10 @@ let compareChart: echarts.ECharts | null = null
 /** 用户请求对比：按请求数总量 Top/Bottom 10 或全部 */
 const rankMode = ref<'top' | 'bottom' | 'all'>('top')
 
+/** 用户请求对比：独立趋势数据与模型过滤（'' = 全部模型） */
+const compareTrend = ref<TrendResp | null>(null)
+const compareModel = ref('')
+
 const isEmpty = computed(() => {
   const data = isAdmin.value ? adminUsage.value : usage.value
   if (!data) return false
@@ -273,8 +292,8 @@ function currentSeries(): TrendPoint[] {
 }
 
 /** 图表 x 轴标签：按天显示 MM-DD，半小时粒度显示本地 MM-DD HH:mm */
-function xLabel(d: TrendPoint): string {
-  if (trend.value?.granularity === 'half_hour') {
+function xLabel(d: TrendPoint, gran?: TrendResp['granularity']): string {
+  if ((gran ?? trend.value?.granularity) === 'half_hour') {
     const t = new Date(d.stat_date)
     const p = (n: number) => String(n).padStart(2, '0')
     return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`
@@ -295,7 +314,7 @@ function renderCallsChart(): void {
       grid: { left: 8, right: 16, top: 32, bottom: 8, containLabel: true },
       xAxis: {
         type: 'category',
-        data: pts.map(xLabel),
+        data: pts.map((d) => xLabel(d)),
         boundaryGap: false,
         axisLabel: { hideOverlap: true },
       },
@@ -331,7 +350,7 @@ function renderTokenChart(): void {
       grid: { left: 8, right: 16, top: 32, bottom: 8, containLabel: true },
       xAxis: {
         type: 'category',
-        data: pts.map(xLabel),
+        data: pts.map((d) => xLabel(d)),
         boundaryGap: false,
         axisLabel: { hideOverlap: true },
       },
@@ -374,7 +393,7 @@ function renderCostChart(): void {
       grid: { left: 8, right: 16, top: 32, bottom: 8, containLabel: true },
       xAxis: {
         type: 'category',
-        data: pts.map(xLabel),
+        data: pts.map((d) => xLabel(d)),
         axisLabel: { hideOverlap: true },
       },
       yAxis: { type: 'value', axisLabel: { formatter: (v: number) => '¥' + v } },
@@ -401,8 +420,8 @@ function renderAllCharts(): void {
 
 /** 用户请求对比系列：按请求数总量排序过滤（Top/Bottom 10 或全部） */
 function compareSeries(): { name: string; data: number[] }[] {
-  if (!trend.value) return []
-  const rows = (trend.value.by_user ?? []).map((u) => ({
+  if (!compareTrend.value) return []
+  const rows = (compareTrend.value.by_user ?? []).map((u) => ({
     name: u.display_name ? `${u.username}（${u.display_name}）` : u.username,
     data: u.daily.map((d) => d.call_count),
     total: u.daily.reduce((s, d) => s + d.call_count, 0),
@@ -420,7 +439,7 @@ function renderCompareChart(): void {
   const c = compareChart
   if (!c) return
   const series = compareSeries()
-  const dates = trend.value?.daily.map(xLabel) ?? []
+  const dates = (compareTrend.value?.daily ?? []).map((d) => xLabel(d, compareTrend.value?.granularity))
   c.setOption(
     {
       tooltip: { trigger: 'axis' },
@@ -453,6 +472,21 @@ function handleResize(): void {
   compareChart?.resize()
 }
 
+/** 用户请求对比数据：独立按模型过滤请求（与趋势图共享粒度/天数） */
+async function loadCompare(): Promise<void> {
+  const base = isAdmin.value ? '/api/admin/usage' : '/api/usage'
+  const gran = isHalfHour.value ? 'half_hour' : 'day'
+  const days = isHalfHour.value ? 1 : trendDays.value
+  const q = new URLSearchParams({ granularity: gran, days: String(days) })
+  if (compareModel.value) q.set('model', compareModel.value)
+  try {
+    compareTrend.value = await request<TrendResp>(`${base}/trend?${q.toString()}`)
+    renderCompareChart()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '加载用户对比失败')
+  }
+}
+
 async function loadData(): Promise<void> {
   loading.value = true
   try {
@@ -472,6 +506,7 @@ async function loadData(): Promise<void> {
     trend.value = t
     await nextTick()
     initCharts()
+    void loadCompare()
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '加载用量数据失败')
   } finally {
@@ -563,6 +598,10 @@ onBeforeUnmount(() => {
 }
 
 .user-select {
+  width: 160px;
+}
+
+.model-select {
   width: 160px;
 }
 

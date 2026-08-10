@@ -24,6 +24,8 @@ pub struct Endpoint {
     pub api: &'static str,
     /// 上游路径（拼接在 base_url 之后，base_url 约定以 /v1 结尾）
     pub upstream: &'static str,
+    /// 是否 /v1/responses 端点（触发降级转换决策）
+    pub responses: bool,
 }
 
 /// OpenAI 兼容代理：鉴权 → 限流 → 配额 → 路由 → 转发（含降级）→ 记账
@@ -91,27 +93,41 @@ pub async fn proxy(
         )));
     }
 
-    // 6. 构造上游请求体（流式自动注入 include_usage 以获得精确 usage；
+    // 6. 构造上游请求体（按 provider 决策：/v1/responses 端点对非原生上游降级转换为
+    //    Chat Completions；流式自动注入 include_usage 以获得精确 usage；
     //    路由配置了 upstream_model 时把请求模型改写为上游实际模型名）
-    let outbound = if streamed {
-        let mut json = json;
-        if json.get("stream_options").is_none() {
-            json["stream_options"] = serde_json::json!({ "include_usage": true });
-        }
-        if let Some(target) = &route.upstream_model {
-            json["model"] = serde_json::Value::String(target.clone());
-        }
-        serde_json::to_vec(&json).map_err(AppError::internal)?
-    } else if let Some(target) = &route.upstream_model {
-        if target != &model {
-            let mut json = json;
-            json["model"] = serde_json::Value::String(target.clone());
-            serde_json::to_vec(&json).map_err(AppError::internal)?
+    let build_outbound = |provider: &Provider| -> Result<(Vec<u8>, &'static str), AppError> {
+        let converted = crate::service::responses::should_convert(endpoint.responses, provider);
+        if converted {
+            // B：降级转换 Responses 请求 → Chat 请求（上游只支持 /v1/chat/completions）
+            let mut chat = crate::service::responses::convert_request(&json).map_err(AppError::BadRequest)?;
+            if streamed && chat.get("stream_options").is_none() {
+                chat["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
+            if let Some(target) = &route.upstream_model {
+                chat["model"] = serde_json::Value::String(target.clone());
+            }
+            Ok((serde_json::to_vec(&chat).map_err(AppError::internal)?, "/chat/completions"))
+        } else if streamed && !endpoint.responses {
+            let mut json = json.clone();
+            if json.get("stream_options").is_none() {
+                json["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
+            if let Some(target) = &route.upstream_model {
+                json["model"] = serde_json::Value::String(target.clone());
+            }
+            Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
+        } else if let Some(target) = &route.upstream_model {
+            if target != &model {
+                let mut json = json.clone();
+                json["model"] = serde_json::Value::String(target.clone());
+                Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
+            } else {
+                Ok((body.to_vec(), endpoint.upstream))
+            }
         } else {
-            body.to_vec()
+            Ok((body.to_vec(), endpoint.upstream))
         }
-    } else {
-        body.to_vec()
     };
 
     let request_id = Uuid::new_v4();
@@ -128,17 +144,51 @@ pub async fn proxy(
 
     // 7. 转发 + 记账
     if streamed {
-        // 流式：仅主上游，不重试（防重复生成/重复计费），透明透传
+        // 流式：仅主上游，不重试（防重复生成/重复计费）
         let provider = &candidates[0];
+        let converted = crate::service::responses::should_convert(endpoint.responses, provider);
+        let (outbound, upstream_path) = build_outbound(provider)?;
         let provider_key =
             crate::crypto::decrypt(&provider.api_key_encrypted, &st.cfg.master_key)
                 .map_err(AppError::internal)?;
-        let resp = send_upstream(st, provider, &provider_key, &outbound, endpoint, request_id, true)
-            .await
-            .map_err(|e| AppError::Internal(format!("upstream request failed: {e}")))?;
+        let resp = send_upstream(
+            st,
+            provider,
+            &provider_key,
+            &outbound,
+            Endpoint { upstream: upstream_path, ..endpoint },
+            request_id,
+            true,
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("upstream request failed: {e}")))?;
         let status = resp.status();
         let content_type = content_type_of(&resp);
         let latency = started.elapsed().as_millis() as i64;
+        // 降级转换流（上游 Chat SSE → 客户端 Responses SSE）：
+        // 转换器内部在 [DONE]/流尾补发终态事件并记账；仅 SSE content-type 才转换
+        // （200 + 非 SSE 错误体走原 wrap_stream 透传，避免错误被吞成空 completed 响应）
+        if converted && status.is_success() && content_type.contains("text/event-stream") {
+            let stream = crate::service::responses::stream::wrap_chat_stream_to_responses(
+                st.clone(),
+                meta,
+                resp.bytes_stream(),
+                latency,
+                status.as_u16(),
+                format!("resp_{request_id}"),
+                model.clone(),
+            );
+            tracing::info!(
+                request_id = %request_id, model = %model, provider = %provider.name,
+                streamed = true, status = %status, "proxying responses stream (converted)"
+            );
+            return Ok(Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type)
+                .header("X-Request-Id", request_id.to_string())
+                .body(Body::from_stream(stream))
+                .map_err(AppError::internal)?);
+        }
         // 非 2xx：不透传 usage 计费（错误体里的 usage 不可信），按真实状态记账、token 记 0
         let capture_usage = status.is_success();
         let stream = wrap_stream(st.clone(), meta, resp.bytes_stream(), latency, status.as_u16(), capture_usage);
@@ -157,6 +207,7 @@ pub async fn proxy(
         let mut last_response: Option<(u16, Vec<u8>, String)> = None;
         for provider in &candidates {
             meta.provider_id = provider.id;
+            let converted = crate::service::responses::should_convert(endpoint.responses, provider);
             let provider_key = match crate::crypto::decrypt(
                 &provider.api_key_encrypted,
                 &st.cfg.master_key,
@@ -167,8 +218,18 @@ pub async fn proxy(
                     continue;
                 }
             };
+            let (outbound, upstream_path) = match build_outbound(provider) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
             let resp = match send_upstream(
-                st, provider, &provider_key, &outbound, endpoint, request_id, false,
+                st,
+                provider,
+                &provider_key,
+                &outbound,
+                Endpoint { upstream: upstream_path, ..endpoint },
+                request_id,
+                false,
             )
             .await
             {
@@ -198,11 +259,36 @@ pub async fn proxy(
             let usage = parse_usage(&bytes);
             usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency).await;
             tracing::info!(request_id = %request_id, model = %model, provider = %provider.name, "proxied");
+            let response_body = if converted {
+                // B：上游 Chat 响应 → Responses 响应（仅 2xx 成功体转换；错误体/异常体透传）
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(v) if status.is_success() && v.get("choices").is_some() => {
+                        match crate::service::responses::convert_response(
+                            &v,
+                            &format!("resp_{request_id}"),
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            Ok(out) => serde_json::to_vec(&out)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!(request_id = %request_id, error = %e, "responses convert serialize failed");
+                                    bytes.to_vec()
+                                }),
+                            Err(e) => {
+                                tracing::warn!(request_id = %request_id, error = %e, "responses convert failed");
+                                bytes.to_vec()
+                            }
+                        }
+                    }
+                    _ => bytes.to_vec(),
+                }
+            } else {
+                bytes.to_vec()
+            };
             return Ok(Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, content_type)
                 .header("X-Request-Id", request_id.to_string())
-                .body(Body::from(bytes))
+                .body(Body::from(response_body))
                 .map_err(AppError::internal)?);
         }
         // 全部候选失败：优先透传最后一次上游响应，否则 502
@@ -367,10 +453,30 @@ pub fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8]) -> (Option<Usage>, bool) {
                 let data = data.trim();
                 if data == "[DONE]" {
                     done = true;
-                } else if usage.is_none() {
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                } else if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if usage.is_none() {
+                        // Chat 流：usage 在顶层
                         if let Some(u) = v.get("usage") {
                             usage = serde_json::from_value(u.clone()).ok();
+                        }
+                        // Responses 终态事件：usage 嵌在 response 对象内
+                        if usage.is_none() {
+                            if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
+                                usage = serde_json::from_value(u.clone()).ok();
+                            }
+                        }
+                    }
+                    // Responses 流无 [DONE] 哨兵：usage 在 response.completed 事件内，
+                    // 以终态事件类型判定结束
+                    if let Some(ty) = v.get("type").and_then(|t| t.as_str()) {
+                        if matches!(
+                            ty,
+                            "response.completed"
+                                | "response.incomplete"
+                                | "response.failed"
+                                | "response.done"
+                        ) {
+                            done = true;
                         }
                     }
                 }
@@ -396,4 +502,67 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
                 .position(|w| w == b"\r\n\r\n")
                 .map(|i| i + 4)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chat 流：usage 顶层 + [DONE] 哨兵
+    #[test]
+    fn feed_sse_chat_stream() {
+        let mut buf = Vec::new();
+        let (usage, done) = feed_sse(
+            &mut buf,
+            b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+        );
+        assert!(done);
+        let u = usage.expect("usage captured");
+        assert_eq!(u.input(), 4);
+        assert_eq!(u.output(), 2);
+    }
+
+    /// Responses 流：无 [DONE]，usage 嵌在 response 内，终态事件判定结束
+    #[test]
+    fn feed_sse_responses_stream() {
+        let mut buf = Vec::new();
+        let (usage, done) = feed_sse(
+            &mut buf,
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n\
+event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":7,\"total_tokens\":19}}}\n\n",
+        );
+        assert!(done, "response.completed 应判定结束");
+        let u = usage.expect("usage captured from response.completed");
+        assert_eq!(u.input(), 12);
+        assert_eq!(u.output(), 7);
+    }
+
+    /// Responses 流：response.done 也能判定结束（即便 usage 缺失）
+    #[test]
+    fn feed_sse_responses_done_without_usage() {
+        let mut buf = Vec::new();
+        let (usage, done) = feed_sse(&mut buf, b"data: {\"type\":\"response.done\"}\n\n");
+        assert!(done);
+        assert!(usage.is_none());
+    }
+
+    /// 跨块缓冲 + usage 双形态（Responses 顶层 usage 也支持）
+    #[test]
+    fn feed_sse_cross_chunk_and_top_level_responses_usage() {
+        let mut buf = Vec::new();
+        let (usage, done) = feed_sse(
+            &mut buf,
+            b"data: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1},\"response\":{}}\n\n",
+        );
+        assert!(done);
+        let u = usage.expect("usage");
+        assert_eq!(u.input(), 3);
+        assert_eq!(u.output(), 1);
+        // 跨块：半截事件
+        let mut buf = Vec::new();
+        let (_, done) = feed_sse(&mut buf, b"data: {\"a\":1}");
+        assert!(!done);
+        let (_, done) = feed_sse(&mut buf, b"\n\ndata: [DONE]\n\n");
+        assert!(done);
+    }
 }

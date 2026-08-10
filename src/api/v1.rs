@@ -25,9 +25,33 @@ pub(crate) fn resolve_client_ip(peer: SocketAddr, headers: &axum::http::HeaderMa
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(models))
+}
+
+/// POST /v1/responses：原生透传（上游 api_type=openai-responses）或
+/// 降级转换为 Chat Completions（其余上游），由 proxy 按 provider 决策
+async fn responses(
+    State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let ip = resolve_client_ip(addr, &headers);
+    proxy::proxy(
+        &st,
+        headers,
+        body,
+        Endpoint {
+            api: "/v1/responses",
+            upstream: "/responses",
+            responses: true,
+        },
+        ip,
+    )
+    .await
 }
 
 async fn chat_completions(
@@ -44,6 +68,7 @@ async fn chat_completions(
         Endpoint {
             api: "/v1/chat/completions",
             upstream: "/chat/completions",
+            responses: false,
         },
         ip,
     )
@@ -64,6 +89,7 @@ async fn completions(
         Endpoint {
             api: "/v1/completions",
             upstream: "/completions",
+            responses: false,
         },
         ip,
     )
@@ -84,6 +110,7 @@ async fn embeddings(
         Endpoint {
             api: "/v1/embeddings",
             upstream: "/embeddings",
+            responses: false,
         },
         ip,
     )

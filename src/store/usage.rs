@@ -16,11 +16,33 @@ pub struct UsageMeta {
     pub client_ip: Option<IpAddr>,
 }
 
-/// 供应商返回的 usage（OpenAI 兼容）
-#[derive(Debug, Clone, serde::Deserialize)]
+/// 供应商返回的 usage（双形态）：Chat Completions 用 prompt/completion_tokens，
+/// Responses API 用 input/output_tokens；缺失字段自动回退为 None（记账按 0 计）。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Usage {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+}
+
+impl Usage {
+    /// 输入 token：Chat 形态优先，Responses 形态回退
+    pub fn input(&self) -> i64 {
+        self.prompt_tokens.or(self.input_tokens).unwrap_or(0)
+    }
+
+    /// 输出 token：Chat 形态优先，Responses 形态回退
+    pub fn output(&self) -> i64 {
+        self.completion_tokens.or(self.output_tokens).unwrap_or(0)
+    }
+
+    /// 全部 token（输入 + 输出）
+    pub fn total(&self) -> i64 {
+        self.input() + self.output()
+    }
 }
 
 /// 记账：单事务写入明细 + UPSERT 月度配额计数（原子一致）
@@ -33,7 +55,7 @@ pub async fn record_usage(
     cost: f64,
 ) -> Result<(), sqlx::Error> {
     let (input, output) = usage
-        .map(|u| (u.prompt_tokens, u.completion_tokens))
+        .map(|u| (Some(u.input()), Some(u.output())))
         .unwrap_or((None, None));
     let tokens = input.unwrap_or(0) + output.unwrap_or(0);
 

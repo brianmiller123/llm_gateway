@@ -111,16 +111,17 @@ pub async fn record(
     status: u16,
     latency_ms: i64,
 ) {
-    let cost = crate::service::routing::compute_cost(st, &meta.model, {
-        usage.and_then(|u| u.prompt_tokens)
-    }, usage.and_then(|u| u.completion_tokens));
+    let cost = crate::service::routing::compute_cost(
+        st,
+        &meta.model,
+        usage.map(|u| u.input()),
+        usage.map(|u| u.output()),
+    );
     match record_usage(&st.pool, meta, usage, status, latency_ms, cost).await {
         Ok(()) => {
             if let Some(user_id) = meta.user_id {
                 let month = chrono::Utc::now().format("%Y-%m").to_string();
-                let tokens = usage
-                    .map(|u| u.prompt_tokens.unwrap_or(0) + u.completion_tokens.unwrap_or(0))
-                    .unwrap_or(0);
+                let tokens = usage.map(|u| u.total()).unwrap_or(0);
                 st.usage.incr(user_id, &month, tokens, cost);
             }
             tracing::info!(
@@ -128,8 +129,8 @@ pub async fn record(
                 model = %meta.model,
                 status,
                 latency_ms,
-                input_tokens = usage.and_then(|u| u.prompt_tokens),
-                output_tokens = usage.and_then(|u| u.completion_tokens),
+                input_tokens = usage.map(|u| u.input()),
+                output_tokens = usage.map(|u| u.output()),
                 cost,
                 "usage recorded"
             );

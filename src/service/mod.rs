@@ -4,6 +4,7 @@ pub mod keys_crypto;
 pub mod ldap;
 pub mod proxy;
 pub mod ratelimit;
+pub mod responses;
 pub mod routing;
 pub mod session;
 pub mod usage;
