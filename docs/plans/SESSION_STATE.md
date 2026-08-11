@@ -141,10 +141,15 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 - 仅前端文案改动；rpm/burst 字段名与 API 不变
 - 冒烟：Chrome CDP 登录 → /limits 页表格列头与新建弹窗表单 label 均为中文，无 pageerror
 
-## P14 配额列表缺用户 + 旧 Key 复制报错修复（已交付）
+## P15 实时监控页（已交付）
 
-- 问题 1：/api/admin/quotas 只返回已配置配额的 1 个用户（user_quotas JOIN users，未配置的用户不出现）
-  - 修复：store/config.rs list_quotas 改 `users LEFT JOIN user_quotas`，billing_day/notify_percent/enabled 用 COALESCE 默认值（1/80/TRUE），配额列 NULL = 不限制；列出全部 3 个用户
-- 问题 2：P10 前创建的旧 Key（key_encrypted IS NULL）复制时报笼统 400 "key not found or not owned by you"
-  - 修复：store/keys.rs find_encrypted 返回 `Option<Option<String>>`（None=行不存在/非本人；Some(None)=旧 Key 无密文；Some(Some)=密文）；console.rs reveal_key 对旧 Key 返回明确提示 "key was created before encrypted storage; delete and recreate the key to copy it again"，越权/不存在仍统一 400 文案
-- 冒烟：配额列表返回 alice/admin/bob 3 用户（未配置者默认值+null 配额）；alice 复制旧 Key id=1 → 重建提示；复制新 Key id=7 → 明文；复制 admin 的 id=6 → 统一 400
+- 需求：独立页面实时监测不同用户 LLM 调用情况（管理员）
+- 后端：`GET /api/admin/usage/realtime`（src/api/console.rs，require_admin）三条 SQL 全命中现有索引：
+  - `summary`：近 5 分钟全站 calls/errors（status>=400，NULL 不计）/token/平均延迟/成本
+  - `users`：近 60 分钟有调用的用户——5m/60m 调用与错误、token、成本、平均延迟、last_call_at；`LEFT JOIN users`（匿名请求 username NULL 归一行）；ORDER BY calls_5m DESC
+  - `recent`：最近 50 条明细（id DESC LIMIT 50），request_id CAST TEXT、cost CAST FLOAT8（sqlx NUMERIC→f64 必须显式 CAST）
+- 前端：`web/src/views/Realtime.vue` + 路由 `/monitor`（admin，meta.title 实时监控）+ Layout 菜单「实时监控」（审计日志下方，Monitor 图标全局注册无需 import）
+- 实时机制：2/5/10s 轮询 + 自动刷新开关 + visibilitychange 暂停/恢复 + inFlight 防重入；新行按 id 增量闪烁高亮（flashIds Set + row-class-name）；相对时间每秒 tick 重算
+- 复查修 bug（勿回退）：① `v-loading="loading"` 轮询闪烁 → `loading && !data`；② 失败弹窗刷屏 → errorShown 首次才弹、成功重置；③ flash setTimeout 泄漏 → 存 id 卸载清理；④ 空态在数据未到时误显「暂无调用」→ `v-if="data && …"`；⑤ 重新开启自动刷新需立即拉一次（watch 里 load+schedule）
+- 验证：cargo check / npm run build ✓；本地网关+种子 12 条实测聚合正确（bob 6 次/2 错、carol 2、匿名 401、alice 仅 60m 3 次/1 错）；权限实测 admin 200 / 非管理员 403 / 无 token 401；测试数据与测试用户（realtime_tester）已清理
+- 运行环境现状：postgres 容器 `llm_gateway-postgres-1` 在跑（schema 已迁移到 0008）；网关/mock/LDAP 未运行；测试账号 admin/admin12345（.env SEED_ADMIN_PASSWORD）

@@ -102,6 +102,46 @@ pub struct Endpoint {
     pub responses: bool,
 }
 
+/// 工具归一化：仅保留 function 类型工具。codex/gpt-5 客户端会声明
+/// `web_search` 等内置工具，DeepSeek 等上游反序列化时直接 400 ——
+/// 在网关层剥离，请求退化为纯函数调用（客户端可感知）。
+fn normalize_tools(json: &mut Value) -> bool {
+    let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return false;
+    };
+    let before = tools.len();
+    tools.retain(|t| {
+        matches!(t.get("type").and_then(|x| x.as_str()), None | Some("function"))
+    });
+    before != tools.len()
+}
+
+/// OpenAI 兼容归一化：gpt-5/codex 等客户端发送 `developer` role，多数上游
+/// （DeepSeek 等）不支持 → 改写为 `system`。同时覆盖 Chat `messages[]` 与
+/// Responses `input[]` 两种格式。返回是否发生改写（决定透传分支是否需重序列化）。
+fn normalize_chat_roles(json: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(arr) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in arr.iter_mut() {
+            if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
+                m["role"] = Value::String("system".into());
+                changed = true;
+            }
+        }
+    }
+    if let Some(arr) = json.get_mut("input").and_then(|m| m.as_array_mut()) {
+        for item in arr.iter_mut() {
+            if item.get("type").and_then(|t| t.as_str()) == Some("message")
+                && item.get("role").and_then(|r| r.as_str()) == Some("developer")
+            {
+                item["role"] = Value::String("system".into());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// OpenAI 兼容代理：鉴权 → 限流 → 配额 → 路由 → 转发（含降级）→ 记账
 pub async fn proxy(
     st: &AppState,
@@ -118,9 +158,11 @@ pub async fn proxy(
     // 2. 三层限流
     crate::service::ratelimit::apply_rate_limits(st, user_id, key_id)?;
 
-    // 3. 解析请求体
-    let json: Value = serde_json::from_slice(&body)
+    // 3. 解析请求体（先做 role 归一化，所有下游分支共用改写后的 json）
+    let mut json: Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?;
+    let mut roles_rewritten = normalize_chat_roles(&mut json);
+    roles_rewritten |= normalize_tools(&mut json);
     let model: String = json
         .get("model")
         .and_then(|m| m.as_str())
@@ -196,9 +238,13 @@ pub async fn proxy(
                 let mut json = json.clone();
                 json["model"] = serde_json::Value::String(target.clone());
                 Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
+            } else if roles_rewritten {
+                Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
             } else {
                 Ok((body.to_vec(), endpoint.upstream))
             }
+        } else if roles_rewritten {
+            Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
         } else {
             Ok((body.to_vec(), endpoint.upstream))
         }

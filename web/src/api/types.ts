@@ -113,6 +113,56 @@ export interface AdminUsageResp extends UsageResp {
   by_ip: IpUsageRow[]
 }
 
+/** 实时监控：近 5 分钟全站汇总 */
+export interface RealtimeSummary {
+  calls: number
+  errors: number
+  input_tokens: number
+  output_tokens: number
+  avg_latency_ms: number
+  cost: number
+}
+
+/** 实时监控：单用户窗口统计（近 60 分钟内有调用的用户） */
+export interface RealtimeUserStat {
+  user_id: number | null
+  username: string | null
+  display_name: string | null
+  calls_5m: number
+  errors_5m: number
+  calls_60m: number
+  errors_60m: number
+  input_tokens: number
+  output_tokens: number
+  cost: number
+  avg_latency_ms: number
+  last_call_at: string
+}
+
+/** 实时监控：最近请求明细行 */
+export interface RealtimeCallRow {
+  id: number
+  request_id: string
+  username: string | null
+  model: string
+  endpoint: string | null
+  streamed: boolean
+  input_tokens: number | null
+  output_tokens: number | null
+  latency_ms: number | null
+  status: number | null
+  cost: number | null
+  created_at: string
+}
+
+/** 实时监控响应（管理员） */
+export interface RealtimeUsageResp {
+  now: string
+  summary: RealtimeSummary
+  users: RealtimeUserStat[]
+  recent: RealtimeCallRow[]
+}
+
 /** 按日趋势点（图表） */
 export interface TrendPoint {
   stat_date: string

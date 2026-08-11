@@ -61,6 +61,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/api/admin/usage/trend",
             get(admin_usage_trend).layer(admin.clone()),
         )
+        .route(
+            "/api/admin/usage/realtime",
+            get(admin_usage_realtime).layer(admin.clone()),
+        )
         .route("/api/admin/audit", get(get_audit).layer(admin))
 }
 
@@ -552,6 +556,110 @@ async fn admin_usage(
         "by_user": by_user,
         "by_key": by_key,
         "by_ip": by_ip,
+    })))
+}
+
+/// 实时监控：近 5 分钟全站汇总
+#[derive(sqlx::FromRow, serde::Serialize)]
+struct RealtimeSummary {
+    calls: i64,
+    errors: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    avg_latency_ms: i64,
+    cost: f64,
+}
+
+/// 实时监控：单个用户窗口统计（近 60 分钟内有过调用的用户）
+#[derive(sqlx::FromRow, serde::Serialize)]
+struct RealtimeUserStat {
+    user_id: Option<i64>,
+    username: Option<String>,
+    display_name: Option<String>,
+    calls_5m: i64,
+    errors_5m: i64,
+    calls_60m: i64,
+    errors_60m: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost: f64,
+    avg_latency_ms: i64,
+    last_call_at: chrono::DateTime<Utc>,
+}
+
+/// 实时监控：最近请求明细行
+#[derive(sqlx::FromRow, serde::Serialize)]
+struct RealtimeCallRow {
+    id: i64,
+    request_id: String,
+    username: Option<String>,
+    model: String,
+    endpoint: Option<String>,
+    streamed: bool,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    latency_ms: Option<i32>,
+    status: Option<i16>,
+    cost: Option<f64>,
+    created_at: chrono::DateTime<Utc>,
+}
+
+/// 实时监控（管理员）：近 5 分钟全站汇总 + 近 60 分钟按用户统计 + 最近 50 条调用明细。
+/// 供前端轮询刷新，不做推送；全部命中 usage_logs 时间/主键索引。
+async fn admin_usage_realtime(
+    State(st): State<AppState>,
+    admin: axum::extract::Extension<users::UserRow>,
+) -> Result<impl IntoResponse, AppError> {
+    let _ = admin;
+
+    let summary: RealtimeSummary = sqlx::query_as(
+        "SELECT COUNT(*)::bigint AS calls, \
+                COUNT(*) FILTER (WHERE status >= 400)::bigint AS errors, \
+                COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens, \
+                COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens, \
+                COALESCE(AVG(latency_ms), 0)::bigint AS avg_latency_ms, \
+                COALESCE(SUM(cost), 0)::float8 AS cost \
+         FROM usage_logs WHERE created_at >= now() - interval '5 minutes'",
+    )
+    .fetch_one(&st.pool)
+    .await
+    .map_err(AppError::internal)?;
+
+    let users: Vec<RealtimeUserStat> = sqlx::query_as(
+        "SELECT u.id AS user_id, u.username, u.display_name, \
+                COUNT(*) FILTER (WHERE l.created_at >= now() - interval '5 minutes')::bigint AS calls_5m, \
+                COUNT(*) FILTER (WHERE l.created_at >= now() - interval '5 minutes' AND l.status >= 400)::bigint AS errors_5m, \
+                COUNT(*)::bigint AS calls_60m, \
+                COUNT(*) FILTER (WHERE l.status >= 400)::bigint AS errors_60m, \
+                COALESCE(SUM(l.input_tokens), 0)::bigint AS input_tokens, \
+                COALESCE(SUM(l.output_tokens), 0)::bigint AS output_tokens, \
+                COALESCE(SUM(l.cost), 0)::float8 AS cost, \
+                COALESCE(AVG(l.latency_ms), 0)::bigint AS avg_latency_ms, \
+                MAX(l.created_at) AS last_call_at \
+         FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id \
+         WHERE l.created_at >= now() - interval '60 minutes' \
+         GROUP BY u.id, u.username, u.display_name \
+         ORDER BY calls_5m DESC, calls_60m DESC",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(AppError::internal)?;
+
+    let recent: Vec<RealtimeCallRow> = sqlx::query_as(
+        "SELECT l.id, CAST(l.request_id AS TEXT) AS request_id, u.username, l.model, l.endpoint, l.streamed, \
+                l.input_tokens, l.output_tokens, l.latency_ms, l.status, CAST(l.cost AS FLOAT8) AS cost, l.created_at \
+         FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id \
+         ORDER BY l.id DESC LIMIT 50",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(Json(json!({
+        "now": Utc::now(),
+        "summary": summary,
+        "users": users,
+        "recent": recent,
     })))
 }
 

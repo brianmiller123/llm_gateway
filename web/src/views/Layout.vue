@@ -29,6 +29,9 @@
           <el-menu-item index="/audit">
             <el-icon><Document /></el-icon><span>审计日志</span>
           </el-menu-item>
+          <el-menu-item index="/monitor">
+            <el-icon><Monitor /></el-icon><span>实时监控</span>
+          </el-menu-item>
           <el-sub-menu index="config">
             <template #title>
               <el-icon><Setting /></el-icon><span>系统配置</span>

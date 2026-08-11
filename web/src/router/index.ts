@@ -16,6 +16,12 @@ const router = createRouter({
         { path: 'users', name: 'users', component: () => import('@/views/Users.vue'), meta: { title: '用户管理', admin: true } },
         { path: 'audit', name: 'audit', component: () => import('@/views/Audit.vue'), meta: { title: '审计日志', admin: true } },
         {
+          path: 'monitor',
+          name: 'monitor',
+          component: () => import('@/views/Realtime.vue'),
+          meta: { title: '实时监控', admin: true },
+        },
+        {
           path: 'providers',
           name: 'providers',
           component: () => import('@/views/Providers.vue'),

@@ -120,23 +120,24 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     // 单语句完成聚合 + 水位推进：整条语句共享同一快照
+    // 注意：不能用 `\` 续行拼接 SQL（会吞掉换行和缩进导致 token 粘连）
     sqlx::query(
-        "WITH m AS (\
-             SELECT COALESCE(MAX(id), $1) AS max_id FROM usage_logs\
-         ),\
-         agg AS (\
-             INSERT INTO usage_daily (user_id, model, stat_date, call_count, input_tokens, output_tokens, cost)\
-             SELECT user_id, model, (created_at AT TIME ZONE 'UTC')::date,\
-                    COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost),0)\
-             FROM usage_logs, m\
-             WHERE usage_logs.id > $1 AND usage_logs.id <= m.max_id\
-             GROUP BY user_id, model, (created_at AT TIME ZONE 'UTC')::date\
-             ON CONFLICT (user_id, model, stat_date) DO UPDATE SET\
-               call_count    = usage_daily.call_count    + EXCLUDED.call_count,\
-               input_tokens  = usage_daily.input_tokens  + EXCLUDED.input_tokens,\
-               output_tokens = usage_daily.output_tokens + EXCLUDED.output_tokens,\
-               cost          = usage_daily.cost          + EXCLUDED.cost\
-         )\
+        "WITH m AS (
+             SELECT COALESCE(MAX(id), $1) AS max_id FROM usage_logs
+         ),
+         agg AS (
+             INSERT INTO usage_daily (user_id, model, stat_date, call_count, input_tokens, output_tokens, cost)
+             SELECT user_id, model, (created_at AT TIME ZONE 'UTC')::date,
+                    COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost),0)
+             FROM usage_logs, m
+             WHERE usage_logs.id > $1 AND usage_logs.id <= m.max_id
+             GROUP BY user_id, model, (created_at AT TIME ZONE 'UTC')::date
+             ON CONFLICT (user_id, model, stat_date) DO UPDATE SET
+               call_count    = usage_daily.call_count    + EXCLUDED.call_count,
+               input_tokens  = usage_daily.input_tokens  + EXCLUDED.input_tokens,
+               output_tokens = usage_daily.output_tokens + EXCLUDED.output_tokens,
+               cost          = usage_daily.cost          + EXCLUDED.cost
+         )
          UPDATE aggregation_state SET watermark_id = (SELECT max_id FROM m) WHERE id = 1",
     )
     .bind(watermark.0)
