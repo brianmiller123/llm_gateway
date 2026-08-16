@@ -6,6 +6,12 @@ const router = createRouter({
   routes: [
     { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { public: true } },
     {
+      path: '/status',
+      name: 'status',
+      component: () => import('@/views/Status.vue'),
+      meta: { public: true },
+    },
+    {
       path: '/',
       component: () => import('@/views/Layout.vue'),
       children: [

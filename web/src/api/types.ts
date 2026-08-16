@@ -382,3 +382,54 @@ export interface LdapSettingsInput {
   user_filter: string
   admin_groups: string[]
 }
+
+// ---------- 服务状态页（公开，仿 status.openai.com） ----------
+
+export type ComponentStatus = 'operational' | 'degraded' | 'down' | 'unknown'
+
+export interface StatusComponent {
+  key: string
+  name: string
+  kind: 'system' | 'provider'
+  status: ComponentStatus
+  latency_ms: number | null
+  detail: string | null
+  /** 30 天可用率（0..1；无数据为 null） */
+  uptime_30d: number | null
+  calls_30d: number
+}
+
+export interface StatusDayPoint {
+  date: string
+  /** 当日成功率（0..1；无数据为 null） */
+  success_rate: number | null
+  calls: number
+  errors: number
+}
+
+export interface StatusUptimeSeries {
+  key: string
+  name: string
+  days: StatusDayPoint[]
+}
+
+export interface StatusIncident {
+  provider_id: number
+  provider_name: string
+  start: string
+  end: string
+  ongoing: boolean
+  severity: 'major' | 'minor'
+  error_rate: number
+  calls: number
+  errors: number
+  title: string
+}
+
+export interface StatusResp {
+  generated_at: string
+  overall: 'operational' | 'degraded' | 'down'
+  components: StatusComponent[]
+  uptime: StatusUptimeSeries[]
+  incidents: StatusIncident[]
+}

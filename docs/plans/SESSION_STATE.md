@@ -153,3 +153,17 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 - 复查修 bug（勿回退）：① `v-loading="loading"` 轮询闪烁 → `loading && !data`；② 失败弹窗刷屏 → errorShown 首次才弹、成功重置；③ flash setTimeout 泄漏 → 存 id 卸载清理；④ 空态在数据未到时误显「暂无调用」→ `v-if="data && …"`；⑤ 重新开启自动刷新需立即拉一次（watch 里 load+schedule）
 - 验证：cargo check / npm run build ✓；本地网关+种子 12 条实测聚合正确（bob 6 次/2 错、carol 2、匿名 401、alice 仅 60m 3 次/1 错）；权限实测 admin 200 / 非管理员 403 / 无 token 401；测试数据与测试用户（realtime_tester）已清理
 - 运行环境现状：postgres 容器 `llm_gateway-postgres-1` 在跑（schema 已迁移到 0008）；网关/mock/LDAP 未运行；测试账号 admin/admin12345（.env SEED_ADMIN_PASSWORD）
+
+## P16 公开服务状态页（已交付）
+
+- 需求：status.openai.com 风格状态页，无需登录公开访问
+- 后端：`GET /api/status`（src/api/status.rs，无鉴权，仅暴露供应商名/错误率/可用率，不含 Key）：
+  - 组件：网关 API（能响应即 operational）+ PostgreSQL（SELECT 1 计时）+ 每个启用供应商（st.providers 内存态）
+  - 供应商状态 = usage_logs 窗口错误率（status>=400 为失败；鉴权/限流 4xx 不写 usage_logs 不污染）：10 分钟窗口优先，样本 <5 次按 60 分钟 → 24 小时回退；>=50% down / >=10% degraded / 否则 operational；24h 无流量 unknown
+  - 30 天按日可用率（`(created_at AT TIME ZONE 'UTC')::date`，Rust 侧补零对齐 30 天）+ 整体 30 天可用率；系统组件无历史合成探测故不展示
+  - 事故 = 单小时桶调用>=5 且错误率>=50%，Rust 侧合并相邻小时为一次（峰值>=80% major 否则 minor，末小时距今<1h 标 ongoing），按 start 倒序截 20 条
+  - 整体 = 任一 down → down / 任一 degraded → degraded / 否则 operational
+- 前端：`web/src/views/Status.vue` + 公开路由 `/status`（meta.public，独立页不入 Layout）+ api.status()；横幅/组件列表/30 天色块条（el-tooltip 按日详情）/事故列表；60s 轮询 + 倒计时 + document.hidden 跳轮询；入口：侧边栏菜单底部「服务状态」（所有登录用户可见，CircleCheck 图标）+ Login 页脚 + Layout 用户下拉；document.title 覆盖
+- 坑（勿回退）：sqlx FromRow 按列名匹配——`date_trunc('hour', created_at) AS h` 配字段 `hour` 会解码失败，且原 match `_` 分支吞掉错误只留空数据；已改为别名对齐 + warn 日志带三查询各自错误
+- 验证：cargo check / npm run build ✓；本地网关+mock+postgres 造数 1392 条实测：10m 窗口 degraded/operational、24h unknown、30 天可用率（92.26%/76.54%/100%）、连续 2 小时事故合并（08-09 06:00→08:00Z major 83.5%）、单小时 major/minor、浏览器色块条颜色分布与事故条颜色、倒计时/自动刷新文案；种子数据已按 request_id 精确删除（表回到 77 条）；测试后网关以 GATEWAY_HTTP_REDIRECT=false 明文 8080 运行中
+- 环境现状：postgres/mock(9001)/网关(cargo run, pid 见 hub)在跑；compose 网关容器已 stop（镜像旧二进制无此端点，且曾与 8443 端口冲突）

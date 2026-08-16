@@ -1,5 +1,5 @@
 // 控制台 API 客户端：Bearer 注入、401 自动 refresh 重试一次、统一错误提取。
-import type { LoginResp } from './types'
+import type { LoginResp, StatusResp } from './types'
 
 const TOKEN_KEY = 'lg_access_token'
 const RT_KEY = 'lg_refresh_token'
@@ -112,4 +112,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ refresh_token: refreshToken }),
     }),
+  /** 服务状态页（公开端点，无需登录） */
+  status: () => request<StatusResp>('/api/status'),
 }

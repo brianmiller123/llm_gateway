@@ -1,5 +1,6 @@
 pub mod admin_config;
 pub mod console;
+pub mod status;
 pub mod v1;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -18,6 +19,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/", get(root))
         .merge(v1::routes())
+        .merge(status::routes())
         .merge(console::routes(state.clone()))
         .merge(admin_config::routes(state.clone()))
         // 控制台前端静态资源（Vue dist）；目录不存在时 ServeDir 自然 404

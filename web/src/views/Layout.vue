@@ -56,6 +56,9 @@
             </el-menu-item>
           </el-sub-menu>
         </template>
+        <el-menu-item index="/status">
+          <el-icon><CircleCheck /></el-icon><span>服务状态</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
@@ -76,6 +79,7 @@
               <el-dropdown-item disabled>
                 {{ auth.user?.username }}<template v-if="auth.isAdmin">（管理员）</template>
               </el-dropdown-item>
+              <el-dropdown-item divided command="status">服务状态页</el-dropdown-item>
               <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
             </el-dropdown-menu>
           </template>
@@ -101,6 +105,10 @@ const router = useRouter()
 const initial = computed(() => (auth.user?.display_name ?? auth.user?.username ?? '?').charAt(0).toUpperCase())
 
 async function onCommand(cmd: string) {
+  if (cmd === 'status') {
+    router.push('/status')
+    return
+  }
   if (cmd !== 'logout') return
   await ElMessageBox.confirm('确定退出登录吗？', '提示', { type: 'warning' })
   await auth.logout()

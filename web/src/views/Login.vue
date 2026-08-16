@@ -36,6 +36,7 @@
         </el-form-item>
       </el-form>
     </el-card>
+    <router-link to="/status" class="status-link">服务状态页 →</router-link>
   </div>
 </template>
 
@@ -114,5 +115,14 @@ async function onSubmit() {
 }
 .submit {
   width: 100%;
+}
+.status-link {
+  margin-top: 16px;
+  font-size: 13px;
+  color: #aeb9c7;
+  text-decoration: none;
+}
+.status-link:hover {
+  color: #fff;
 }
 </style>
