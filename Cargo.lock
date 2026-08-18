@@ -1241,6 +1241,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "ldap3",
+ "libc",
  "parking_lot",
  "rand 0.8.7",
  "reqwest",

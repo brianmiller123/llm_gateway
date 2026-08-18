@@ -47,6 +47,9 @@ pub struct AppConfig {
     pub seed_provider_base_url: Option<String>,
     pub seed_provider_api_key: Option<String>,
     pub seed_model_pattern: Option<String>,
+    /// 限流恢复豁免：主体（用户×Key）静默 ≥ 该时长后，恢复执行的首请求
+    /// 若被限流规则拒绝则豁免放行（每个空闲间隙至多一次）。0 = 关闭。
+    pub rate_idle_exempt_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +107,10 @@ impl AppConfig {
         if access_token_ttl <= 0 || refresh_token_ttl <= 0 {
             return Err("GATEWAY_ACCESS/REFRESH_TOKEN_TTL must be > 0 seconds".into());
         }
+
+        let rate_idle_exempt_secs: u64 = env("GATEWAY_RATE_IDLE_EXEMPT_SECS", "60")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_RATE_IDLE_EXEMPT_SECS: {e}"))?;
 
         Ok(Self {
             database_url: env(
@@ -166,6 +173,7 @@ impl AppConfig {
             seed_provider_base_url: std::env::var("SEED_PROVIDER_BASE_URL").ok(),
             seed_provider_api_key: std::env::var("SEED_PROVIDER_API_KEY").ok(),
             seed_model_pattern: std::env::var("SEED_MODEL_PATTERN").ok(),
+            rate_idle_exempt_secs,
         })
     }
 }

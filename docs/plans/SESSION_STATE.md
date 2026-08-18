@@ -167,3 +167,16 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 - 坑（勿回退）：sqlx FromRow 按列名匹配——`date_trunc('hour', created_at) AS h` 配字段 `hour` 会解码失败，且原 match `_` 分支吞掉错误只留空数据；已改为别名对齐 + warn 日志带三查询各自错误
 - 验证：cargo check / npm run build ✓；本地网关+mock+postgres 造数 1392 条实测：10m 窗口 degraded/operational、24h unknown、30 天可用率（92.26%/76.54%/100%）、连续 2 小时事故合并（08-09 06:00→08:00Z major 83.5%）、单小时 major/minor、浏览器色块条颜色分布与事故条颜色、倒计时/自动刷新文案；种子数据已按 request_id 精确删除（表回到 77 条）；测试后网关以 GATEWAY_HTTP_REDIRECT=false 明文 8080 运行中
 - 环境现状：postgres/mock(9001)/网关(cargo run, pid 见 hub)在跑；compose 网关容器已 stop（镜像旧二进制无此端点，且曾与 8443 端口冲突）
+
+## P17 限流长时间空闲恢复豁免（已交付）
+
+- 现象：agent 暂停等待用户确认时间较长后，恢复执行首请求 429，需额外冷却才能用
+- 根因（实测确认，非配额误扣）：令牌桶空闲期按真实时间回填、无任何扣减（320s 空闲后 5 连发全过）；真正机制是 **global 共享桶在暂停期间被其他会话耗尽**（演示配置 rpm=1/burst=5，回填每分钟 1 个），恢复首请求撞空桶 → 429 Retry-After=60s；叠加恢复瞬间的并发齐发打穿 burst。潜在计时缺陷：回填原用 std Instant（CLOCK_MONOTONIC），机器睡眠期间不走 → 睡眠等待后回填少计
+- 修复（src/service/ratelimit.rs 重构）：
+  - 回填时钟改 CLOCK_BOOTTIME（Linux/libc，含挂起时间；失败或非 Linux 回退 Instant）；桶内时间戳统一为 Ts=Duration，可注入测试
+  - 空闲恢复豁免：RateLimiter 新增 identities 表（u:{user}|k:{key} → last_active，任意结局请求都刷新）；静默 ≥ GATEWAY_RATE_IDLE_EXEMPT_SECS（默认 60，0=关）后的首请求若被拒则豁免放行（不扣空桶），INFO 日志 `rate limit resume exemption granted`；每空闲间隙一次；首次出现视同恢复（冷启动兜底）；登录 login:* 桶不参与
+  - apply_rate_limits 单锁原子处理全部匹配规则（原逐规则 check），拒绝时 WARN 日志带 identity 与 retry_secs；rpm<=0 不再产生 NaN（返回 INF）；error.rs Retry-After 钳制 ≤86400
+- 防滥用边界：豁免放大 ≤ 每主体每阈值窗口 1 请求且仅当拒绝桶已耗尽；高频请求攒不出间隙 → 防压制不变（实测 8 连发 5 过 3 拒、150 并发 120 过 30 拒）
+- 配置修正：global 规则 rpm=1/burst=5（初始演示数据）→ 600/100；429 冷却从 60s/令牌降到 0.1s/令牌
+- 验证：cargo test 37/37（新增 11 个限流单测：突发/短等待/长空闲回填/豁免触发与仅一次/高频不豁免/阈值0关闭/多桶扣减/rpm0/冷启动/规则热更/时钟单调）；e2e 实测（8080 明文 + mock 上游）：基线复现 alice 空闲 640s 恢复即 429 → 修复后同场景 200（豁免日志佐证）+ 第二发 429（每间隙一次）+ bob 8 连发仍 5 过 3 拒
+- 坑：被拒请求不扣令牌 → 30s 间隔持续压制收敛为通过率=rpm 的交替模式（断言"全部拒绝"是错的）；sustained 测试用同刻连发断言全拒 + 间隔压制断言令牌守恒上限

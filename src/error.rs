@@ -53,7 +53,8 @@ impl IntoResponse for AppError {
                     None,
                 ),
                 AppError::RateLimited(secs) => {
-                    let retry = secs.ceil().max(1.0) as u64;
+                    // 上限 24h：rpm<=0 的规则会产生无限等待，不能让 u64 溢出/巨值直达客户端
+                    let retry = secs.ceil().max(1.0).min(86400.0) as u64;
                     (
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate_limit_exceeded",

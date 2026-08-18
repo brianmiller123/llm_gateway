@@ -11,7 +11,7 @@
 - `POST /v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`GET /v1/models`
 - `POST /v1/responses`（OpenAI Responses API）：上游原生支持时透传（`api_type=openai-responses`），否则自动做 Responses ↔ Chat 转换（非流式 + 流式状态机），新旧 OpenAI SDK 均可直连
 - API Key 鉴权：Key 仅存 SHA-256 哈希 + 12 位前缀定位，明文只在创建时展示一次；可配置为不鉴权（仅本地开发）
-- 三层速率限制（API Key → 用户 → 全局，令牌桶），命中返回 429 + `Retry-After` + OpenAI 标准错误体
+- 三层速率限制（API Key → 用户 → 全局，令牌桶，BOOTTIME 回填时钟），命中返回 429 + `Retry-After` + OpenAI 标准错误体；长时间空闲后恢复的首请求空闲豁免，避免 agent 暂停等待用户确认后恢复即 429（见「限流与长时间空闲恢复」）
 - 月度配额：按用户限制 Token/成本上限，记账事务内原子扣减，超限 429
 - 模型路由：通配 pattern + priority 匹配，支持 `fallback_ids` 降级链（非流式对 429/5xx/超时自动重试；流式不重试避免重复生成）
 - Token 计量：优先解析上游 `usage`（流式自动注入 `include_usage`），usage 双形态（`prompt_tokens` / `input_tokens`）归一化
@@ -126,6 +126,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GATEWAY_MASTER_KEY` | — | AES-256-GCM 主密钥（64 hex），**必须更换**；缺失时 JWT 密钥由它派生 |
 | `GATEWAY_AUTH_MODE` | `api_key` | `none` = 跳过 API Key 鉴权（仅本地开发） |
 | `GATEWAY_RELOAD_INTERVAL` | `30` | 路由/限流/供应商配置热加载周期（秒） |
+| `GATEWAY_RATE_IDLE_EXEMPT_SECS` | `60` | 限流恢复豁免阈值：主体静默 ≥ 该秒数后恢复的首请求若被限流则豁免放行（每空闲间隙至多一次）；`0` = 关闭。见「限流与长时间空闲恢复」 |
 | `GATEWAY_WEB_DIR` | `web/dist` | 控制台静态资源目录；目录不存在时 `/` 返回服务信息 JSON |
 | `GATEWAY_JWT_SECRET` / `GATEWAY_ACCESS_TOKEN_TTL` / `GATEWAY_REFRESH_TOKEN_TTL` | 派生 / `900` / `2592000` | 控制台会话 |
 | `LDAP_URL` / `LDAP_STARTTLS` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_BASE_DN` / `LDAP_USER_FILTER` / `LDAP_ADMIN_GROUPS` | — | LDAP 登录（AD 默认 `sAMAccountName`，OpenLDAP 用 `uid`；不配置则仅本地账号） |
@@ -154,6 +155,36 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 - **30 天可用率**：按 UTC 日聚合成功率，绿/黄/红/深红分级
 - **事故**：单小时桶调用 ≥5 且错误率 ≥50% 判定事故小时，相邻小时自动合并为一次，峰值 ≥80% 标为重大，进行中（<1 小时）标注「进行中」
 - 系统组件（网关/PostgreSQL）只有实时状态，无历史可用率（被动监测无数据源，如实显示）
+
+
+## 限流与长时间空闲恢复
+
+### 策略与空闲期配额语义
+
+三层规则（API Key → 用户 → 全局）均为**进程内令牌桶**：桶容量 = `burst`，回填速率 = `rpm/60` 每秒，请求消耗 1 个令牌，不足即 429 + `Retry-After`（距下一个令牌的秒数，上限 24h）。空闲期间**没有任何扣减**——桶按真实流逝时间惰性回填直至 `burst`（`rpm=1, burst=5` 时空闲 5 分钟即回满）。回填时钟在 Linux 上取 `CLOCK_BOOTTIME`（含系统挂起/睡眠时间；`std::time::Instant` 的 `CLOCK_MONOTONIC` 在机器睡眠时不前进，会导致睡眠等待后的令牌少回填）。
+
+### 长时间等待后恢复触发 429 的根因
+
+agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）会被其他会话/其他用户的流量耗尽**。恢复执行的首请求撞上已耗尽的桶 → 429，`Retry-After = 60/rpm` 秒——低 rpm 配置下即“额外冷却分钟级才能用”。该主体的 user/key 桶哪怕已回满也无济于事，因为命中即拒作用于任一层。叠加因素：恢复瞬间客户端并发齐发（主循环 + 并行子代理），burst 再大也可能被瞬间打穿。
+
+### 修复：空闲恢复豁免（resume exemption）
+
+网关无法感知客户端“暂停/恢复”，因此不做计时暂停（服务端不可实现），改为**按可观测的空闲间隙豁免**：
+
+- 每个主体（`u:{user_id}|k:{key_id}`）记录最近一次活动时间，**任意结局的请求（含被拒）都刷新活动时间**；
+- 主体静默 ≥ `GATEWAY_RATE_IDLE_EXEMPT_SECS`（默认 60s）后的**首个请求**若被某层规则拒绝，则豁免放行（不扣空桶、不重置任何桶），并记录 `rate limit resume exemption granted` 日志；
+- 每个空闲间隙至多豁免一次；主体首次出现（冷启动）视同长空闲后恢复；
+- 高频请求永远攒不出空闲间隙，豁免零影响——防压制能力不变。
+
+**防滥用边界**：豁免最坏放大 = 每主体每阈值窗口 1 个请求（仅当拒绝桶已耗尽时发生）；N 个主体交替静默可造成聚合速率超出 global 上限 `N/阈值`，阈值即调节旋钮；登录限流（`login:*` 桶）不参与豁免。
+
+**运维要点**：global 层 rpm 决定 429 后每令牌冷却时间（`60/rpm` 秒），面向并行 agent 客户端建议 ≥ 数百 rpm + 百级 burst；本仓演示数据原为 `rpm=1, burst=5`（每分钟 1 请求），已调整为 `600/100`。豁免只解决“恢复首请求”，恢复后的持续速率仍受规则约束——客户端应遵循 `Retry-After` 重试（OpenAI 兼容客户端均支持）。
+
+### 已知边界
+
+- 单实例语义：豁免状态与令牌桶均在进程内，重启清零（重启后冷启动豁免兜底）；多实例需 Redis 实现。
+- 上游 429 与网关自身 429 相互独立：非流式按降级链重试上游 429/5xx；流式不重试（防重复生成），上游 429 原样透传。
+- 流式请求在网关自身限流处被拒时同样返回 429 JSON（未建立上游连接，无计费）。
 
 ## 数据模型
 
