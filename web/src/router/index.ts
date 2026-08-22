@@ -46,6 +46,12 @@ const router = createRouter({
           meta: { title: '路由规则', admin: true },
         },
         {
+          path: 'advanced-request',
+          name: 'advanced-request',
+          component: () => import('@/views/AdvancedRequest.vue'),
+          meta: { title: '高级请求配置', admin: true },
+        },
+        {
           path: 'limits',
           name: 'limits',
           component: () => import('@/views/Limits.vue'),
@@ -56,6 +62,12 @@ const router = createRouter({
           name: 'prices',
           component: () => import('@/views/Prices.vue'),
           meta: { title: '模型价格', admin: true },
+        },
+        {
+          path: 'api-endpoints',
+          name: 'api-endpoints',
+          component: () => import('@/views/ApiEndpoints.vue'),
+          meta: { title: 'API 端点', admin: true },
         },
         {
           path: 'settings',

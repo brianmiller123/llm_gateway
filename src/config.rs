@@ -23,7 +23,9 @@ pub struct AppConfig {
     pub reload_interval_secs: u64,
     /// 控制台前端静态资源目录（Vue dist；不存在时跳过托管）
     pub web_dir: PathBuf,
-    /// JWT 签名密钥（缺省由主密钥派生）
+    /// 对外公开基址（https://host[:port]）：管理页/用户页展示调用地址用。
+    /// 缺省按请求 Host/X-Forwarded-* 推导
+    pub public_base_url: Option<String>,
     pub jwt_secret: [u8; 32],
     /// access token 有效期（秒）
     pub access_token_ttl: i64,
@@ -50,6 +52,33 @@ pub struct AppConfig {
     /// 限流恢复豁免：主体（用户×Key）静默 ≥ 该时长后，恢复执行的首请求
     /// 若被限流规则拒绝则豁免放行（每个空闲间隙至多一次）。0 = 关闭。
     pub rate_idle_exempt_secs: u64,
+    /// 流式首字节超时（秒）：等待首个上游 chunk 的最长时间；0 = 禁用
+    pub stream_first_byte_timeout_secs: u64,
+    /// 流式静默超时（秒）：相邻 chunk 间最大间隔；0 = 禁用
+    pub stream_idle_timeout_secs: u64,
+    /// L29：出站上游代理（http/https/socks5 URL，如 http://127.0.0.1:7890）；
+    /// 未配置时不启用（需经代理出海的部署使用）
+    pub upstream_proxy: Option<String>,
+    /// M4：降级链尝试上限（主渠道 + N-1 个降级候选；>= 1）
+    pub max_attempts: u32,
+    /// M5：非流式请求总超时（秒，含响应体读取；0 = 禁用总超时）。
+    /// 与 header 超时（provider.timeout_ms）解耦——长推理生成不被掐断
+    pub non_stream_timeout_secs: u64,
+    /// H6：反应式整流（4xx 媒体降级 / thinking 剥离后同上游重试一次）全局开关
+    pub rectify_enabled: bool,
+    /// P1-3：向原生 Anthropic 上游注入 anthropic-beta `claude-code-20250219`
+    /// 标记（仿 Claude Code 客户端指纹；依赖 beta 分流/计费的上游需要，
+    /// 默认关闭——普通 API key 场景无意义）
+    pub anthropic_inject_claude_code_beta: bool,
+    /// M4：熔断器参数（cc-switch circuit_breaker 同款；可调优）
+    pub breaker_failure_threshold: u32,
+    pub breaker_open_secs: u64,
+    pub breaker_failure_rate: f64,
+    pub breaker_min_requests: u64,
+    pub breaker_window_secs: u64,
+    /// M4：半开需连续成功次数才闭合（cc-switch success_threshold=2；单次成功
+    /// 闭合会让抖动上游在开-半开间震荡）
+    pub breaker_success_threshold: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +140,58 @@ impl AppConfig {
         let rate_idle_exempt_secs: u64 = env("GATEWAY_RATE_IDLE_EXEMPT_SECS", "60")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_RATE_IDLE_EXEMPT_SECS: {e}"))?;
-
+        // cc-switch ProxyConfig 同款：首字节 60s 默认、静默 120s 默认、0 禁用
+        let stream_first_byte_timeout_secs: u64 = env("GATEWAY_STREAM_FIRST_BYTE_TIMEOUT", "60")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_STREAM_FIRST_BYTE_TIMEOUT: {e}"))?;
+        let stream_idle_timeout_secs: u64 = env("GATEWAY_STREAM_IDLE_TIMEOUT", "120")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_STREAM_IDLE_TIMEOUT: {e}"))?;
+        let upstream_proxy = std::env::var("GATEWAY_UPSTREAM_PROXY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        // M4：降级链尝试上限（>= 1）
+        let max_attempts: u32 = env("GATEWAY_MAX_ATTEMPTS", "4")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_MAX_ATTEMPTS: {e}"))?;
+        if max_attempts == 0 {
+            return Err("GATEWAY_MAX_ATTEMPTS must be >= 1".into());
+        }
+        // M5：非流式总超时独立可配（cc-switch non_streaming_timeout 600s 默认；0 禁用）
+        let non_stream_timeout_secs: u64 = env("GATEWAY_NON_STREAM_TIMEOUT", "600")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_NON_STREAM_TIMEOUT: {e}"))?;
+        // H6：反应式整流全局开关
+        let rectify_enabled = env_bool("GATEWAY_RECTIFY_ENABLED", true)?;
+        // P1-3：Anthropic claude-code beta 标记注入（默认关闭）
+        let anthropic_inject_claude_code_beta =
+            env_bool("GATEWAY_ANTHROPIC_INJECT_CLAUDE_CODE_BETA", false)?;
+        // M4：熔断器参数（默认与既有常量一致；success_threshold=2 为 cc-switch 对齐）
+        let breaker_failure_threshold: u32 = env("GATEWAY_BREAKER_FAILURE_THRESHOLD", "4")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_BREAKER_FAILURE_THRESHOLD: {e}"))?;
+        let breaker_open_secs: u64 = env("GATEWAY_BREAKER_OPEN_SECS", "30")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_BREAKER_OPEN_SECS: {e}"))?;
+        let breaker_failure_rate: f64 = env("GATEWAY_BREAKER_FAILURE_RATE", "0.6")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_BREAKER_FAILURE_RATE: {e}"))?;
+        if !(0.0..=1.0).contains(&breaker_failure_rate) {
+            return Err("GATEWAY_BREAKER_FAILURE_RATE must be in [0,1]".into());
+        }
+        let breaker_min_requests: u64 = env("GATEWAY_BREAKER_MIN_REQUESTS", "10")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_BREAKER_MIN_REQUESTS: {e}"))?;
+        let breaker_window_secs: u64 = env("GATEWAY_BREAKER_WINDOW_SECS", "120")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_BREAKER_WINDOW_SECS: {e}"))?;
+        let breaker_success_threshold: u32 = env("GATEWAY_BREAKER_SUCCESS_THRESHOLD", "2")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_BREAKER_SUCCESS_THRESHOLD: {e}"))?;
+        if breaker_success_threshold == 0 {
+            return Err("GATEWAY_BREAKER_SUCCESS_THRESHOLD must be >= 1".into());
+        }
         Ok(Self {
             database_url: env(
                 "GATEWAY_DATABASE_URL",
@@ -137,10 +217,13 @@ impl AppConfig {
             auth_mode,
             reload_interval_secs,
             web_dir: PathBuf::from(env("GATEWAY_WEB_DIR", "web/dist")),
+            public_base_url: std::env::var("GATEWAY_PUBLIC_BASE_URL")
+                .ok()
+                .map(|v| v.trim().trim_end_matches('/').to_string())
+                .filter(|v| !v.is_empty()),
             jwt_secret: {
                 let hex = env("GATEWAY_JWT_SECRET", "");
                 if hex.is_empty() {
-                    // 缺省由主密钥确定性派生
                     sha2::Sha256::digest(master_key).into()
                 } else {
                     let bytes = hex::decode(&hex)
@@ -174,6 +257,19 @@ impl AppConfig {
             seed_provider_api_key: std::env::var("SEED_PROVIDER_API_KEY").ok(),
             seed_model_pattern: std::env::var("SEED_MODEL_PATTERN").ok(),
             rate_idle_exempt_secs,
+            rectify_enabled,
+            anthropic_inject_claude_code_beta,
+            breaker_failure_threshold,
+            stream_first_byte_timeout_secs,
+            stream_idle_timeout_secs,
+            upstream_proxy,
+            max_attempts,
+            non_stream_timeout_secs,
+            breaker_open_secs,
+            breaker_failure_rate,
+            breaker_min_requests,
+            breaker_window_secs,
+            breaker_success_threshold,
         })
     }
 }

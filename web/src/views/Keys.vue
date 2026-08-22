@@ -1,5 +1,14 @@
 <template>
   <div class="keys-page">
+    <el-card v-if="endpointList.length" shadow="never" class="endpoints-card">
+      <template #header><span>调用地址</span></template>
+      <div v-for="ep in endpointList" :key="ep.path" class="endpoint-row">
+        <el-tag size="small" type="primary" effect="plain">{{ ep.title }}</el-tag>
+        <code class="endpoint-addr">{{ ep.address }}</code>
+        <el-button link type="primary" size="small" @click="copyAddr(ep.address)">复制</el-button>
+      </div>
+    </el-card>
+
     <el-card shadow="never" class="keys-card">
       <div class="toolbar">
         <p class="desc">API Key 用于调用 /v1/* 接口，创建后仅显示一次</p>
@@ -8,7 +17,6 @@
           <span>新建 Key</span>
         </el-button>
       </div>
-
       <el-table :data="keys" v-loading="loading" stripe>
         <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip />
         <el-table-column label="Key 前缀" min-width="170">
@@ -100,14 +108,41 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ApiError, request } from '@/api/client'
-import type { CreateKeyResp, KeyMeta, KeysResp } from '@/api/types'
+import { api, ApiError, request } from '@/api/client'
+import type { CreateKeyResp, KeyMeta, KeysResp, PublicEndpointInfo, PublicEndpointsResp } from '@/api/types'
 
 const keys = ref<KeyMeta[]>([])
 const loading = ref(false)
 
+// 调用地址（公开端点，按管理员可见性开关过滤；全部隐藏时面板不展示）
+const endpoints = ref<PublicEndpointsResp | null>(null)
+const endpointList = computed<{ path: string; title: string; address: string }[]>(() => {
+  const eps = endpoints.value
+  if (!eps) return []
+  const list: { path: string; title: string; address: string }[] = []
+  if (eps.responses) list.push({ path: eps.responses.path, title: 'Response API', address: eps.responses.address })
+  if (eps.messages) list.push({ path: eps.messages.path, title: 'Anthropic Messages', address: eps.messages.address })
+  return list
+})
+
+async function loadEndpoints() {
+  try {
+    endpoints.value = await api.publicEndpoints()
+  } catch {
+    endpoints.value = null
+  }
+}
+
+async function copyAddr(addr: string) {
+  try {
+    await navigator.clipboard.writeText(addr)
+    ElMessage.success('地址已复制')
+  } catch {
+    ElMessage.error('复制失败（浏览器权限受限）')
+  }
+}
 const dialogVisible = ref(false)
 const creating = ref(false)
 const createdKey = ref<CreateKeyResp | null>(null)
@@ -218,7 +253,10 @@ function formatTime(iso: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-onMounted(loadKeys)
+onMounted(() => {
+  loadKeys()
+  loadEndpoints()
+})
 </script>
 
 <style scoped>
@@ -226,8 +264,29 @@ onMounted(loadKeys)
   padding: 16px;
 }
 
-.keys-card {
+.endpoints-card {
   border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.endpoint-addr {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 13px;
+  background: #f5f7fa;
+  border-radius: 4px;
+  padding: 2px 8px;
+  color: #303133;
+  word-break: break-all;
+}
+
+.keys-card {
 }
 
 .toolbar {

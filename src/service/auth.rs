@@ -27,13 +27,23 @@ pub async fn authenticate(
         return Ok((None, None));
     }
 
-    let auth = headers
+    // M7：Anthropic 客户端（Claude Code / Claude SDK）默认发 `x-api-key` 而非
+    // Bearer；Authorization 缺失时回退读取 x-api-key（同一 Key 库校验）
+    let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Auth("missing Authorization header".into()))?;
-    let key = auth
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| AppError::Auth("authorization scheme must be Bearer".into()))?;
+        .and_then(|auth| auth.strip_prefix("Bearer "));
+    let key = bearer
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+        })
+        .ok_or_else(|| {
+            AppError::Auth("missing Authorization: Bearer header or x-api-key header".into())
+        })?;
     if key.len() < 16 {
         return Err(AppError::Auth("invalid api key".into()));
     }

@@ -38,23 +38,49 @@ pub fn user_can_use(st: &AppState, user_id: i64, provider_id: i64, model: &str) 
     })
 }
 
-/// 计算计费金额：cost = in/1e6 * p_in + out/1e6 * p_out；无单价记 0
+/// 计算计费金额：cost = in/1e6 * p_in + out/1e6 * p_out + 缓存桶独立费率
+/// （未配置缓存单价时回退 input 单价，与历史行为一致）；无单价记 0。
+/// 注意 input_tokens 已包含缓存桶（OpenAI 口径），缓存部分按缓存费率、
+/// 其余 (input − cache_read − cache_write) 按 input 费率，不重复计费。
+/// L4：内部按微美元整数累计（i128），终值才转 f64——消除逐桶 f64 累加的
+/// 舍入漂移（cc-switch usage/calculator.rs Decimal 精确计费同款动机，
+/// 不引入新依赖）。
 pub fn compute_cost(
     st: &AppState,
     model: &str,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
 ) -> f64 {
     let prices = st.prices.read();
     let Some(price) = prices.get(model) else {
         return 0.0;
     };
-    let mut cost = 0.0;
-    if let (Some(t), Some(p)) = (input_tokens, price.input_price_per_m) {
-        cost += t as f64 / 1e6 * p;
+    // 单价（每百万 token）→ 微美元整数（每百万 token 的价格 × 1e6）
+    let micros = |p: f64| (p * 1_000_000.0).round() as i128;
+    let bucket = |tokens: i64, p_micros: i128| (tokens as i128).saturating_mul(p_micros) / 1_000_000;
+    let mut cost_micros: i128 = 0;
+    if let Some(t) = input_tokens {
+        let cache_read = cache_read_tokens.unwrap_or(0).min(t);
+        let cache_write = cache_write_tokens.unwrap_or(0).min(t.saturating_sub(cache_read));
+        let fresh = t - cache_read - cache_write;
+        if let Some(p) = price.input_price_per_m {
+            cost_micros += bucket(fresh, micros(p));
+        }
+        if cache_read > 0 {
+            if let Some(p) = price.cache_read_price_per_m.or(price.input_price_per_m) {
+                cost_micros += bucket(cache_read, micros(p));
+            }
+        }
+        if cache_write > 0 {
+            if let Some(p) = price.cache_write_price_per_m.or(price.input_price_per_m) {
+                cost_micros += bucket(cache_write, micros(p));
+            }
+        }
     }
     if let (Some(t), Some(p)) = (output_tokens, price.output_price_per_m) {
-        cost += t as f64 / 1e6 * p;
+        cost_micros += bucket(t, micros(p));
     }
-    cost
+    cost_micros as f64 / 1_000_000.0
 }

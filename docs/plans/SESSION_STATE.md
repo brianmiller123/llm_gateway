@@ -180,3 +180,33 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 - 配置修正：global 规则 rpm=1/burst=5（初始演示数据）→ 600/100；429 冷却从 60s/令牌降到 0.1s/令牌
 - 验证：cargo test 37/37（新增 11 个限流单测：突发/短等待/长空闲回填/豁免触发与仅一次/高频不豁免/阈值0关闭/多桶扣减/rpm0/冷启动/规则热更/时钟单调）；e2e 实测（8080 明文 + mock 上游）：基线复现 alice 空闲 640s 恢复即 429 → 修复后同场景 200（豁免日志佐证）+ 第二发 429（每间隙一次）+ bob 8 连发仍 5 过 3 拒
 - 坑：被拒请求不扣令牌 → 30s 间隔持续压制收敛为通过率=rpm 的交替模式（断言"全部拒绝"是错的）；sustained 测试用同刻连发断言全拒 + 间隔压制断言令牌守恒上限
+
+## P18 Anthropic Messages API + Responses 转换层 cc-switch 化重构（已交付）
+
+- 依据：`docs/cc-switch-protocol-conversion-analysis.md`（cc-switch v3.20.0 转换层逆向分析）
+- 新增 `POST /v1/messages`（Anthropic Messages API，Claude Code / Claude SDK 直连）：
+  - `src/service/anthropic/`（mod/transform/convert_resp/stream 四文件）：transform = Anthropic→Chat 请求（system 数组拼接+billing header 剥离、tool_use→tool_calls canonical args、tool_result→role:tool 消息、thinking→reasoning_content、DeepSeek/MiMo vendor hint 空 thinking 补占位符 "tool call"、tool_choice any→required/对象形态、input_schema 强制根 object）；convert_resp = Chat→Anthropic（thinking/text/tool_use 块、finish↔stop_reason（tool_calls 但无有效 tool_use 块→end_turn 防客户端解析失败）、usage 三桶恒等式 input=prompt−cached−cache_creation）；stream = Chat SSE→Anthropic SSE 状态机（message_start→content_block_start/delta/stop→message_delta(仅一次,后到 finish 覆盖)→message_stop；工具块 id+name 到齐才 start、参数先缓冲；错误帧→event:error 抑制正常收尾；断流有输出优雅收尾/零输出 error 事件）
+  - 决策门：provider api_type=anthropic 透传（Endpoint{anthic:true}，proxy per-provider 判定）；Anthropic 方言跳过 normalize_chat_roles/normalize_tools；错误按客户端方言整形（AppError→anthropic::error_response；上游非 2xx 或 200+JSON 错误体→reshape_upstream_error 提取 error.message/message/detail/base_resp.status_msg）；流式非 SSE 错误体缓冲整形返回
+- Responses 转换层按 cc-switch 模式加固（service/responses/）：
+  - dto Usage 增加多源缓存字段（prompt_tokens_details.cached_tokens > input_tokens_details > cache_read_input_tokens > DeepSeek prompt_cache_hit_tokens；cache_write 同理），input_tokens_details 归一化合并
+  - 无名工具调用护栏（#4341）：非流式/流式全部丢弃且无其他输出 → status=failed + upstream_tool_call_dropped（length 豁免）；流式工具 added 延迟到 id+name 到齐（参数缓冲冲刷），无名工具不进终态 output
+  - 流内错误帧（chunk.error）→ response.failed（extract_stream_error 多路径提取）；断流兜底 finalize_truncated：有输出→incomplete/max_output_tokens，零输出→failed/stream_truncated（尾帧不再伪装 completed）
+  - 工具参数 canonical 化（service/canonical.rs 键排序递归）保上游前缀缓存
+  - convert_resp 增 refusal→text 兜底、reasoning 别名
+- mock_upstream.py 扩展：请求带 tools→tool_calls 响应（流式分帧 identity/args）、消息带 reasoning_content 或 "think"→reasoning_content 输出；用于两条管线的工具/思考 E2E
+- 验证：cargo test 70/70（新增 33：anthropic transform 8/convert_resp 6/stream 8/mod 4 + canonical 3 + responses 护栏/缓存 4）、cargo build 零警告；E2E（auth=none + mock + PG）：非流式基础/工具往返含 thinking（stop_reason=tool_use、args 解析为对象）/流式完整事件序列（message_start→…→message_stop，tool_use 块 index 正确）/400 未路由→anthropic 错误形状/上游 200+JSON 错误体（流式+非流式）→reshape/usage_logs 记账 12/7（错误零 token）/Responses 回归（基础+带工具延迟启动）/chat 回归/api_type=anthropic 透传（404 原样）
+- 修复过程发现并修正：①多 finish_reason 语义改为"后到覆盖"（mock 文本帧带 stop、工具帧带 tool_calls 的真实序列暴露首帧锁定错误）；②stop_reason=tool_use 必须有实际 tool_use 块；③非 JSON 上游错误体回退原文提取
+- 运行环境现状：gateway（hub，GATEWAY_AUTH_MODE=none，本地 debug 二进制 8443）/mock-upstream（hub，9001）/postgres 容器在跑；compose gateway 容器已 stop（旧镜像无 /v1/messages，与 8443 冲突）
+- 后续可选（未做，文档 §5.2 对应）：管线③④（Responses↔Anthropic 直转，供 Codex 客户端+Anthropic 上游与反向）；typed IR 替代动态 JSON；content_filter 语义在 Anthropic 方向仍丢失（end_turn）
+
+## P19 高级请求配置（extra_body 透传，已交付）
+
+- 需求：vLLM/SGLang 等推理引擎上 Qwen3 思考参数（`chat_template_kwargs.thinking` / `reasoning_effort`）无法经网关透传；需要通用请求体扩展机制（top_k / repetition_penalty 等后端特有参数）
+- 存储（迁移 0009）：`providers.extra_body`、`model_routes.extra_body` JSONB NOT NULL DEFAULT '{}'（空对象 = 未配置）；`system_settings.extra_body_enabled` BOOLEAN DEFAULT TRUE（全局开关，停用不丢配置）；sqlx 开 `json` feature
+- 合并语义（src/service/proxy.rs build_outbound）：渠道级为底、路由级（模型级）覆盖同名叶键（effective_extra）→ 深合并进出站体（apply_extra，对象递归合并/标量与数组覆盖/客户端独有字段保留）；四个分支全接入（Anthropic→Chat 转换 / Responses→Chat 转换 / 流式 chat / 直传——有 extra 或 role 改写或模型映射时才重建体，否则保持原始字节零拷贝快路径）；`model`/`stream`/`stream_options` 为网关托管字段（API 写入拒绝 + 合并时二次剥离）
+- 全局开关：AppState.extra_body_enabled RwLock，reload() 从 system_settings 热加载；GET/PUT `/api/admin/settings/extra-body`（audit settings.extra_body.update）
+- API：providers/routes CRUD 扩展 extra_body（create 默认 {}；PATCH 缺省=不改、空对象=清空），validate_extra_body：必须是 JSON 对象、拒绝托管顶层字段、≤8KB
+- 前端：`web/src/views/AdvancedRequest.vue`（菜单「高级请求配置」/advanced-request，MagicStick 图标）：全局开关（关闭出 warning alert）、两个 tab（按渠道/按模型，模型级覆盖渠道级）、JSON 编辑器 + 校验 + 7 个快捷预设（Qwen3 思考 max/开/关、enable_thinking、top_k、repetition_penalty）、最终请求体实时预览（基础请求可编辑 × 渠道/路由下拉组合，前端 deepMerge 与后端同语义）；types.ts 增 extra_body/ExtraBodySettingsResp
+- 验证：cargo test 73/73（新增 merge_deep/effective_extra/apply_extra 3 个单测）、cargo build 零警告、npm run build 零错；E2E（临时 capture 服务器 9002 + 测试 provider/route，已清理）：客户端 chat_template_kwargs.client_field 保留、渠道 thinking:true+top_k 生效、模型级 reasoning_effort 覆盖渠道级、清空模型级回落渠道级、全局开关关闭不合并/恢复即生效、托管字段与非对象 400、/v1/messages 转换路径与流式路径均正确合并、stream_options.include_usage 共存；浏览器：预设应用/保存/表格回显、模型级对话框（标题+覆盖提示）、全局开关 alert 出现与消失、预览区合并输出正确（基础请求校验与 extra_body 校验分离——model 在基础请求中合法）
+- 坑（勿回退）：save_extra_body_enabled 首版 SQL 用 $2 只绑 1 参 → bind 参数错误（已改 $1）；前端预览误用 extra_body 校验函数检查基础请求导致 `// 顶层字段 "model" 由网关管理`（拆 validateBaseJson/validateJson）；edit 工具多 hunk 编辑 Vue SFC 时错位 → 最后整文件重写
+- 运行环境现状：gateway（hub，8443，admin/admin12345）/mock-upstream（hub，9001）/postgres 容器在跑；schema 已迁移到 0009；测试残留已清理（providers/routes extra_body 全空、开关 true）

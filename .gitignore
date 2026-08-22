@@ -2,3 +2,7 @@
 .env
 certs/
 third/
+vendor/
+*.zip
+test_.py
+*.pyc

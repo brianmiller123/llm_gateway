@@ -112,12 +112,49 @@ pub async fn record(
     status: u16,
     latency_ms: i64,
 ) {
-    let cost = crate::service::routing::compute_cost(
+    // 管理员测试调用不记账：不写 usage_logs，不污染状态页/用量统计
+    if meta.test_call {
+        return;
+    }
+    // M33：计价双查（cc-switch pricing_model_source 语义）——客户端模型名优先，
+    // 回退路由映射后的上游模型名；均无价格 → 记 0 并告警（此前静默记 0，
+    // 无对账线索）
+    let mut cost = crate::service::routing::compute_cost(
         st,
         &meta.model,
         usage.map(|u| u.input()),
         usage.map(|u| u.output()),
+        usage.and_then(|u| u.cache_read_tokens),
+        usage.and_then(|u| u.cache_write_tokens),
     );
+    if cost == 0.0 && usage.is_some() {
+        for fallback in &meta.pricing_models {
+            if *fallback == meta.model {
+                continue;
+            }
+            cost = crate::service::routing::compute_cost(
+                st,
+                fallback,
+                usage.map(|u| u.input()),
+                usage.map(|u| u.output()),
+                usage.and_then(|u| u.cache_read_tokens),
+                usage.and_then(|u| u.cache_write_tokens),
+            );
+            if cost > 0.0 {
+                break;
+            }
+        }
+    }
+    if cost == 0.0 && usage.is_some() {
+        // M33：缺价告警（cc-switch USG-002 同款）——启用模型名映射而价格表
+        // 只配上游名（或反之）时，计费全部记 0 且此前无任何告警
+        tracing::warn!(
+            request_id = %meta.request_id,
+            model = %meta.model,
+            pricing_models = ?meta.pricing_models,
+            "no price configured for model; cost recorded as 0"
+        );
+    }
     match record_usage(&st.pool, meta, usage, status, latency_ms, cost).await {
         Ok(()) => {
             if let Some(user_id) = meta.user_id {

@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        .route("/v1/messages", post(messages))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(models))
@@ -48,10 +49,40 @@ async fn responses(
             api: "/v1/responses",
             upstream: "/responses",
             responses: true,
+            anthropic: false,
         },
         ip,
     )
     .await
+}
+
+/// POST /v1/messages：Anthropic Messages API。上游 api_type=anthropic 透传；
+/// 其余（默认 openai 等 Chat 兼容上游）降级转换 Anthropic ↔ Chat。
+/// 网关内部错误整形为 Anthropic 单错误对象形状（客户端方言）。
+async fn messages(
+    State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let ip = resolve_client_ip(addr, &headers);
+    match proxy::proxy(
+        &st,
+        headers,
+        body,
+        Endpoint {
+            api: "/v1/messages",
+            upstream: "/messages",
+            responses: false,
+            anthropic: true,
+        },
+        ip,
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => Ok(crate::service::anthropic::error_response(&e)),
+    }
 }
 
 async fn chat_completions(
@@ -69,6 +100,7 @@ async fn chat_completions(
             api: "/v1/chat/completions",
             upstream: "/chat/completions",
             responses: false,
+            anthropic: false,
         },
         ip,
     )
@@ -90,6 +122,7 @@ async fn completions(
             api: "/v1/completions",
             upstream: "/completions",
             responses: false,
+            anthropic: false,
         },
         ip,
     )
@@ -111,6 +144,7 @@ async fn embeddings(
             api: "/v1/embeddings",
             upstream: "/embeddings",
             responses: false,
+            anthropic: false,
         },
         ip,
     )

@@ -16,13 +16,21 @@ pub struct AdminProvider {
     pub api_key_encrypted: String,
     pub timeout_ms: i32,
     pub enabled: bool,
+    /// extra_body 透传配置（JSON 对象；{} = 未配置）
+    pub extra_body: serde_json::Value,
+    /// 认证形态：bearer（默认）/ x-api-key
+    pub auth_scheme: String,
+    /// 渠道级静态附加请求头（{} = 未配置）
+    pub extra_headers: serde_json::Value,
+    /// H6：渠道是否支持图像输入（FALSE → 发前主动降级图片 part）
+    pub supports_images: bool,
     pub created_at: DateTime<Utc>,
 }
 
 /// 按 id 查供应商（存在性校验用）
 pub async fn find_provider(pool: &PgPool, id: i64) -> Result<Option<AdminProvider>, sqlx::Error> {
     sqlx::query_as::<_, AdminProvider>(
-        "SELECT id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, created_at \
+        "SELECT id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, extra_body, auth_scheme, extra_headers, supports_images, created_at \
          FROM providers WHERE id = $1",
     )
     .bind(id)
@@ -32,7 +40,7 @@ pub async fn find_provider(pool: &PgPool, id: i64) -> Result<Option<AdminProvide
 
 pub async fn list_providers(pool: &PgPool) -> Result<Vec<AdminProvider>, sqlx::Error> {
     sqlx::query_as::<_, AdminProvider>(
-        "SELECT id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, created_at \
+        "SELECT id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, extra_body, auth_scheme, extra_headers, supports_images, created_at \
          FROM providers ORDER BY id",
     )
     .fetch_all(pool)
@@ -47,11 +55,15 @@ pub async fn create_provider(
     api_key_encrypted: &str,
     timeout_ms: i32,
     enabled: bool,
+    extra_body: &serde_json::Value,
+    auth_scheme: &str,
+    extra_headers: &serde_json::Value,
+    supports_images: bool,
 ) -> Result<AdminProvider, sqlx::Error> {
     sqlx::query_as::<_, AdminProvider>(
-        "INSERT INTO providers (name, api_type, base_url, api_key_encrypted, timeout_ms, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, created_at",
+        "INSERT INTO providers (name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, extra_body, auth_scheme, extra_headers, supports_images) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         RETURNING id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, extra_body, auth_scheme, extra_headers, supports_images, created_at",
     )
     .bind(name)
     .bind(api_type)
@@ -59,6 +71,10 @@ pub async fn create_provider(
     .bind(api_key_encrypted)
     .bind(timeout_ms)
     .bind(enabled)
+    .bind(extra_body)
+    .bind(auth_scheme)
+    .bind(extra_headers)
+    .bind(supports_images)
     .fetch_one(pool)
     .await
 }
@@ -72,6 +88,11 @@ pub async fn update_provider(
     api_key_encrypted: Option<&str>,
     timeout_ms: Option<i32>,
     enabled: Option<bool>,
+    // None = 不修改；Some(空对象) = 清空
+    extra_body: Option<&serde_json::Value>,
+    auth_scheme: Option<&str>,
+    extra_headers: Option<&serde_json::Value>,
+    supports_images: Option<bool>,
 ) -> Result<Option<AdminProvider>, sqlx::Error> {
     sqlx::query_as::<_, AdminProvider>(
         "UPDATE providers SET \
@@ -80,9 +101,13 @@ pub async fn update_provider(
             base_url = COALESCE($4, base_url), \
             api_key_encrypted = COALESCE($5, api_key_encrypted), \
             timeout_ms = COALESCE($6, timeout_ms), \
-            enabled = COALESCE($7, enabled) \
+            enabled = COALESCE($7, enabled), \
+            extra_body = COALESCE($8, extra_body), \
+            auth_scheme = COALESCE($9, auth_scheme), \
+            extra_headers = COALESCE($10, extra_headers), \
+            supports_images = COALESCE($11, supports_images) \
          WHERE id = $1 \
-         RETURNING id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, created_at",
+         RETURNING id, name, api_type, base_url, api_key_encrypted, timeout_ms, enabled, extra_body, auth_scheme, extra_headers, supports_images, created_at",
     )
     .bind(id)
     .bind(name)
@@ -91,10 +116,13 @@ pub async fn update_provider(
     .bind(api_key_encrypted)
     .bind(timeout_ms)
     .bind(enabled)
+    .bind(extra_body)
+    .bind(auth_scheme)
+    .bind(extra_headers)
+    .bind(supports_images)
     .fetch_optional(pool)
     .await
 }
-
 // ---------- 路由规则 ----------
 
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
@@ -107,11 +135,21 @@ pub struct AdminRoute {
     /// 上游实际模型名（映射）；NULL = 透传客户端模型名
     pub upstream_model: Option<String>,
     pub enabled: bool,
+    /// 模型级 extra_body（覆盖渠道级同名叶键；{} = 未配置）
+    pub extra_body: serde_json::Value,
+    /// 模型级开关：system 消息收拢到头部（管理员按模型启用）
+    pub strict_system_head: bool,
+    /// H3：reasoning_effort 值域钳制模式（NULL = passthrough）
+    pub reasoning_effort_mode: Option<String>,
+    /// H3：thinking 形态（NULL = 剥离；thinking_param / reasoning_split / enable_thinking）
+    pub thinking_form: Option<String>,
+    /// H2：Responses 方言字段透传白名单（逗号分隔；NULL = 全部剥离）
+    pub responses_passthrough_fields: Option<String>,
 }
 
 pub async fn list_routes(pool: &PgPool) -> Result<Vec<AdminRoute>, sqlx::Error> {
     sqlx::query_as::<_, AdminRoute>(
-        "SELECT id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled \
+        "SELECT id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields \
          FROM model_routes ORDER BY priority, id",
     )
     .fetch_all(pool)
@@ -126,11 +164,16 @@ pub async fn create_route(
     fallback_ids: &[i64],
     upstream_model: Option<&str>,
     enabled: bool,
+    extra_body: &serde_json::Value,
+    strict_system_head: bool,
+    reasoning_effort_mode: Option<&str>,
+    thinking_form: Option<&str>,
+    responses_passthrough_fields: Option<&str>,
 ) -> Result<AdminRoute, sqlx::Error> {
     sqlx::query_as::<_, AdminRoute>(
-        "INSERT INTO model_routes (model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled",
+        "INSERT INTO model_routes (model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields",
     )
     .bind(model_pattern)
     .bind(provider_id)
@@ -138,6 +181,11 @@ pub async fn create_route(
     .bind(fallback_ids)
     .bind(upstream_model)
     .bind(enabled)
+    .bind(extra_body)
+    .bind(strict_system_head)
+    .bind(reasoning_effort_mode)
+    .bind(thinking_form)
+    .bind(responses_passthrough_fields)
     .fetch_one(pool)
     .await
 }
@@ -151,10 +199,29 @@ pub async fn update_route(
     fallback_ids: Option<Vec<i64>>,
     upstream_model: Option<Option<String>>,
     enabled: Option<bool>,
+    // None = 不修改；Some(空对象) = 清空
+    extra_body: Option<&serde_json::Value>,
+    strict_system_head: Option<bool>,
+    // H3：None = 不修改；Some(None) = 清空回 passthrough；Some(Some(v)) = 设置
+    reasoning_effort_mode: Option<Option<String>>,
+    thinking_form: Option<Option<String>>,
+    responses_passthrough_fields: Option<Option<String>>,
 ) -> Result<Option<AdminRoute>, sqlx::Error> {
     // upstream_model 语义：None = 不修改；Some(None) = 清空映射；Some(Some(v)) = 设置
     // SQL 无法区分 NULL 与缺失，故用 $8 布尔标记（$6 为 NULL 时 CASE 决定保留/清空）
     let (upstream_val, upstream_provided) = match upstream_model {
+        Some(inner) => (inner, true),
+        None => (None, false),
+    };
+    let (mode_val, mode_provided) = match reasoning_effort_mode {
+        Some(inner) => (inner, true),
+        None => (None, false),
+    };
+    let (thinking_val, thinking_provided) = match thinking_form {
+        Some(inner) => (inner, true),
+        None => (None, false),
+    };
+    let (passthrough_val, passthrough_provided) = match responses_passthrough_fields {
         Some(inner) => (inner, true),
         None => (None, false),
     };
@@ -165,9 +232,14 @@ pub async fn update_route(
             priority = COALESCE($4, priority), \
             fallback_ids = COALESCE($5, fallback_ids), \
             upstream_model = CASE WHEN $8 THEN $6 ELSE upstream_model END, \
-            enabled = COALESCE($7, enabled) \
+            enabled = COALESCE($7, enabled), \
+            extra_body = COALESCE($9, extra_body), \
+            strict_system_head = COALESCE($10, strict_system_head), \
+            reasoning_effort_mode = CASE WHEN $12 THEN $11 ELSE reasoning_effort_mode END, \
+            thinking_form = CASE WHEN $14 THEN $13 ELSE thinking_form END, \
+            responses_passthrough_fields = CASE WHEN $16 THEN $15 ELSE responses_passthrough_fields END \
          WHERE id = $1 \
-         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled",
+         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields",
     )
     .bind(id)
     .bind(model_pattern)
@@ -177,6 +249,14 @@ pub async fn update_route(
     .bind(upstream_val)
     .bind(enabled)
     .bind(upstream_provided)
+    .bind(extra_body)
+    .bind(strict_system_head)
+    .bind(mode_val)
+    .bind(mode_provided)
+    .bind(thinking_val)
+    .bind(thinking_provided)
+    .bind(passthrough_val)
+    .bind(passthrough_provided)
     .fetch_optional(pool)
     .await
 }
@@ -543,4 +623,147 @@ pub async fn save_ldap_settings(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ---------- 系统设置（extra_body 全局开关） ----------
+
+/// extra_body 合并全局开关（false = 保留配置但不合并，方便临时停用）
+pub async fn load_extra_body_enabled(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let row: Option<(bool,)> =
+        sqlx::query_as("SELECT extra_body_enabled FROM system_settings WHERE id = 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0).unwrap_or(true))
+}
+
+pub async fn save_extra_body_enabled(pool: &PgPool, enabled: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE system_settings SET extra_body_enabled = $1, updated_at = now() WHERE id = 1")
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ---------- 系统设置（API 端点管理） ----------
+
+/// API 端点运行时开关：启用/停用与用户页地址可见性（Response API × Messages API 独立）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiEndpointSettings {
+    pub responses_enabled: bool,
+    pub responses_visible: bool,
+    pub messages_enabled: bool,
+    pub messages_visible: bool,
+}
+
+#[derive(FromRow)]
+struct ApiEndpointRow {
+    responses_enabled: bool,
+    responses_visible: bool,
+    messages_enabled: bool,
+    messages_visible: bool,
+}
+
+/// 读取 API 端点开关（单行表，迁移保证列存在；缺省全部启用/可见）
+pub async fn load_api_endpoint_settings(pool: &PgPool) -> Result<ApiEndpointSettings, sqlx::Error> {
+    let row: Option<ApiEndpointRow> = sqlx::query_as(
+        "SELECT responses_enabled, responses_visible, messages_enabled, messages_visible \
+         FROM system_settings WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|r| ApiEndpointSettings {
+            responses_enabled: r.responses_enabled,
+            responses_visible: r.responses_visible,
+            messages_enabled: r.messages_enabled,
+            messages_visible: r.messages_visible,
+        })
+        .unwrap_or(ApiEndpointSettings {
+            responses_enabled: true,
+            responses_visible: true,
+            messages_enabled: true,
+            messages_visible: true,
+        }))
+}
+
+/// 保存 API 端点开关（单行 upsert 语义；UPDATE 命中 id=1 恒存在）
+pub async fn save_api_endpoint_settings(
+    pool: &PgPool,
+    s: &ApiEndpointSettings,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE system_settings SET responses_enabled = $1, responses_visible = $2, \
+         messages_enabled = $3, messages_visible = $4, updated_at = now() WHERE id = 1",
+    )
+    .bind(s.responses_enabled)
+    .bind(s.responses_visible)
+    .bind(s.messages_enabled)
+    .bind(s.messages_visible)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------- API 测试结果 ----------
+
+/// 管理员 API 测试历史行（按时间倒序返回给前端）
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct ApiTestResultRow {
+    pub id: i64,
+    pub api: String,
+    pub admin_id: Option<i64>,
+    pub model: String,
+    pub stream: bool,
+    pub status_code: i32,
+    pub ok: bool,
+    pub latency_ms: i64,
+    pub error: String,
+    pub body_preview: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn insert_api_test_result(
+    pool: &PgPool,
+    api: &str,
+    admin_id: Option<i64>,
+    model: &str,
+    stream: bool,
+    status_code: i32,
+    ok: bool,
+    latency_ms: i64,
+    error: &str,
+    body_preview: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO api_test_results \
+         (api, admin_id, model, stream, status_code, ok, latency_ms, error, body_preview) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(api)
+    .bind(admin_id)
+    .bind(model)
+    .bind(stream)
+    .bind(status_code)
+    .bind(ok)
+    .bind(latency_ms)
+    .bind(error)
+    .bind(body_preview)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 最近 N 条测试结果（时间倒序；limit 由调用方钳制）
+pub async fn list_api_test_results(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ApiTestResultRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, api, admin_id, model, stream, status_code, ok, latency_ms, error, \
+         body_preview, created_at FROM api_test_results ORDER BY created_at DESC, id DESC \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }

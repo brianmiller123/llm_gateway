@@ -1,29 +1,31 @@
 # LLM Gateway
 
-企业内网 LLM API 网关：对外暴露 **OpenAI 兼容接口**（Chat Completions / Responses / Embeddings），统一鉴权、限流、配额、路由与用量计费，并提供带管理后台的 Web 控制台和公开服务状态页。
+企业内网 LLM API 网关：对外暴露 **OpenAI 兼容接口**（Chat Completions / Responses / Embeddings）与 **Anthropic Messages 接口**（Claude Code / Claude SDK 直连），统一鉴权、限流、配额、路由与用量计费，并提供带管理后台的 Web 控制台和公开服务状态页。
 
 单二进制部署（Rust + axum），唯一外部依赖 PostgreSQL。定位为 <200 用户、低并发的内部部署，架构预留多实例扩展路径。
 
 ## 功能特性
 
-**网关（OpenAI 兼容代理）**
+**网关（协议转换代理）**
 
 - `POST /v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`GET /v1/models`
 - `POST /v1/responses`（OpenAI Responses API）：上游原生支持时透传（`api_type=openai-responses`），否则自动做 Responses ↔ Chat 转换（非流式 + 流式状态机），新旧 OpenAI SDK 均可直连
+- `POST /v1/messages`（Anthropic Messages API，参照 cc-switch 转换层实现）：上游 `api_type=anthropic` 时透传，其余上游自动做 Anthropic ↔ Chat 降级转换——system（含 Claude Code billing header 剥离）/ tool_use ↔ tool_calls（参数 canonical JSON 保前缀缓存）/ tool_result → tool 消息 / thinking ↔ reasoning_content（DeepSeek 等厂商 tool-call 消息空思考自动补占位符）/ usage 三桶恒等式（input + cache_read + cache_creation == prompt_tokens 双向换算）/ finish_reason ↔ stop_reason / 流式 SSE 状态机（message_start → content_block_* → message_delta/message_stop，多 finish_reason 去重、工具块延迟启动、断流兜底）/ 错误整形为 Anthropic 单错误对象形状
+- Responses ↔ Chat 转换层按 cc-switch 模式加固：usage 多源缓存字段归一化（prompt_tokens_details.cached_tokens / cache_read_input_tokens / DeepSeek prompt_cache_hit_tokens）、无名工具调用护栏（全部丢弃时报 failed 而非伪 completed）、流内错误帧 → response.failed、断流区分 incomplete/failed
 - API Key 鉴权：Key 仅存 SHA-256 哈希 + 12 位前缀定位，明文只在创建时展示一次；可配置为不鉴权（仅本地开发）
 - 三层速率限制（API Key → 用户 → 全局，令牌桶，BOOTTIME 回填时钟），命中返回 429 + `Retry-After` + OpenAI 标准错误体；长时间空闲后恢复的首请求空闲豁免，避免 agent 暂停等待用户确认后恢复即 429（见「限流与长时间空闲恢复」）
 - 月度配额：按用户限制 Token/成本上限，记账事务内原子扣减，超限 429
 - 模型路由：通配 pattern + priority 匹配，支持 `fallback_ids` 降级链（非流式对 429/5xx/超时自动重试；流式不重试避免重复生成）
 - Token 计量：优先解析上游 `usage`（流式自动注入 `include_usage`），usage 双形态（`prompt_tokens` / `input_tokens`）归一化
-- 用量计费：按模型单价 × Token 计算成本，请求日志与配额计数**同事务原子写入**，无对账需求
-- 上游 4xx/5xx 透明透传不吞错误；全链路 `request_id`（uuid v4）+ `X-Request-Id` 透传
+- 高级请求配置（extra_body 透传）：渠道级（供应商）与模型级（路由规则）各一份 JSON 对象，请求转发前深合并进上游请求体（模型级覆盖渠道级同名叶键，配置覆盖客户端同名叶键、客户端独有字段保留）——解决 vLLM/SGLang 上 Qwen3 思考参数（`chat_template_kwargs.thinking` / `reasoning_effort`）无法透传的问题，兼容 `top_k`、`repetition_penalty` 等后端特有参数；全局开关可临时停用而不丢配置；`model`/`stream`/`stream_options` 由网关管理、配置被拒绝
+- 上游 4xx/5xx 透明透传不吞错误（/v1/messages 按客户端方言整形为 Anthropic 错误体）；全链路 `request_id`（uuid v4）+ `X-Request-Id` 透传
 
 **控制台（Vue 3 + Element Plus）**
 
 - LDAP 登录（AD / OpenLDAP 配置驱动，memberOf 组映射管理员）+ 本地账号；内置 break-glass 本地管理员
 - JWT 会话（access 15 分钟 / refresh 30 天，可配置），支持强制下线（token 版本吊销）
 - 仪表盘、API Key 自助管理、用量统计（时间段 × 模型维度 + 图表）、实时监控（5 分钟粒度轮询）
-- 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线）、供应商配置（Key AES-256-GCM 加密落库，永不回显）、路由规则、模型库、限流规则、月度配额、模型价格、LDAP 设置（含连通性测试）
+- 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线）、供应商配置（Key AES-256-GCM 加密落库，永不回显；`api_type` 区分 openai / openai-responses / anthropic）、路由规则、模型库、限流规则、月度配额、模型价格、LDAP 设置（含连通性测试）、高级请求配置（extra_body JSON 编辑 + 校验 + 快捷预设 + 最终请求体实时预览）
 - 管理操作全部写入审计日志，可追溯
 
 **公开状态页（仿 status.openai.com）**
@@ -44,10 +46,10 @@ flowchart LR
         subgraph GW["gateway 容器 — Rust 单二进制 (axum)"]
             T["TLS 终结 (rustls)<br/>8443 HTTPS + 8080"]
             P["/v1/* 代理管线<br/>鉴权 → 限流 → 配额 → 路由 → 转发(SSE) → 记账"]
-            R["Responses ↔ Chat 转换层"]
+            R["协议转换层<br/>Responses ↔ Chat / Anthropic ↔ Chat"]
             C["控制台 API + 静态资源 (Vue dist)"]
             W["后台任务：usage_daily 聚合 (60s)"]
-        end
+        }
         PG[("postgres — 唯一外部依赖")]
     end
     A -->|HTTPS| T --> P --> R
@@ -57,7 +59,6 @@ flowchart LR
     W --> PG
     P -. 上游转发 .-> U["DeepSeek / 通义 / GLM / vLLM / OpenAI"]
 ```
-
 关键设计决策：
 
 1. **模块化单体**：代理热路径、控制台、后台任务同进程；无 Nginx（TLS 由 rustls 终结，静态资源由 tower-http 托管），无 Redis。
@@ -140,10 +141,11 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GET /healthz` | 无 | 存活探针 |
 | `GET /` | 无 | 服务信息 JSON（配置了前端目录时为控制台页面） |
 | `POST /v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/responses`、`GET /v1/models` | Bearer API Key | OpenAI 兼容调用面 |
+| `POST /v1/messages` | Bearer API Key | Anthropic Messages 调用面（Claude Code / Claude SDK；错误体为 Anthropic 形状） |
 | `GET /api/status` | 无 | 公开状态：组件状态 + 30 天可用率 + 事故 |
 | `POST /api/auth/login`、`/refresh`、`/logout` | — | 控制台会话（LDAP / 本地账号） |
 | `GET /api/me`、`/api/keys`、`/api/usage`、`/api/usage/trend` | JWT | 个人资料、Key 管理、用量查询 |
-| `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/quotas`、`/prices`、`/models`、`/settings/ldap`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
+| `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/quotas`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
 
 错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；限流 429 带 `Retry-After`；上游错误透明透传。
 
@@ -204,14 +206,14 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 ```bash
 # 后端：需要本地 PostgreSQL（或 docker compose up -d postgres）
 cargo run                      # 读取 .env，监听 8443/8080
-cargo test                     # 单元测试 26 项（Responses 转换 + SSE 解析回归）
+cargo test                     # 单元测试 70 项（Responses/Anthropic 转换 + SSE 状态机 + 限流回归）
 
 # 前端（Vite dev server，/api 与 /v1 代理到 8443）
 cd web && npm install && npm run dev
 npm run build                  # vue-tsc 类型检查 + 产物构建（提交前必跑）
 
 # 无真实上游时本地模拟
-python3 scripts/mock_upstream.py   # http://127.0.0.1:9001/v1，支持 chat/responses
+python3 scripts/mock_upstream.py   # http://127.0.0.1:9001/v1，支持 chat（含 tools/reasoning/错误场景）/responses
 ```
 
 其他脚本：`scripts/gen-cert.sh`（自签证书）、`scripts/deploy-local-binary.sh`（本机编译 release 后打运行时镜像）、`scripts/seed-ldap.sh`（演示用 OpenLDAP 种子数据，配合 `--profile ldap`）。

@@ -1,5 +1,13 @@
 // 控制台 API 客户端：Bearer 注入、401 自动 refresh 重试一次、统一错误提取。
-import type { LoginResp, StatusResp } from './types'
+import type {
+  ApiEndpointsReq,
+  ApiEndpointsResp,
+  ApiTestResp,
+  ApiTestResult,
+  LoginResp,
+  PublicEndpointsResp,
+  StatusResp,
+} from './types'
 
 const TOKEN_KEY = 'lg_access_token'
 const RT_KEY = 'lg_refresh_token'
@@ -112,6 +120,26 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ refresh_token: refreshToken }),
     }),
+  /** 管理员：API 端点配置（查看/保存） */
+  apiEndpoints: () => request<ApiEndpointsResp>('/api/admin/api-endpoints'),
+  putApiEndpoints: (p: ApiEndpointsReq) =>
+    request<ApiEndpointsResp>('/api/admin/api-endpoints', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(p),
+    }),
+  /** 管理员：发送 API 测试请求（走真实代理管线） */
+  testApiEndpoint: (p: { api: 'responses' | 'messages'; stream: boolean; body: unknown }) =>
+    request<ApiTestResp>('/api/admin/api-endpoints/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(p),
+    }),
+  /** 管理员：最近测试结果 */
+  apiTestResults: (limit = 20) =>
+    request<{ results: ApiTestResult[] }>(`/api/admin/api-endpoints/results?limit=${limit}`),
+  /** 公开：用户页展示的调用地址（按可见性开关过滤） */
+  publicEndpoints: () => request<PublicEndpointsResp>('/api/endpoints'),
   /** 服务状态页（公开端点，无需登录） */
   status: () => request<StatusResp>('/api/status'),
 }

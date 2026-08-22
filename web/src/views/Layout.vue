@@ -45,14 +45,14 @@
             <el-menu-item index="/routes">
               <el-icon><Share /></el-icon><span>路由规则</span>
             </el-menu-item>
+            <el-menu-item index="/advanced-request">
+              <el-icon><MagicStick /></el-icon><span>高级请求配置</span>
+            </el-menu-item>
             <el-menu-item index="/limits">
               <el-icon><Timer /></el-icon><span>限流与配额</span>
             </el-menu-item>
-            <el-menu-item index="/prices">
-              <el-icon><Money /></el-icon><span>模型价格</span>
-            </el-menu-item>
-            <el-menu-item index="/settings">
-              <el-icon><Setting /></el-icon><span>系统设置</span>
+            <el-menu-item index="/api-endpoints">
+              <el-icon><Link /></el-icon><span>API 端点</span>
             </el-menu-item>
           </el-sub-menu>
         </template>

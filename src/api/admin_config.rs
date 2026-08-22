@@ -3,9 +3,10 @@
 
 use std::error::Error as StdError;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
@@ -84,13 +85,32 @@ pub fn routes(state: AppState) -> Router<AppState> {
                 .put(put_ldap_settings)
                 .layer(admin.clone()),
         )
+        .route(
+            "/api/admin/settings/extra-body",
+            get(get_extra_body_settings)
+                .put(put_extra_body_settings)
+                .layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/api-endpoints",
+            get(get_api_endpoint_settings)
+                .put(put_api_endpoint_settings)
+                .layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/api-endpoints/test",
+            post(test_api_endpoint).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/api-endpoints/results",
+            get(list_api_test_results).layer(admin.clone()),
+        )
         .route("/api/admin/models/{id}", delete(delete_model).layer(admin.clone()))
         .route(
             "/api/admin/settings/ldap/test",
             post(test_ldap_settings).layer(admin),
         )
 }
-
 /// 管理员身份（require_admin 注入）
 type Admin = Extension<users::UserRow>;
 
@@ -468,6 +488,17 @@ struct ProviderReq {
     timeout_ms: i32,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default = "empty_object")]
+    extra_body: serde_json::Value,
+    /// 认证形态：bearer（默认）/ x-api-key
+    #[serde(default = "default_auth_scheme")]
+    auth_scheme: String,
+    /// 渠道级静态附加请求头（覆盖同名透传头）
+    #[serde(default = "empty_object")]
+    extra_headers: serde_json::Value,
+    /// H6：渠道是否支持图像输入（false = 发前主动降级图片）
+    #[serde(default = "default_true")]
+    supports_images: bool,
 }
 
 fn default_api_type() -> String {
@@ -478,6 +509,66 @@ fn default_timeout() -> i32 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_auth_scheme() -> String {
+    "bearer".into()
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// extra_body 配置校验：必须是 JSON 对象、不含网关管理的顶层字段、≤ 8KB
+fn validate_extra_body(v: &serde_json::Value) -> Result<(), AppError> {
+    let Some(obj) = v.as_object() else {
+        return Err(AppError::BadRequest("extra_body must be a JSON object".into()));
+    };
+    for k in obj.keys() {
+        if matches!(k.as_str(), "model" | "stream" | "stream_options") {
+            return Err(AppError::BadRequest(format!(
+                "extra_body top-level field '{k}' is managed by the gateway (model/stream/stream_options) and cannot be overridden"
+            )));
+        }
+    }
+    if serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX) > 8 * 1024 {
+        return Err(AppError::BadRequest("extra_body too large (max 8KB)".into()));
+    }
+    Ok(())
+}
+
+/// auth_scheme / extra_headers 配置校验：scheme 限枚举；headers 必须是
+/// 值全为字符串的 JSON 对象（header 名合法字符）、不含网关管理的认证头、≤ 4KB
+fn validate_extra_headers(scheme: &str, headers: &serde_json::Value) -> Result<(), AppError> {
+    let scheme = scheme.trim();
+    if !matches!(scheme, "bearer" | "x-api-key") {
+        return Err(AppError::BadRequest(
+            "auth_scheme must be 'bearer' or 'x-api-key'".into(),
+        ));
+    }
+    let Some(obj) = headers.as_object() else {
+        return Err(AppError::BadRequest("extra_headers must be a JSON object".into()));
+    };
+    for (k, v) in obj {
+        // 网关自管头：认证/内容类型/请求追踪不允许被渠道配置覆盖
+        let lower = k.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "authorization" | "x-api-key" | "content-type" | "x-request-id" | "content-length" | "host"
+        ) {
+            return Err(AppError::BadRequest(format!(
+                "extra_headers field '{k}' is managed by the gateway and cannot be set"
+            )));
+        }
+        if !v.is_string() {
+            return Err(AppError::BadRequest(format!(
+                "extra_headers field '{k}' must be a string value"
+            )));
+        }
+    }
+    if serde_json::to_vec(headers).map(|b| b.len()).unwrap_or(usize::MAX) > 4 * 1024 {
+        return Err(AppError::BadRequest("extra_headers too large (max 4KB)".into()));
+    }
+    Ok(())
 }
 
 async fn encrypt_key(st: &AppState, plain: Option<&str>) -> Result<Option<String>, AppError> {
@@ -510,6 +601,8 @@ async fn create_provider(
     if name.is_empty() || name.len() > 64 {
         return Err(AppError::BadRequest("provider name must be 1-64 chars".into()));
     }
+    validate_extra_body(&req.extra_body)?;
+    validate_extra_headers(&req.auth_scheme, &req.extra_headers)?;
     let api_key = req
         .api_key
         .as_deref()
@@ -526,6 +619,10 @@ async fn create_provider(
         &enc,
         req.timeout_ms,
         req.enabled,
+        &req.extra_body,
+        req.auth_scheme.trim(),
+        &req.extra_headers,
+        req.supports_images,
     )
     .await
     .map_err(AppError::internal)?;
@@ -536,7 +633,7 @@ async fn create_provider(
         "provider.create",
         Some("provider"),
         Some(provider.id),
-        Some(json!({"name": name})),
+        Some(json!({"name": name, "extra_body": req.extra_body})),
     )
     .await
     .map_err(AppError::internal)?;
@@ -544,7 +641,6 @@ async fn create_provider(
     p.api_key_encrypted = mask_key(&p.api_key_encrypted);
     Ok(Json(json!({"provider": p})).into_response())
 }
-
 #[derive(Deserialize)]
 struct ProviderPatch {
     name: Option<String>,
@@ -553,6 +649,17 @@ struct ProviderPatch {
     api_key: Option<String>,
     timeout_ms: Option<i32>,
     enabled: Option<bool>,
+    /// None/缺省 = 不修改；空对象 = 清空
+    #[serde(default)]
+    extra_body: Option<serde_json::Value>,
+    #[serde(default)]
+    auth_scheme: Option<String>,
+    /// None/缺省 = 不修改；空对象 = 清空
+    #[serde(default)]
+    extra_headers: Option<serde_json::Value>,
+    /// H6：渠道是否支持图像输入
+    #[serde(default)]
+    supports_images: Option<bool>,
 }
 
 async fn update_provider(
@@ -566,6 +673,14 @@ async fn update_provider(
             return Err(AppError::BadRequest("provider name must be 1-64 chars".into()));
         }
     }
+    if let Some(v) = req.extra_body.as_ref() {
+        validate_extra_body(v)?;
+    }
+    if let Some(scheme) = req.auth_scheme.as_deref() {
+        validate_extra_headers(scheme, req.extra_headers.as_ref().unwrap_or(&serde_json::json!({})))?;
+    } else if let Some(v) = req.extra_headers.as_ref() {
+        validate_extra_headers("bearer", v)?;
+    }
     let enc = encrypt_key(&st, req.api_key.as_deref()).await?;
     let provider = config::update_provider(
         &st.pool,
@@ -576,6 +691,10 @@ async fn update_provider(
         enc.as_deref(),
         req.timeout_ms,
         req.enabled,
+        req.extra_body.as_ref(),
+        req.auth_scheme.as_deref().map(str::trim),
+        req.extra_headers.as_ref(),
+        req.supports_images,
     )
     .await
     .map_err(AppError::internal)?
@@ -611,6 +730,20 @@ struct RouteReq {
     upstream_model: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default = "empty_object")]
+    extra_body: serde_json::Value,
+    /// 模型级开关：Chat 请求 system 消息收拢到头部（MiniMax 类严格上游）
+    #[serde(default)]
+    strict_system_head: bool,
+    /// H3：reasoning_effort 值域钳制模式（缺省/空 = passthrough）
+    #[serde(default)]
+    reasoning_effort_mode: Option<String>,
+    /// H3：thinking 形态（缺省/空 = 剥离；thinking_param / reasoning_split / enable_thinking）
+    #[serde(default)]
+    thinking_form: Option<String>,
+    /// H2：Responses 方言字段透传白名单（逗号分隔；缺省/空 = 全部剥离）
+    #[serde(default)]
+    responses_passthrough_fields: Option<String>,
 }
 
 fn default_priority() -> i32 {
@@ -632,6 +765,61 @@ fn normalize_upstream_model(raw: Option<&str>) -> Result<Option<String>, AppErro
     Ok(Some(s.to_string()))
 }
 
+/// H3：reasoning_effort_mode 归一化（trim、空串 → None、非法值报错）
+fn normalize_effort_mode(raw: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match s {
+        "passthrough" | "deepseek" | "low_high" | "openrouter" => Ok(Some(s.to_string())),
+        _ => Err(AppError::BadRequest(format!(
+            "reasoning_effort_mode must be one of passthrough/deepseek/low_high/openrouter, got '{s}'"
+        ))),
+    }
+}
+
+/// H3：thinking_form 归一化（trim、空串 → None、非法值报错）
+fn normalize_thinking_form(raw: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match s {
+        "thinking_param" | "reasoning_split" | "enable_thinking" => Ok(Some(s.to_string())),
+        _ => Err(AppError::BadRequest(format!(
+            "thinking_form must be one of thinking_param/reasoning_split/enable_thinking, got '{s}'"
+        ))),
+    }
+}
+
+/// H2：responses_passthrough_fields 归一化（trim、空串 → None、非法字段报错）
+fn normalize_passthrough_fields(raw: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let mut fields: Vec<String> = Vec::new();
+    for f in raw.split(',') {
+        let f = f.trim();
+        if f.is_empty() {
+            continue;
+        }
+        if !matches!(f, "store" | "safety_identifier" | "prompt_cache_retention" | "prompt_cache_key") {
+            return Err(AppError::BadRequest(format!(
+                "responses_passthrough_fields contains unsupported field '{f}' \
+                 (allowed: store, safety_identifier, prompt_cache_retention, prompt_cache_key)"
+            )));
+        }
+        fields.push(f.to_string());
+    }
+    fields.sort();
+    fields.dedup();
+    if fields.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(fields.join(",")))
+    }
+}
 async fn list_routes(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
     let routes = config::list_routes(&st.pool).await.map_err(AppError::internal)?;
     Ok(Json(json!({"routes": routes})).into_response())
@@ -646,6 +834,7 @@ async fn create_route(
     if pattern.is_empty() || pattern.len() > 128 {
         return Err(AppError::BadRequest("model_pattern must be 1-128 chars".into()));
     }
+    validate_extra_body(&req.extra_body)?;
     // 主供应商与 fallback 必须存在（此前缺口：FK 违例直接 500）
     if config::find_provider(&st.pool, req.provider_id)
         .await
@@ -669,6 +858,9 @@ async fn create_route(
         }
     }
     let upstream_model = normalize_upstream_model(req.upstream_model.as_deref())?;
+    let effort_mode = normalize_effort_mode(req.reasoning_effort_mode.as_deref())?;
+    let thinking_form = normalize_thinking_form(req.thinking_form.as_deref())?;
+    let passthrough = normalize_passthrough_fields(req.responses_passthrough_fields.as_deref())?;
     let route = config::create_route(
         &st.pool,
         pattern,
@@ -677,6 +869,11 @@ async fn create_route(
         &req.fallback_ids,
         upstream_model.as_deref(),
         req.enabled,
+        &req.extra_body,
+        req.strict_system_head,
+        effort_mode.as_deref(),
+        thinking_form.as_deref(),
+        passthrough.as_deref(),
     )
     .await
     .map_err(AppError::internal)?;
@@ -704,6 +901,21 @@ struct RoutePatch {
     #[serde(default)]
     upstream_model: Option<Option<String>>,
     enabled: Option<bool>,
+    /// None/缺省 = 不修改；空对象 = 清空
+    #[serde(default)]
+    extra_body: Option<serde_json::Value>,
+    /// None/缺省 = 不修改
+    #[serde(default)]
+    strict_system_head: Option<bool>,
+    /// H3：外层 None = 不改动；内层 None/null = 清空回 passthrough；Some = 设置
+    #[serde(default)]
+    reasoning_effort_mode: Option<Option<String>>,
+    /// H3：thinking 形态（外层 None = 不改动；内层 None = 清空）
+    #[serde(default)]
+    thinking_form: Option<Option<String>>,
+    /// H2：方言字段透传白名单（外层 None = 不改动；内层 None = 清空）
+    #[serde(default)]
+    responses_passthrough_fields: Option<Option<String>>,
 }
 
 async fn update_route(
@@ -719,6 +931,9 @@ async fn update_route(
                 "model_pattern must be 1-128 chars".into(),
             ));
         }
+    }
+    if let Some(v) = req.extra_body.as_ref() {
+        validate_extra_body(v)?;
     }
     if let Some(pid) = req.provider_id {
         if config::find_provider(&st.pool, pid)
@@ -746,6 +961,18 @@ async fn update_route(
         .upstream_model
         .map(|v| normalize_upstream_model(v.as_deref()))
         .transpose()?;
+    let effort_mode = req
+        .reasoning_effort_mode
+        .map(|v| normalize_effort_mode(v.as_deref()))
+        .transpose()?;
+    let thinking_form = req
+        .thinking_form
+        .map(|v| normalize_thinking_form(v.as_deref()))
+        .transpose()?;
+    let passthrough = req
+        .responses_passthrough_fields
+        .map(|v| normalize_passthrough_fields(v.as_deref()))
+        .transpose()?;
     let route = config::update_route(
         &st.pool,
         id,
@@ -755,6 +982,11 @@ async fn update_route(
         req.fallback_ids,
         upstream_model,
         req.enabled,
+        req.extra_body.as_ref(),
+        req.strict_system_head,
+        effort_mode,
+        thinking_form,
+        passthrough,
     )
     .await
     .map_err(AppError::internal)?
@@ -1226,4 +1458,330 @@ async fn test_ldap_settings(
         Ok(msg) => Ok(Json(json!({"ok": true, "message": msg})).into_response()),
         Err(e) => Err(AppError::BadRequest(format!("LDAP 连接测试失败：{e}"))),
     }
+}
+
+// ---------- 系统设置（extra_body 全局开关） ----------
+
+/// extra_body 合并全局开关：false = 保留所有配置但不合并进上游请求体
+async fn get_extra_body_settings(
+    State(st): State<AppState>,
+    _a: Admin,
+) -> Result<Response, AppError> {
+    let enabled = *st.extra_body_enabled.read();
+    Ok(Json(json!({ "enabled": enabled })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ExtraBodySettingsReq {
+    enabled: bool,
+}
+
+async fn put_extra_body_settings(
+    State(st): State<AppState>,
+    admin: Admin,
+    Json(req): Json<ExtraBodySettingsReq>,
+) -> Result<Response, AppError> {
+    config::save_extra_body_enabled(&st.pool, req.enabled)
+        .await
+        .map_err(AppError::internal)?;
+    *st.extra_body_enabled.write() = req.enabled;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "settings.extra_body.update",
+        Some("settings"),
+        None,
+        Some(json!({ "enabled": req.enabled })),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({ "enabled": req.enabled })).into_response())
+}
+
+// ---------- API 端点管理（Response API × Anthropic Messages API） ----------
+
+/// 单 API 端点视图（GET 设置 / PUT 后回显共用）
+#[derive(serde::Serialize)]
+struct ApiEndpointOut {
+    path: &'static str,
+    address: String,
+    enabled: bool,
+    visible: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ApiEndpointsResp {
+    public_base: String,
+    public_base_override: bool,
+    responses: ApiEndpointOut,
+    messages: ApiEndpointOut,
+}
+
+/// 组装端点视图（base 无尾斜杠）
+fn endpoints_view(st: &AppState, headers: &HeaderMap) -> ApiEndpointsResp {
+    let eps = st.api_endpoints.read();
+    let base = crate::service::endpoints::public_base(st, headers);
+    ApiEndpointsResp {
+        public_base: base.clone(),
+        public_base_override: st.cfg.public_base_url.is_some(),
+        responses: ApiEndpointOut {
+            path: "/v1/responses",
+            address: format!("{base}/v1/responses"),
+            enabled: eps.responses_enabled,
+            visible: eps.responses_visible,
+        },
+        messages: ApiEndpointOut {
+            path: "/v1/messages",
+            address: format!("{base}/v1/messages"),
+            enabled: eps.messages_enabled,
+            visible: eps.messages_visible,
+        },
+    }
+}
+
+async fn get_api_endpoint_settings(
+    State(st): State<AppState>,
+    _a: Admin,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    Ok(Json(endpoints_view(&st, &headers)).into_response())
+}
+
+#[derive(Deserialize)]
+struct ApiEndpointsReq {
+    responses_enabled: bool,
+    responses_visible: bool,
+    messages_enabled: bool,
+    messages_visible: bool,
+}
+
+/// 保存开关：入库 → 运行时状态即时生效 → audit 留痕（周期 reload 兜底）
+async fn put_api_endpoint_settings(
+    State(st): State<AppState>,
+    admin: Admin,
+    headers: HeaderMap,
+    Json(req): Json<ApiEndpointsReq>,
+) -> Result<Response, AppError> {
+    let settings = config::ApiEndpointSettings {
+        responses_enabled: req.responses_enabled,
+        responses_visible: req.responses_visible,
+        messages_enabled: req.messages_enabled,
+        messages_visible: req.messages_visible,
+    };
+    config::save_api_endpoint_settings(&st.pool, &settings)
+        .await
+        .map_err(AppError::internal)?;
+    *st.api_endpoints.write() = settings;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "api_endpoints.update",
+        Some("settings"),
+        None,
+        Some(json!({
+            "responses_enabled": req.responses_enabled,
+            "responses_visible": req.responses_visible,
+            "messages_enabled": req.messages_enabled,
+            "messages_visible": req.messages_visible,
+        })),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(endpoints_view(&st, &headers)).into_response())
+}
+
+/// 管理员 API 测试请求：走真实代理管线（跳过鉴权/限流上下文，不记账）
+#[derive(Deserialize)]
+struct ApiTestReq {
+    /// "responses" | "messages"
+    api: String,
+    stream: bool,
+    /// 完整请求体（必须含 model；stream 由本字段外的开关注入）
+    body: serde_json::Value,
+}
+
+/// 测试响应体读取上限（2 MiB；超限截断标记）
+const TEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// body_preview 文本上限（字符）
+const TEST_PREVIEW_CHARS: usize = 8000;
+/// 测试整体超时（代理内部另有首字节/静默超时）
+const TEST_TIMEOUT: Duration = Duration::from_secs(150);
+
+fn app_error_status(e: &AppError) -> u16 {
+    match e {
+        AppError::WithRequestId { inner, .. } => app_error_status(inner),
+        AppError::Auth(_) | AppError::Unauthorized(_) => 401,
+        AppError::Forbidden(_) => 403,
+        AppError::RateLimited(_) | AppError::QuotaExceeded => 429,
+        AppError::BadRequest(_) => 400,
+        AppError::Internal(_) => 500,
+        AppError::ServiceUnavailable(_) | AppError::UpstreamExhausted(_) => 503,
+        AppError::BadGateway(_) => 502,
+        AppError::UpstreamTimeout(_) => 504,
+    }
+}
+async fn test_api_endpoint(
+    State(st): State<AppState>,
+    admin: Admin,
+    Json(req): Json<ApiTestReq>,
+) -> Result<Response, AppError> {
+    let endpoint = match req.api.as_str() {
+        "responses" => crate::service::proxy::Endpoint {
+            api: "/v1/responses",
+            upstream: "/responses",
+            responses: true,
+            anthropic: false,
+        },
+        "messages" => crate::service::proxy::Endpoint {
+            api: "/v1/messages",
+            upstream: "/messages",
+            responses: false,
+            anthropic: true,
+        },
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown api '{other}' (expect 'responses' or 'messages')"
+            )))
+        }
+    };
+    let mut body = req.body;
+    if !body.is_object() {
+        return Err(AppError::BadRequest(
+            "body must be a JSON object (the full request body for the API)".into(),
+        ));
+    }
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::BadRequest("missing 'model' field in body".into()))?;
+    body["stream"] = json!(req.stream);
+    let bytes = axum::body::Bytes::from(body.to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    let started = Instant::now();
+    let attempt = tokio::time::timeout(
+        TEST_TIMEOUT,
+        crate::service::proxy::proxy_test(
+            &st,
+            headers,
+            bytes,
+            endpoint,
+            std::net::IpAddr::from([127, 0, 0, 1]),
+        ),
+    )
+    .await;
+    let latency_ms = started.elapsed().as_millis() as i64;
+
+    // 结果四元组：(status, content_type, error, body_preview)
+    let (status_code, content_type, error, preview) = match attempt {
+        Err(_elapsed) => (
+            504,
+            String::new(),
+            format!("test timed out after {}s", TEST_TIMEOUT.as_secs()),
+            String::new(),
+        ),
+        Ok(Err(e)) => (
+            app_error_status(&e),
+            String::new(),
+            e.to_string(),
+            String::new(),
+        ),
+        Ok(Ok(resp)) => {
+            let (parts, resp_body) = resp.into_parts();
+            let ct = parts
+                .headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let status = parts.status.as_u16();
+            let (bytes, truncated) = match axum::body::to_bytes(resp_body, TEST_BODY_LIMIT).await {
+                Ok(b) => (b, false),
+                Err(_) => (axum::body::Bytes::new(), true),
+            };
+            let mut preview = String::from_utf8_lossy(&bytes).into_owned();
+            if preview.chars().count() > TEST_PREVIEW_CHARS {
+                preview.truncate(TEST_PREVIEW_CHARS);
+                preview.push_str("\n…(truncated)");
+            } else if truncated {
+                preview.push_str("\n…(body exceeded 2 MiB capture limit)");
+            }
+            (status, ct, String::new(), preview)
+        }
+    };
+    let ok = (200..400).contains(&status_code);
+    // 历史落库（预览截断）；失败仅告警不影响测试结果返回
+    if let Err(e) = config::insert_api_test_result(
+        &st.pool,
+        match endpoint.responses {
+            true => "responses",
+            false => "messages",
+        },
+        Some(admin.0.id),
+        &model,
+        req.stream,
+        status_code as i32,
+        ok,
+        latency_ms,
+        &error,
+        &preview,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "api test result persist failed");
+    }
+    if let Err(e) = audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "api_endpoint.test",
+        Some("settings"),
+        None,
+        Some(json!({
+            "api": if endpoint.responses { "responses" } else { "messages" },
+            "model": model,
+            "stream": req.stream,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+        })),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "api test audit failed");
+    }
+    Ok(Json(json!({
+        "ok": ok,
+        "api": if endpoint.responses { "responses" } else { "messages" },
+        "model": model,
+        "stream": req.stream,
+        "status_code": status_code,
+        "latency_ms": latency_ms,
+        "error": error,
+        "content_type": content_type,
+        "body_preview": preview,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ApiTestResultsParams {
+    limit: Option<i64>,
+}
+
+/// 最近测试结果（时间倒序；limit 默认 20、上限 100）
+async fn list_api_test_results(
+    State(st): State<AppState>,
+    _a: Admin,
+    Query(params): Query<ApiTestResultsParams>,
+) -> Result<Response, AppError> {
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let rows = config::list_api_test_results(&st.pool, limit)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({ "results": rows })).into_response())
 }

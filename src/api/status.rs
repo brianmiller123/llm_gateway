@@ -12,20 +12,46 @@
 //! - 事故 = 单小时桶调用 >= 5 且错误率 >= 50%，相邻事故小时合并为一次事故
 
 use std::collections::HashMap;
-
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
+use serde_json::json;
 use sqlx::FromRow;
 
 use crate::error::AppError;
 use crate::state::AppState;
 
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/status", get(status))
+    Router::new()
+        .route("/api/status", get(status))
+        .route("/api/endpoints", get(public_endpoints))
+}
+
+/// 公开：用户页面展示的 API 调用地址（按管理员可见性开关过滤）。
+/// 仅暴露路径与地址，无任何敏感信息
+async fn public_endpoints(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    let eps = st.api_endpoints.read();
+    let base = crate::service::endpoints::public_base(&st, &headers);
+    let out = json!({
+        "responses": if eps.responses_visible {
+            json!({ "path": "/v1/responses", "address": format!("{base}/v1/responses") })
+        } else {
+            serde_json::Value::Null
+        },
+        "messages": if eps.messages_visible {
+            json!({ "path": "/v1/messages", "address": format!("{base}/v1/messages") })
+        } else {
+            serde_json::Value::Null
+        },
+    });
+    Ok(Json(out).into_response())
 }
 
 /// 状态判定阈值
@@ -44,6 +70,8 @@ struct StatusResp {
     components: Vec<ComponentOut>,
     uptime: Vec<UptimeSeries>,
     incidents: Vec<IncidentOut>,
+    /// L3：当前进行中的代理请求数（活跃连接观测；cc-switch ActiveConnectionGuard 同款动机）
+    active_requests: i64,
 }
 
 #[derive(Serialize)]
@@ -293,6 +321,9 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         components,
         uptime,
         incidents,
+        active_requests: st
+            .active_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
     })
     .into_response())
 }

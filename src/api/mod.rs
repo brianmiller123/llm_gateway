@@ -26,8 +26,10 @@ pub fn build_router(state: AppState) -> Router {
         .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         // SPA 深层路由（浏览器导航）→ index.html；API 未匹配路径 → JSON 404
         .fallback(spa_fallback)
-        // LLM 请求体（长上下文 prompt）可远超 axum 默认 2MB 限制，放宽到 32MB
-        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        // LLM 请求体（长上下文 agent 会话、多轮 tool_result）可远超 axum 默认
+        // 2MB 限制；对齐 cc-switch server.rs DefaultBodyLimit 200MB（原 32MB，
+        // 长上下文客户端请求 >32MB 被 413 拒绝）
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -44,7 +46,7 @@ async fn root(State(st): State<AppState>) -> Response {
             Json(json!({
                 "service": "llm_gateway",
                 "version": env!("CARGO_PKG_VERSION"),
-                "openai_compat": ["/v1/chat/completions", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/models"]
+                "openai_compat": ["/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/completions", "/v1/embeddings", "/v1/models"]
             })),
         )
             .into_response(),

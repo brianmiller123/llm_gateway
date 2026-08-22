@@ -17,12 +17,16 @@ pub struct UserQuota {
     pub monthly_cost_quota: Option<f64>,
 }
 
-/// 模型计费单价（每百万 token）
+/// 模型计费单价（每百万 token；缓存桶缺省回退 input 单价）
 #[derive(Debug, Clone, FromRow)]
 pub struct ModelPrice {
     pub model: String,
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
+    /// 缓存命中读单价（NULL = 回退 input_price_per_m，与历史行为一致）
+    pub cache_read_price_per_m: Option<f64>,
+    /// 缓存写入单价（NULL = 回退 input_price_per_m）
+    pub cache_write_price_per_m: Option<f64>,
 }
 
 pub async fn load_rules(pool: &PgPool) -> Result<Vec<RateRule>, sqlx::Error> {
@@ -44,10 +48,11 @@ pub async fn load_quotas(pool: &PgPool) -> Result<Vec<UserQuota>, sqlx::Error> {
 
 pub async fn load_prices(pool: &PgPool) -> Result<Vec<ModelPrice>, sqlx::Error> {
     // 子查询包一层：DISTINCT ON 内层不 cast，外层投影 cast——
-    // 避免 DISTINCT ON 与 ::float8 同层时 describe 返回 NUMERIC 的兼容问题
     sqlx::query_as::<_, ModelPrice>(
-        "SELECT model, input_price_per_m::float8, output_price_per_m::float8 \
-         FROM (SELECT DISTINCT ON (model) model, input_price_per_m, output_price_per_m \
+        "SELECT model, input_price_per_m::float8, output_price_per_m::float8, \
+         cache_read_price_per_m::float8, cache_write_price_per_m::float8 \
+         FROM (SELECT DISTINCT ON (model) model, input_price_per_m, output_price_per_m, \
+               cache_read_price_per_m, cache_write_price_per_m \
                FROM model_prices ORDER BY model, effective_from DESC) t",
     )
     .fetch_all(pool)

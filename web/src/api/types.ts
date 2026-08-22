@@ -234,6 +234,8 @@ export interface ProviderRow {
   api_key_encrypted: string
   timeout_ms: number
   enabled: boolean
+  /** extra_body 透传配置（JSON 对象；{} = 未配置） */
+  extra_body?: Record<string, unknown>
   created_at: string
 }
 
@@ -250,6 +252,8 @@ export interface RouteRow {
   /** 上游实际模型名（映射）；null = 透传客户端模型名 */
   upstream_model: string | null
   enabled: boolean
+  /** 模型级 extra_body（覆盖渠道级同名叶键；{} = 未配置） */
+  extra_body?: Record<string, unknown>
 }
 
 export interface RoutesResp {
@@ -368,8 +372,12 @@ export interface LdapSettingsResp {
   base_dn: string
   user_filter: string
   admin_groups: string[]
-  /** bind 密码是否已保存（永不回显明文） */
   has_password: boolean
+}
+
+/** extra_body 合并全局开关 */
+export interface ExtraBodySettingsResp {
+  enabled: boolean
 }
 
 export interface LdapSettingsInput {
@@ -432,4 +440,65 @@ export interface StatusResp {
   components: StatusComponent[]
   uptime: StatusUptimeSeries[]
   incidents: StatusIncident[]
+}
+
+/** API 端点管理（管理员） */
+export interface ApiEndpointInfo {
+  path: string
+  address: string
+  enabled: boolean
+  visible: boolean
+}
+
+export interface ApiEndpointsResp {
+  public_base: string
+  public_base_override: boolean
+  responses: ApiEndpointInfo
+  messages: ApiEndpointInfo
+}
+
+export interface ApiEndpointsReq {
+  responses_enabled: boolean
+  responses_visible: boolean
+  messages_enabled: boolean
+  messages_visible: boolean
+}
+
+/** 管理员 API 测试结果 */
+export interface ApiTestResult {
+  id: number
+  api: 'responses' | 'messages'
+  admin_id: number | null
+  model: string
+  stream: boolean
+  status_code: number
+  ok: boolean
+  latency_ms: number
+  error: string
+  body_preview: string
+  created_at: string
+}
+
+/** 单次测试即时响应（无历史字段） */
+export interface ApiTestResp {
+  ok: boolean
+  api: 'responses' | 'messages'
+  model: string
+  stream: boolean
+  status_code: number
+  latency_ms: number
+  error: string
+  content_type: string
+  body_preview: string
+}
+
+/** 用户页公开端点（hidden 时为 null） */
+export interface PublicEndpointInfo {
+  path: string
+  address: string
+}
+
+export interface PublicEndpointsResp {
+  responses: PublicEndpointInfo | null
+  messages: PublicEndpointInfo | null
 }

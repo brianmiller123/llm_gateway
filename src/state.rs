@@ -28,21 +28,56 @@ pub struct AppState {
     pub user_access: Arc<RwLock<HashMap<i64, Vec<UserAccessRule>>>>,
     /// 管理员用户 id 集合（授权检查时跳过）
     pub admin_ids: Arc<RwLock<HashSet<i64>>>,
+    /// M3：进程内每渠道熔断器（连续可重试失败 → 短窗跳过；仅内存态）
+    pub breaker: Arc<crate::service::breaker::Breaker>,
     pub limiter: Arc<RateLimiter>,
     pub usage: Arc<UsageCache>,
     /// 运行时 LDAP 设置（DB 优先、env 兜底；保存后立即生效）
     pub ldap: Arc<RwLock<crate::service::ldap::LdapSettings>>,
-    /// 配额超限告警去重（user_id, month）——首次超限才写 audit
+    /// extra_body 合并全局开关（false = 保留配置但不合并进上游请求体）
+    pub extra_body_enabled: Arc<RwLock<bool>>,
+    /// API 端点运行时开关（Response API × Anthropic Messages API 独立启停/可见性）
+    pub api_endpoints: Arc<RwLock<crate::store::config::ApiEndpointSettings>>,
+    /// L3：当前进行中的代理请求数（入口 +1 / 结束 -1；状态页暴露）
+    pub active_requests: Arc<std::sync::atomic::AtomicI64>,
+    /// P0-1：Responses previous_response_id 桥接历史（进程内 LRU；仅转换路径
+    /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
+    pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,
     pub quota_alerts: Arc<Mutex<HashSet<(i64, String)>>>,
 }
 
 impl AppState {
     pub async fn init(cfg: Arc<AppConfig>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pool = crate::store::init(&cfg).await?;
-        let client = Client::builder()
+        // L22：连接池调优（cc-switch http_client.rs:216-260 同款思想）——
+        // 空闲连接 60s 回收、同 host 最多 10 个空闲连接、TCP keepalive 60s。
+        // L29：出站代理（GATEWAY_UPSTREAM_PROXY，http/https/socks5）
+        let mut client_builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .build()?;
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(10)
+            .tcp_keepalive(Duration::from_secs(60));
+        if let Some(proxy_url) = cfg.upstream_proxy.as_deref() {
+            match reqwest::Proxy::all(proxy_url) {
+                Ok(proxy) => {
+                    client_builder = client_builder.proxy(proxy);
+                }
+                Err(e) => {
+                    return Err(format!("invalid GATEWAY_UPSTREAM_PROXY: {e}").into());
+                }
+            }
+        }
+        let client = client_builder.build()?;
         let ldap = crate::service::ldap::LdapSettings::from(&*cfg);
+        // M4：熔断器参数取自 AppConfig（cfg 随后移入 state）
+        let breaker_cfg = crate::service::breaker::BreakerConfig {
+            failure_threshold: cfg.breaker_failure_threshold,
+            open_secs: cfg.breaker_open_secs,
+            failure_rate: cfg.breaker_failure_rate,
+            min_requests: cfg.breaker_min_requests,
+            window_secs: cfg.breaker_window_secs,
+            success_threshold: cfg.breaker_success_threshold,
+        };
 
         let state = Self {
             pool,
@@ -55,9 +90,21 @@ impl AppState {
             prices: Arc::new(RwLock::new(HashMap::new())),
             user_access: Arc::new(RwLock::new(HashMap::new())),
             admin_ids: Arc::new(RwLock::new(HashSet::new())),
+            breaker: Arc::new(crate::service::breaker::Breaker::new_with(breaker_cfg)),
             limiter: Arc::new(RateLimiter::new()),
-            usage: Arc::new(UsageCache::new()),
             ldap: Arc::new(RwLock::new(ldap)),
+            extra_body_enabled: Arc::new(RwLock::new(true)),
+            active_requests: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            api_endpoints: Arc::new(RwLock::new(crate::store::config::ApiEndpointSettings {
+                responses_enabled: true,
+                responses_visible: true,
+                messages_enabled: true,
+                messages_visible: true,
+            })),
+            usage: Arc::new(UsageCache::new()),
+            responses_history: Arc::new(
+                crate::service::responses::history::ResponseHistoryStore::new(),
+            ),
             quota_alerts: Arc::new(Mutex::new(HashSet::new())),
         };
         state.reload().await?;
@@ -120,8 +167,11 @@ impl AppState {
         *self.prices.write() = prices;
         *self.user_access.write() = user_access;
         *self.admin_ids.write() = admin_ids;
+        *self.extra_body_enabled.write() =
+            crate::store::config::load_extra_body_enabled(&self.pool).await?;
+        *self.api_endpoints.write() =
+            crate::store::config::load_api_endpoint_settings(&self.pool).await?;
         self.reload_ldap().await?;
-        tracing::info!("config reloaded");
         Ok(())
     }
 

@@ -14,10 +14,21 @@ pub struct UsageMeta {
     pub streamed: bool,
     /// 客户端来源 IP（X-Forwarded-For 优先，缺省取对端地址）
     pub client_ip: Option<IpAddr>,
+    /// L3：客户端会话关联（x-claude-code-session-id / session_id / x-grok-conv-id）
+    pub session_id: Option<String>,
+    /// L3：流式请求首个上游 chunk 到达耗时（ms；非流式 None）
+    pub first_token_ms: Option<i64>,
+    /// 管理员测试调用：跳过用量记账（不写 usage_logs，不污染状态页错误率）
+    pub test_call: bool,
+    /// 计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
+    /// 依次查价；仅记账使用）
+    pub pricing_models: Vec<String>,
 }
 
 /// 供应商返回的 usage（双形态）：Chat Completions 用 prompt/completion_tokens，
 /// Responses API 用 input/output_tokens；缺失字段自动回退为 None（记账按 0 计）。
+/// 缓存桶（cache_read/cache_write）来自 prompt_tokens_details.cached_tokens 等多源
+/// 归一化（详见 responses::dto::Usage），用于按缓存费率计费与明细对账。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Usage {
     pub prompt_tokens: Option<i64>,
@@ -26,6 +37,14 @@ pub struct Usage {
     pub input_tokens: Option<i64>,
     #[serde(default)]
     pub output_tokens: Option<i64>,
+    /// 缓存命中读 token（prompt_tokens 已包含，不重复计入 total）。
+    /// P1-18：原生 Anthropic usage 字段名为 cache_read_input_tokens，
+    /// 别名反序列化——透传请求的缓存桶不再丢失（按 input 全价计）
+    #[serde(default, alias = "cache_read_input_tokens")]
+    pub cache_read_tokens: Option<i64>,
+    /// 缓存写入 token（prompt_tokens 已包含）；Anthropic 名 cache_creation_input_tokens
+    #[serde(default, alias = "cache_creation_input_tokens", alias = "cache_write_input_tokens")]
+    pub cache_write_tokens: Option<i64>,
 }
 
 impl Usage {
@@ -57,15 +76,18 @@ pub async fn record_usage(
     let (input, output) = usage
         .map(|u| (Some(u.input()), Some(u.output())))
         .unwrap_or((None, None));
+    let (cache_read, cache_write) = usage
+        .map(|u| (u.cache_read_tokens, u.cache_write_tokens))
+        .unwrap_or((None, None));
     // 上游 usage 为外部输入，饱和加法防 i64 回绕为负
     let tokens = input.unwrap_or(0).saturating_add(output.unwrap_or(0));
-
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO usage_logs
            (request_id, user_id, api_key_id, model, provider_id, endpoint, streamed,
-            input_tokens, output_tokens, latency_ms, status, cost, client_ip)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::inet)",
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            latency_ms, status, cost, client_ip, session_id, first_token_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17)",
     )
     .bind(meta.request_id)
     .bind(meta.user_id)
@@ -76,10 +98,14 @@ pub async fn record_usage(
     .bind(meta.streamed)
     .bind(input)
     .bind(output)
+    .bind(cache_read)
+    .bind(cache_write)
     .bind(latency_ms as i32)
     .bind(status as i16)
     .bind(cost)
     .bind(meta.client_ip.map(|ip| ip.to_string()))
+    .bind(meta.session_id.as_deref())
+    .bind(meta.first_token_ms)
     .execute(&mut *tx)
     .await?;
 
