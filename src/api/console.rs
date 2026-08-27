@@ -450,12 +450,37 @@ async fn usage(State(st): State<AppState>, user: ConsoleUser) -> Result<impl Int
     })))
 }
 
-/// 管理员用量：全用户汇总 + 本月按用户 + 本月按 API Key
+/// 管理员用量分组视图（by_user/by_key/by_ip）的时间范围参数
+#[derive(Deserialize)]
+struct UsageRangeParams {
+    /// 30m | 1d | 7d | 30d | 90d；缺省 = 本月（与汇总视图行为一致）
+    range: Option<String>,
+}
+
+/// 范围 → usage_logs.created_at 时间下界 SQL 片段（固定白名单，非用户拼插）
+fn range_since_sql(range: Option<&str>) -> Result<String, AppError> {
+    Ok(match range.map(str::trim).filter(|r| !r.is_empty()) {
+        None | Some("month") => "date_trunc('month', now())",
+        Some("30m") => "now() - interval '30 minutes'",
+        Some("1d") => "now() - interval '1 day'",
+        Some("7d") => "now() - interval '7 days'",
+        Some("30d") => "now() - interval '30 days'",
+        Some("90d") => "now() - interval '90 days'",
+        Some(other) => return Err(AppError::BadRequest(format!("invalid range: {other}"))),
+    }
+    .to_string())
+}
+
+/// 管理员用量：全用户汇总（本月按模型 + 近 7 日明细，汇总视图用）
+/// + 分组视图（按用户 / API Key / 来源 IP，?range= 切换时间窗口，缺省本月）
 async fn admin_usage(
     State(st): State<AppState>,
     admin: axum::extract::Extension<users::UserRow>,
+    Query(params): Query<UsageRangeParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
+    // 仅作用于分组视图；by_model / last_7_days 恒为本月/近7日（汇总视图语义不变）
+    let since = range_since_sql(params.range.as_deref())?;
     let month = Utc::now().format("%Y-%m").to_string();
 
     let by_model: Vec<ModelStat> = sqlx::query_as(
@@ -488,14 +513,14 @@ async fn admin_usage(
         output_tokens: Option<i64>,
         cost: Option<f64>,
     }
-    let by_user: Vec<UserStat> = sqlx::query_as(
+    let by_user: Vec<UserStat> = sqlx::query_as(&format!(
         "SELECT u.id AS user_id, u.username, u.display_name, COUNT(*)::bigint AS call_count, \
                 CAST(SUM(l.input_tokens) AS BIGINT) AS input_tokens, \
                 CAST(SUM(l.output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(l.cost) AS FLOAT8) AS cost \
          FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id \
-         WHERE l.created_at >= date_trunc('month', now()) \
+         WHERE l.created_at >= {since} \
          GROUP BY u.id, u.username, u.display_name ORDER BY call_count DESC",
-    )
+    ))
     .fetch_all(&st.pool)
     .await
     .map_err(AppError::internal)?;
@@ -512,7 +537,7 @@ async fn admin_usage(
         output_tokens: Option<i64>,
         cost: Option<f64>,
     }
-    let by_key: Vec<KeyStat> = sqlx::query_as(
+    let by_key: Vec<KeyStat> = sqlx::query_as(&format!(
         "SELECT k.id AS key_id, k.name, k.key_prefix, u.id AS user_id, u.username, \
                 COUNT(*)::bigint AS call_count, \
                 CAST(SUM(l.input_tokens) AS BIGINT) AS input_tokens, \
@@ -520,9 +545,9 @@ async fn admin_usage(
          FROM usage_logs l \
          JOIN api_keys k ON k.id = l.api_key_id \
          LEFT JOIN users u ON u.id = k.user_id \
-         WHERE l.created_at >= date_trunc('month', now()) \
+         WHERE l.created_at >= {since} \
          GROUP BY k.id, k.name, k.key_prefix, u.id, u.username ORDER BY call_count DESC",
-    )
+    ))
     .fetch_all(&st.pool)
     .await
     .map_err(AppError::internal)?;
@@ -536,15 +561,15 @@ async fn admin_usage(
         cost: Option<f64>,
         last_seen: chrono::DateTime<Utc>,
     }
-    let by_ip: Vec<IpStat> = sqlx::query_as(
+    let by_ip: Vec<IpStat> = sqlx::query_as(&format!(
         "SELECT host(client_ip) AS client_ip, COUNT(*)::bigint AS call_count, \
                 CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, \
                 CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost) AS FLOAT8) AS cost, \
                 MAX(created_at) AS last_seen \
          FROM usage_logs \
-         WHERE created_at >= date_trunc('month', now()) AND client_ip IS NOT NULL \
+         WHERE created_at >= {since} AND client_ip IS NOT NULL \
          GROUP BY client_ip ORDER BY call_count DESC",
-    )
+    ))
     .fetch_all(&st.pool)
     .await
     .map_err(AppError::internal)?;

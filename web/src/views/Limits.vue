@@ -51,6 +51,8 @@ interface RateForm {
   id: number | null
   scope: string
   scope_id: number | null
+  /** 模型限定（'' = 所有模型，提交 null） */
+  model: string
   rpm: number | null
   burst: number | null
   enabled: boolean
@@ -60,6 +62,7 @@ const rateForm = reactive<RateForm>({
   id: null,
   scope: 'global',
   scope_id: null,
+  model: '',
   rpm: 60,
   burst: 10,
   enabled: true,
@@ -69,6 +72,7 @@ function resetRateForm() {
   rateForm.id = null
   rateForm.scope = 'global'
   rateForm.scope_id = null
+  rateForm.model = ''
   rateForm.rpm = 60
   rateForm.burst = 10
   rateForm.enabled = true
@@ -83,6 +87,7 @@ function openEditRate(row: RateRuleRow) {
   rateForm.id = row.id
   rateForm.scope = row.scope
   rateForm.scope_id = row.scope_id
+  rateForm.model = row.model ?? ''
   rateForm.rpm = row.rpm
   rateForm.burst = row.burst
   rateForm.enabled = row.enabled
@@ -117,6 +122,8 @@ async function submitRate() {
       scope: rateForm.scope,
       // global 无 ID；PATCH 时传 null 表示清空原有绑定
       scope_id: rateForm.scope === 'global' ? null : rateForm.scope_id,
+      // 留空 = 所有模型（提交 null）
+      model: rateForm.model.trim() || null,
       rpm: rateForm.rpm,
       burst: rateForm.burst,
       enabled: rateForm.enabled,
@@ -148,9 +155,10 @@ async function submitRate() {
 // —— 删除 ——
 async function removeRate(row: RateRuleRow) {
   const scopeText = `${scopeLabels[row.scope] ?? row.scope}${row.scope_id !== null ? ` #${row.scope_id}` : ''}`
+  const modelText = row.model ? `（模型 ${row.model}）` : ''
   try {
     await ElMessageBox.confirm(
-      `删除后 ${scopeText} 将不再受限流保护，确定删除该规则吗？`,
+      `删除后 ${scopeText}${modelText} 将不再受限流保护，确定删除该规则吗？`,
       '删除限流规则',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -158,7 +166,6 @@ async function removeRate(row: RateRuleRow) {
     return // 用户取消
   }
   try {
-    await request(`/api/admin/rate-limits/${row.id}`, { method: 'DELETE' })
     ElMessage.success('限流规则已删除')
     await loadRules()
   } catch (e) {
@@ -267,7 +274,7 @@ onMounted(loadQuotas)
     <el-tabs v-model="activeTab">
       <el-tab-pane label="限流规则" name="rate">
         <div class="toolbar">
-          <span class="desc">令牌桶：api_key &gt; user &gt; global 命中即拒，超限返回 429+Retry-After</span>
+          <span class="desc">令牌桶：api_key &gt; user &gt; global 命中即拒，超限返回 429+Retry-After；可选模型限定（按客户端模型名精确匹配，独立计量）</span>
           <el-button type="primary" @click="openCreateRate">
             <el-icon><Plus /></el-icon>
             <span>新建规则</span>
@@ -285,6 +292,12 @@ onMounted(loadQuotas)
             </el-table-column>
             <el-table-column label="scope_id" width="100">
               <template #default="{ row }">{{ row.scope_id ?? '-' }}</template>
+            </el-table-column>
+            <el-table-column label="模型" min-width="140">
+              <template #default="{ row }">
+                <span v-if="row.model" class="mono">{{ row.model }}</span>
+                <span v-else class="sub">全部模型</span>
+              </template>
             </el-table-column>
             <el-table-column prop="rpm" label="每分钟请求数" min-width="140" />
             <el-table-column prop="burst" label="突发上限" min-width="120" />
@@ -377,6 +390,16 @@ onMounted(loadQuotas)
           <div v-if="rateForm.scope !== 'global'" class="form-tip">
             必填；清空保存表示解除绑定（传 null）
           </div>
+        </el-form-item>
+        <el-form-item label="模型">
+          <el-input
+            v-model="rateForm.model"
+            placeholder="留空 = 所有模型"
+            maxlength="128"
+            clearable
+            style="width: 100%"
+          />
+          <div class="form-tip">模型限定：按客户端请求的模型名精确匹配，独立限流计量</div>
         </el-form-item>
         <el-form-item label="每分钟请求数">
           <el-input-number
@@ -490,5 +513,13 @@ onMounted(loadQuotas)
   line-height: 1.4;
   color: #909399;
   margin-top: 4px;
+}
+
+.mono {
+  font-family: var(--el-font-family-mono);
+}
+
+.sub {
+  color: #909399;
 }
 </style>

@@ -3,15 +3,16 @@
     <div class="toolbar">
       <div>
         <h2 class="page-title">系统设置</h2>
-        <p class="page-desc">LDAP 登录配置（保存后立即生效，无需重启；环境变量作为未配置时的兜底）</p>
+        <p class="page-desc">LDAP 登录与自定义 Header 配置（保存后立即生效，无需重启；环境变量作为未配置时的兜底）</p>
       </div>
       <el-tag :type="enabled ? 'success' : 'info'" effect="plain">
         LDAP {{ enabled ? '已启用' : '未启用' }}
       </el-tag>
     </div>
 
+    <el-tabs v-model="settingsTab">
+      <el-tab-pane label="LDAP / AD 登录" name="ldap">
     <el-card shadow="never" class="panel" v-loading="loading">
-      <template #header><span>LDAP / AD 登录</span></template>
       <el-form label-position="top" class="ldap-form" @submit.prevent>
         <el-form-item label="LDAP URL" required>
           <el-input
@@ -64,18 +65,61 @@
         </div>
       </el-form>
     </el-card>
+      </el-tab-pane>
+      <el-tab-pane label="自定义 Header" name="headers">
+    <el-card shadow="never" class="panel" v-loading="headersLoading">
+      <el-form label-position="top" @submit.prevent>
+        <el-form-item label="上游请求头（网关 → 提供商）">
+          <div v-for="(row, i) in upstreamRows" :key="i" class="header-row">
+            <el-input v-model="row.name" placeholder="Header 名，如 X-Title" style="width: 220px" />
+            <el-input v-model="row.value" placeholder="值" style="flex: 1" />
+            <el-button :icon="Delete" circle text type="danger" @click="upstreamRows.splice(i, 1)" />
+          </div>
+          <el-button :icon="Plus" text type="primary" @click="upstreamRows.push({ name: '', value: '' })">
+            添加上游请求头
+          </el-button>
+          <div class="header-tip">
+            追加到网关发往上游提供商的每个代理请求（与渠道级 extra_headers 并存）。
+            认证 / Content-Type / Accept 等网关管理头不可设置；Connection: close 等
+            仅对 HTTP/1.1 上游生效。
+          </div>
+        </el-form-item>
+
+        <el-form-item label="客户端响应头（网关 → 客户端）">
+          <div v-for="(row, i) in responseRows" :key="i" class="header-row">
+            <el-input v-model="row.name" placeholder="Header 名，如 X-Gateway-Region" style="width: 220px" />
+            <el-input v-model="row.value" placeholder="值" style="flex: 1" />
+            <el-button :icon="Delete" circle text type="danger" @click="responseRows.splice(i, 1)" />
+          </div>
+          <el-button :icon="Plus" text type="primary" @click="responseRows.push({ name: '', value: '' })">
+            添加客户端响应头
+          </el-button>
+          <div class="header-tip">
+            附加到 /v1/* 的所有响应（含错误响应）。Content-Type / Content-Length / Connection
+            等由 HTTP 层管理，不可设置。
+          </div>
+        </el-form-item>
+
+        <div class="actions">
+          <el-button type="primary" :loading="headersSaving" @click="saveHeaders">保存</el-button>
+        </div>
+      </el-form>
+    </el-card>
+      </el-tab-pane>
+    </el-tabs>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Check, Connection } from '@element-plus/icons-vue'
+import { Check, Connection, Delete, Plus } from '@element-plus/icons-vue'
 import { request } from '@/api/client'
-import type { LdapSettingsResp } from '@/api/types'
+import type { HeaderSettingsResp, LdapSettingsResp } from '@/api/types'
 
 const loading = ref(false)
 const saving = ref(false)
+const settingsTab = ref('ldap')
 const testing = ref(false)
 const hasPassword = ref(false)
 
@@ -158,7 +202,67 @@ async function doSave() {
   }
 }
 
+// ============ 自定义 Header ============
+interface HeaderRow {
+  name: string
+  value: string
+}
+
+const headersLoading = ref(false)
+const headersSaving = ref(false)
+const upstreamRows = ref<HeaderRow[]>([])
+const responseRows = ref<HeaderRow[]>([])
+
+function rowsFrom(map: Record<string, string>): HeaderRow[] {
+  return Object.entries(map).map(([name, value]) => ({ name, value }))
+}
+
+function rowsToMap(rows: HeaderRow[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const r of rows) {
+    const name = r.name.trim()
+    if (name !== '') out[name] = r.value.trim()
+  }
+  return out
+}
+
+async function loadHeaders() {
+  headersLoading.value = true
+  try {
+    const resp = await request<HeaderSettingsResp>('/api/admin/settings/headers')
+    upstreamRows.value = rowsFrom(resp.upstream_headers)
+    responseRows.value = rowsFrom(resp.response_headers)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '加载 Header 设置失败')
+  } finally {
+    headersLoading.value = false
+  }
+}
+
+async function saveHeaders() {
+  headersSaving.value = true
+  try {
+    const payloadHeaders = {
+      upstream_headers: rowsToMap(upstreamRows.value),
+      response_headers: rowsToMap(responseRows.value),
+    }
+    const resp = await request<HeaderSettingsResp>('/api/admin/settings/headers', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payloadHeaders),
+    })
+    upstreamRows.value = rowsFrom(resp.upstream_headers)
+    responseRows.value = rowsFrom(resp.response_headers)
+    ElMessage.success('Header 设置已保存并生效')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  } finally {
+    headersSaving.value = false
+  }
+}
+
 onMounted(load)
+onMounted(loadHeaders)
 </script>
 
 <style scoped>
@@ -203,5 +307,21 @@ onMounted(load)
 .actions {
   display: flex;
   gap: 12px;
+}
+
+.header-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 8px;
+  align-items: center;
+}
+
+.header-tip {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #909399;
+  margin-top: 4px;
+  width: 100%;
 }
 </style>

@@ -38,7 +38,8 @@ pub struct AppState {
     pub extra_body_enabled: Arc<RwLock<bool>>,
     /// API 端点运行时开关（Response API × Anthropic Messages API 独立启停/可见性）
     pub api_endpoints: Arc<RwLock<crate::store::config::ApiEndpointSettings>>,
-    /// L3：当前进行中的代理请求数（入口 +1 / 结束 -1；状态页暴露）
+    /// 全局自定义 Header（upstream → 上游请求；response → 客户端响应）
+    pub custom_headers: Arc<RwLock<crate::store::config::HeaderSettings>>,
     pub active_requests: Arc<std::sync::atomic::AtomicI64>,
     /// P0-1：Responses previous_response_id 桥接历史（进程内 LRU；仅转换路径
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
@@ -101,6 +102,7 @@ impl AppState {
                 messages_enabled: true,
                 messages_visible: true,
             })),
+            custom_headers: Arc::new(RwLock::new(crate::store::config::HeaderSettings::default())),
             usage: Arc::new(UsageCache::new()),
             responses_history: Arc::new(
                 crate::service::responses::history::ResponseHistoryStore::new(),
@@ -172,6 +174,8 @@ impl AppState {
         *self.api_endpoints.write() =
             crate::store::config::load_api_endpoint_settings(&self.pool).await?;
         self.reload_ldap().await?;
+        *self.custom_headers.write() =
+            crate::store::config::load_header_settings(&self.pool).await?;
         Ok(())
     }
 

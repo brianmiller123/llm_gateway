@@ -18,7 +18,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(root))
-        .merge(v1::routes())
+        .merge(v1::routes(state.clone()))
         .merge(status::routes())
         .merge(console::routes(state.clone()))
         .merge(admin_config::routes(state.clone()))
@@ -77,8 +77,14 @@ async fn spa_fallback(State(st): State<AppState>, req: Request) -> Response {
 }
 
 fn html_response(bytes: Vec<u8>) -> Response {
+    // SPA 壳禁缓存：assets 均为内容哈希名（index-XXXX.js 永久可缓存），
+    // 但 index.html 本体必须每次回源重验——否则部署后旧壳一直引用已被
+    // 新构建删除的旧 chunk，页面停留在旧版本
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         bytes,
     )
         .into_response()

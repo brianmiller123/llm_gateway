@@ -22,7 +22,7 @@ pub(crate) fn resolve_client_ip(peer: SocketAddr, headers: &axum::http::HeaderMa
         .unwrap_or(peer.ip())
 }
 
-pub fn routes() -> Router<AppState> {
+pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -30,6 +30,34 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(models))
+        // 全局自定义响应头（设置页）：附加到 /v1/* 所有响应（含错误整形路径）；
+        // insert 语义覆盖同名头，保存时已过校验，此处解析失败防御性跳过
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            append_custom_response_headers,
+        ))
+}
+
+async fn append_custom_response_headers(
+    axum::extract::State(st): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    let custom = st.custom_headers.read();
+    if !custom.response.is_empty() {
+        for (k, v) in custom.response.iter() {
+            if let Some(s) = v.as_str() {
+                if let (Ok(name), Ok(val)) = (
+                    k.parse::<axum::http::HeaderName>(),
+                    axum::http::HeaderValue::from_str(s),
+                ) {
+                    resp.headers_mut().insert(name, val);
+                }
+            }
+        }
+    }
+    resp
 }
 
 /// POST /v1/responses：原生透传（上游 api_type=openai-responses）或

@@ -268,6 +268,8 @@ pub struct AdminRateRule {
     pub id: i64,
     pub scope: String,
     pub scope_id: Option<i64>,
+    /// 模型限定（NULL = 所有模型）
+    pub model: Option<String>,
     pub rpm: i32,
     pub burst: i32,
     pub enabled: bool,
@@ -276,7 +278,7 @@ pub struct AdminRateRule {
 
 pub async fn list_rate_rules(pool: &PgPool) -> Result<Vec<AdminRateRule>, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
-        "SELECT id, scope, scope_id, rpm, burst, enabled, updated_at FROM rate_limit_rules ORDER BY id",
+        "SELECT id, scope, scope_id, model, rpm, burst, enabled, updated_at FROM rate_limit_rules ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -286,17 +288,19 @@ pub async fn create_rate_rule(
     pool: &PgPool,
     scope: &str,
     scope_id: Option<i64>,
+    model: Option<&str>,
     rpm: i32,
     burst: i32,
     enabled: bool,
 ) -> Result<AdminRateRule, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
-        "INSERT INTO rate_limit_rules (scope, scope_id, rpm, burst, enabled) \
-         VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, scope, scope_id, rpm, burst, enabled, updated_at",
+        "INSERT INTO rate_limit_rules (scope, scope_id, model, rpm, burst, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, scope, scope_id, model, rpm, burst, enabled, updated_at",
     )
     .bind(scope)
     .bind(scope_id)
+    .bind(model)
     .bind(rpm)
     .bind(burst)
     .bind(enabled)
@@ -309,6 +313,7 @@ pub async fn update_rate_rule(
     id: i64,
     scope: Option<&str>,
     scope_id: Option<Option<i64>>,
+    model: Option<Option<&str>>,
     rpm: Option<i32>,
     burst: Option<i32>,
     enabled: Option<bool>,
@@ -316,21 +321,24 @@ pub async fn update_rate_rule(
     sqlx::query_as::<_, AdminRateRule>(
         "UPDATE rate_limit_rules SET \
             scope = COALESCE($2, scope), \
-            scope_id = CASE WHEN $7 THEN $3 ELSE scope_id END, \
-            rpm = COALESCE($4, rpm), \
-            burst = COALESCE($5, burst), \
-            enabled = COALESCE($6, enabled), \
+            scope_id = CASE WHEN $8 THEN $3 ELSE scope_id END, \
+            model = CASE WHEN $9 THEN $4 ELSE model END, \
+            rpm = COALESCE($5, rpm), \
+            burst = COALESCE($6, burst), \
+            enabled = COALESCE($7, enabled), \
             updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, scope, scope_id, rpm, burst, enabled, updated_at",
+         RETURNING id, scope, scope_id, model, rpm, burst, enabled, updated_at",
     )
     .bind(id)
     .bind(scope)
     .bind(scope_id)
+    .bind(model)
     .bind(rpm)
     .bind(burst)
     .bind(enabled)
-    .bind(scope_id.is_some()) // $7：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
+    .bind(scope_id.is_some()) // $8：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
+    .bind(model.is_some()) // $9：同上
     .fetch_optional(pool)
     .await
 }
@@ -641,6 +649,51 @@ pub async fn save_extra_body_enabled(pool: &PgPool, enabled: bool) -> Result<(),
         .bind(enabled)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+// ---------- 系统设置（自定义 Header） ----------
+
+/// 全局自定义 Header（保存时已验证：合法 HeaderName/HeaderValue、
+/// 非网关管理头；运行时只读消费，无需再次校验）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HeaderSettings {
+    /// 网关 → 上游提供商请求追加的头（渠道级 extra_headers 优先级更高）
+    pub upstream: serde_json::Map<String, serde_json::Value>,
+    /// 网关 → 客户端 /v1/* 响应附加的头
+    pub response: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 读取自定义 Header 配置（迁移保证列存在；非对象值防御性回退空）
+pub async fn load_header_settings(pool: &PgPool) -> Result<HeaderSettings, sqlx::Error> {
+    let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
+        "SELECT upstream_headers, response_headers FROM system_settings WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let to_map = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+    Ok(row
+        .map(|(u, r)| HeaderSettings {
+            upstream: to_map(u),
+            response: to_map(r),
+        })
+        .unwrap_or_default())
+}
+
+/// 保存自定义 Header 配置（单行 upsert 语义；UPDATE 命中 id=1 恒存在）
+pub async fn save_header_settings(
+    pool: &PgPool,
+    upstream: &serde_json::Value,
+    response: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE system_settings SET upstream_headers = $1, response_headers = $2, \
+         updated_at = now() WHERE id = 1",
+    )
+    .bind(upstream)
+    .bind(response)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

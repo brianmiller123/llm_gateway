@@ -264,6 +264,7 @@ export interface RateRuleRow {
   id: number
   scope: string
   scope_id: number | null
+  model: string | null
   rpm: number
   burst: number
   enabled: boolean
@@ -272,6 +273,11 @@ export interface RateRuleRow {
 
 export interface RateRulesResp {
   rules: RateRuleRow[]
+}
+
+export interface HeaderSettingsResp {
+  upstream_headers: Record<string, string>
+  response_headers: Record<string, string>
 }
 
 export interface QuotaRow {

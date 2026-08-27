@@ -173,33 +173,54 @@ impl RateLimiter {
     }
 }
 
+/// 规则匹配（纯函数，便于单测）：作用域（global/user/api_key）× 模型限定 → 桶键列表。
+/// 模型限定的规则仅在请求模型名与之精确相等时命中，桶键附加 `|model:` 后缀独立计量；
+/// 不限模型的规则对所有请求命中（既有行为），两者叠加时最严者先拒。
+fn matched_rules(
+    rules: &[crate::store::rules::RateRule],
+    user_id: Option<i64>,
+    key_id: Option<i64>,
+    model: &str,
+) -> Vec<(String, f64, f64)> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let mut bucket_key = match rule.scope.as_str() {
+                "global" => "global".to_string(),
+                "user" => user_id
+                    .filter(|uid| Some(*uid) == rule.scope_id)
+                    .map(|uid| format!("user:{uid}"))?,
+                "api_key" => key_id
+                    .filter(|kid| Some(*kid) == rule.scope_id)
+                    .map(|kid| format!("key:{kid}"))?,
+                other => {
+                    tracing::warn!("unknown rate limit scope: {other}");
+                    return None;
+                }
+            };
+            if let Some(rule_model) = rule.model.as_deref() {
+                if rule_model != model {
+                    return None;
+                }
+                bucket_key.push_str("|model:");
+                bucket_key.push_str(rule_model);
+            }
+            Some((bucket_key, rule.rpm as f64, rule.burst as f64))
+        })
+        .collect()
+}
+
 /// 应用限流规则（api_key > user > global，命中即拒）
 pub fn apply_rate_limits(
     st: &AppState,
     user_id: Option<i64>,
     key_id: Option<i64>,
+    model: &str,
 ) -> Result<(), AppError> {
-    let rules = st.rules.read();
-    let matched: Vec<(String, f64, f64)> = rules
-        .iter()
-        .filter_map(|rule| {
-            let bucket_key = match rule.scope.as_str() {
-                "global" => Some("global".to_string()),
-                "user" => user_id
-                    .filter(|uid| Some(*uid) == rule.scope_id)
-                    .map(|uid| format!("user:{uid}")),
-                "api_key" => key_id
-                    .filter(|kid| Some(*kid) == rule.scope_id)
-                    .map(|kid| format!("key:{kid}")),
-                other => {
-                    tracing::warn!("unknown rate limit scope: {other}");
-                    None
-                }
-            };
-            bucket_key.map(|k| (k, rule.rpm as f64, rule.burst as f64))
-        })
-        .collect();
-    drop(rules);
+    let matched = {
+        let rules = st.rules.read();
+        matched_rules(&rules, user_id, key_id, model)
+    };
 
     // 主体标识：user+key 联合（同一用户多 key 各自独立豁免，粒度贴合"会话恢复"）
     let identity = match (user_id, key_id) {
@@ -217,6 +238,7 @@ pub fn apply_rate_limits(
         Err(retry) => {
             tracing::warn!(
                 identity = identity.as_deref().unwrap_or(""),
+                model = %model,
                 retry_secs = format!("{retry:.1}"),
                 "request rate limited"
             );
@@ -228,6 +250,70 @@ pub fn apply_rate_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::store::rules::RateRule;
+
+    fn rule(scope: &str, scope_id: Option<i64>, model: Option<&str>) -> RateRule {
+        RateRule {
+            scope: scope.to_string(),
+            scope_id,
+            rpm: 60,
+            burst: 10,
+            model: model.map(str::to_string),
+        }
+    }
+
+    fn keys(matched: &[(String, f64, f64)]) -> Vec<&str> {
+        matched.iter().map(|(k, _, _)| k.as_str()).collect()
+    }
+
+    /// 模型限定规则：仅请求模型精确相等时命中，桶键带模型后缀
+    #[test]
+    fn model_scoped_rule_matches_exact_model_only() {
+        let rules = vec![rule("global", None, Some("gpt-4o"))];
+        assert_eq!(
+            keys(&matched_rules(&rules, None, None, "gpt-4o")),
+            vec!["global|model:gpt-4o"]
+        );
+        assert!(matched_rules(&rules, None, None, "gpt-4o-mini").is_empty());
+        assert!(matched_rules(&rules, None, None, "GPT-4O").is_empty(), "大小写敏感");
+    }
+
+    /// 不限模型的规则对所有请求命中（既有行为不变）
+    #[test]
+    fn unscoped_rule_matches_all_models() {
+        let rules = vec![rule("global", None, None)];
+        for m in ["a", "b", ""] {
+            assert_eq!(keys(&matched_rules(&rules, None, None, m)), vec!["global"]);
+        }
+    }
+
+    /// 作用域 × 模型叠加：user 规则命中本人且桶键独立；他人不命中
+    #[test]
+    fn user_scoped_model_rule() {
+        let rules = vec![rule("user", Some(7), Some("claude-3"))];
+        assert_eq!(
+            keys(&matched_rules(&rules, Some(7), None, "claude-3")),
+            vec!["user:7|model:claude-3"]
+        );
+        assert!(matched_rules(&rules, Some(8), None, "claude-3").is_empty());
+        assert!(matched_rules(&rules, Some(7), None, "gpt-4o").is_empty());
+    }
+
+    /// 同请求同时命中限模型与不限模型规则 → 两个桶（最严者先拒）
+    #[test]
+    fn model_rule_stacks_with_general_rule() {
+        let rules = vec![rule("global", None, None), rule("user", Some(1), Some("m2"))];
+        assert_eq!(
+            keys(&matched_rules(&rules, Some(1), None, "m2")),
+            vec!["global", "user:1|model:m2"]
+        );
+        // 换模型：只剩不限模型的规则
+        assert_eq!(
+            keys(&matched_rules(&rules, Some(1), None, "m1")),
+            vec!["global"]
+        );
+    }
 
     fn rules_global(rpm: f64, burst: f64) -> Vec<(String, f64, f64)> {
         vec![("global".to_string(), rpm, burst)]

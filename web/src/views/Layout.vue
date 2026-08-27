@@ -54,6 +54,9 @@
             <el-menu-item index="/api-endpoints">
               <el-icon><Link /></el-icon><span>API 端点</span>
             </el-menu-item>
+            <el-menu-item index="/settings">
+              <el-icon><Tools /></el-icon><span>系统设置</span>
+            </el-menu-item>
           </el-sub-menu>
         </template>
         <el-menu-item index="/status">

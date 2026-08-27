@@ -603,8 +603,6 @@ async fn proxy_authed(
         }
     }
 
-    // 1. 三层限流
-    crate::service::ratelimit::apply_rate_limits(st, user_id, key_id)?;
     // 2. 解析请求体（M24：先按 Content-Encoding 解压，再解析 JSON；
     //    后做 role 归一化，所有下游分支共用改写后的 json；
     //    Anthropic 方言跳过 OpenAI 归一化）
@@ -646,6 +644,10 @@ async fn proxy_authed(
         .map(str::to_string)
         .ok_or_else(|| AppError::BadRequest("missing 'model' field".into()))?;
     let streamed = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
+    // 3. 三层限流（模型限定规则按客户端模型名精确匹配，独立桶计量；
+    //    置于模型解析后执行——缺 model 字段/坏 JSON 的请求在上方解析即 400）
+    crate::service::ratelimit::apply_rate_limits(st, user_id, key_id, &model)?;
 
     // 4. 配额预检查
     if let Some(uid) = user_id {
@@ -2357,6 +2359,24 @@ async fn send_upstream(
     for (name, v) in client_headers.iter() {
         if name.as_str().starts_with("x-stainless-") {
             req = req.header(name, v);
+        }
+    }
+    // 全局自定义上游请求头（设置页）。与渠道级 extra_headers 同为追加语义：
+    // 同名时并存为多值头（reqwest .header() append）。保存时已过合法性/
+    // 黑名单校验，此处解析失败防御性跳过
+    {
+        let custom = st.custom_headers.read();
+        if !custom.upstream.is_empty() {
+            for (k, v) in custom.upstream.iter() {
+                if let Some(s) = v.as_str() {
+                    if let (Ok(name), Ok(val)) = (
+                        k.parse::<axum::http::HeaderName>(),
+                        axum::http::HeaderValue::from_str(s),
+                    ) {
+                        req = req.header(name, val);
+                    }
+                }
+            }
         }
     }
     if let Some(map) = provider.extra_headers.as_object() {

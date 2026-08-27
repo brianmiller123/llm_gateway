@@ -92,6 +92,12 @@ pub fn routes(state: AppState) -> Router<AppState> {
                 .layer(admin.clone()),
         )
         .route(
+            "/api/admin/settings/headers",
+            get(get_header_settings)
+                .put(put_header_settings)
+                .layer(admin.clone()),
+        )
+        .route(
             "/api/admin/api-endpoints",
             get(get_api_endpoint_settings)
                 .put(put_api_endpoint_settings)
@@ -1011,12 +1017,29 @@ async fn update_route(
 struct RateLimitReq {
     scope: String,
     scope_id: Option<i64>,
+    /// 模型限定（空/缺省 = 所有模型；客户端模型名精确匹配）
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default = "default_rpm")]
     rpm: i32,
     #[serde(default = "default_burst")]
     burst: i32,
     #[serde(default = "default_true")]
     enabled: bool,
+}
+
+/// 归一化模型限定：trim、空串 → None；超长（>128，与表列宽一致）→ 400
+fn normalize_rule_model(model: Option<&str>) -> Result<Option<String>, AppError> {
+    let m = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    if let Some(m) = &m {
+        if m.len() > 128 {
+            return Err(AppError::BadRequest("model must be <= 128 chars".into()));
+        }
+    }
+    Ok(m)
 }
 
 fn default_rpm() -> i32 {
@@ -1047,10 +1070,12 @@ async fn create_rate_limit(
     if req.rpm <= 0 || req.burst <= 0 {
         return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
     }
+    let model = normalize_rule_model(req.model.as_deref())?;
     let rule = config::create_rate_rule(
         &st.pool,
         &scope,
         req.scope_id,
+        model.as_deref(),
         req.rpm,
         req.burst,
         req.enabled,
@@ -1064,7 +1089,7 @@ async fn create_rate_limit(
         "rate_limit.create",
         Some("rate_limit"),
         Some(rule.id),
-        Some(json!({"scope": scope})),
+        Some(json!({"scope": scope, "model": model})),
     )
     .await
     .map_err(AppError::internal)?;
@@ -1076,6 +1101,8 @@ struct RateLimitPatch {
     scope: Option<String>,
     /// Some(v) 更新 / Some(None) 清空 / None 不变
     scope_id: Option<Option<i64>>,
+    /// Some(Some(v)) 设置 / Some(None) 或空串 清空 / None 不变
+    model: Option<Option<String>>,
     rpm: Option<i32>,
     burst: Option<i32>,
     enabled: Option<bool>,
@@ -1098,11 +1125,16 @@ async fn update_rate_limit(
     if req.rpm.is_some_and(|v| v <= 0) || req.burst.is_some_and(|v| v <= 0) {
         return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
     }
+    let model = match req.model {
+        None => None,
+        Some(m) => Some(normalize_rule_model(m.as_deref())?),
+    };
     let rule = config::update_rate_rule(
         &st.pool,
         id,
         req.scope.as_deref().map(str::trim),
         req.scope_id,
+        model.as_ref().map(|m| m.as_deref()),
         req.rpm,
         req.burst,
         req.enabled,
@@ -1496,6 +1528,162 @@ async fn put_extra_body_settings(
     .await
     .map_err(AppError::internal)?;
     Ok(Json(json!({ "enabled": req.enabled })).into_response())
+}
+
+// ---------- 系统设置（自定义 Header） ----------
+
+/// 上游请求头黑名单：网关代管的头（认证/方言协商/消息框架），全局设置
+/// 覆盖会破坏代理语义 → 保存即 400。Connection 不在列（用户显式场景），
+/// 仅对 HTTP/1.1 上游生效（HTTP/2 为连接级协议，无该头）
+const UPSTREAM_HEADER_BLOCKLIST: &[&str] = &[
+    "host",
+    "authorization",
+    "x-api-key",
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "accept",
+    "anthropic-version",
+    "anthropic-beta",
+];
+
+/// 客户端响应头黑名单：消息框架/连接管理头由 HTTP 层（hyper）控制，
+/// 手工注入会破坏响应解析
+const RESPONSE_HEADER_BLOCKLIST: &[&str] = &[
+    "host",
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+];
+
+/// 单组 header 配置上限
+const HEADER_SETTINGS_MAX_ENTRIES: usize = 16;
+/// 序列化上限（单组）
+const HEADER_SETTINGS_MAX_BYTES: usize = 4 * 1024;
+
+/// 校验并整理一组 header：JSON 对象 {name: value(字符串)}；
+/// name/value 经 HeaderName/HeaderValue 解析校验，命中黑名单即 400。
+/// 返回整理后的对象（name 去空白、空值项剔除）
+fn validate_header_map(
+    v: &serde_json::Value,
+    blocklist: &[&str],
+    label: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+    let Some(map) = v.as_object() else {
+        return Err(AppError::BadRequest(format!("{label} must be a JSON object")));
+    };
+    if map.len() > HEADER_SETTINGS_MAX_ENTRIES {
+        return Err(AppError::BadRequest(format!(
+            "{label} 超过 {HEADER_SETTINGS_MAX_ENTRIES} 条上限"
+        )));
+    }
+    let mut out = serde_json::Map::new();
+    for (k, val) in map {
+        let name = k.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(value) = val.as_str() else {
+            return Err(AppError::BadRequest(format!(
+                "{label}['{k}'] 的值必须是字符串"
+            )));
+        };
+        if blocklist
+            .iter()
+            .any(|b| name.eq_ignore_ascii_case(b))
+        {
+            return Err(AppError::BadRequest(format!(
+                "header '{name}' 由网关管理，不能在 {label} 中设置"
+            )));
+        }
+        name
+            .parse::<axum::http::HeaderName>()
+            .map_err(|e| AppError::BadRequest(format!("header 名 '{name}' 不合法：{e}")))?;
+        axum::http::HeaderValue::from_str(value.trim())
+            .map_err(|e| AppError::BadRequest(format!("header '{name}' 的值不合法：{e}")))?;
+        out.insert(name, serde_json::Value::String(value.trim().to_string()));
+    }
+    if serde_json::to_vec(&out).unwrap_or_default().len() > HEADER_SETTINGS_MAX_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "{label} 序列化后超过 {} 字节上限",
+            HEADER_SETTINGS_MAX_BYTES
+        )));
+    }
+    Ok(out)
+}
+
+async fn get_header_settings(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
+    let current = st.custom_headers.read().clone();
+    Ok(Json(serde_json::json!({
+        "upstream_headers": current.upstream,
+        "response_headers": current.response,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct HeaderSettingsReq {
+    #[serde(default)]
+    upstream_headers: serde_json::Value,
+    #[serde(default)]
+    response_headers: serde_json::Value,
+}
+
+/// 保存：校验 → 入库 → 运行时状态即时生效 → audit 留痕（周期 reload 兜底）。
+/// null/缺省字段 = 清空该组
+async fn put_header_settings(
+    State(st): State<AppState>,
+    admin: Admin,
+    Json(req): Json<HeaderSettingsReq>,
+) -> Result<Response, AppError> {
+    // null/缺省字段 = 清空该组（非对象值仍 400）
+    let upstream_v = serde_json::Value::Object(
+        req.upstream_headers.as_object().cloned().unwrap_or_default(),
+    );
+    let response_v = serde_json::Value::Object(
+        req.response_headers.as_object().cloned().unwrap_or_default(),
+    );
+    let upstream = validate_header_map(
+        &upstream_v,
+        UPSTREAM_HEADER_BLOCKLIST,
+        "upstream_headers",
+    )?;
+    let response = validate_header_map(
+        &response_v,
+        RESPONSE_HEADER_BLOCKLIST,
+        "response_headers",
+    )?;
+    let settings = config::HeaderSettings {
+        upstream: upstream.clone(),
+        response: response.clone(),
+    };
+    config::save_header_settings(
+        &st.pool,
+        &serde_json::Value::Object(upstream.clone()),
+        &serde_json::Value::Object(response.clone()),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    *st.custom_headers.write() = settings;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "settings.headers.update",
+        Some("settings"),
+        None,
+        Some(json!({
+            "upstream_count": upstream.len(),
+            "response_count": response.len(),
+        })),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "upstream_headers": upstream,
+        "response_headers": response,
+    }))
+    .into_response())
 }
 
 // ---------- API 端点管理（Response API × Anthropic Messages API） ----------

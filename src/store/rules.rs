@@ -1,12 +1,14 @@
 use sqlx::{FromRow, PgPool};
 
-/// 限流规则（scope: global | user | api_key）
+/// 限流规则（scope: global | user | api_key；model 为 Some 时仅限该模型）
 #[derive(Debug, Clone, FromRow)]
 pub struct RateRule {
     pub scope: String,
     pub scope_id: Option<i64>,
     pub rpm: i32,
     pub burst: i32,
+    /// 模型限定（NULL = 所有模型）；按客户端请求的模型名精确匹配
+    pub model: Option<String>,
 }
 
 /// 用户月度配额
@@ -31,7 +33,7 @@ pub struct ModelPrice {
 
 pub async fn load_rules(pool: &PgPool) -> Result<Vec<RateRule>, sqlx::Error> {
     sqlx::query_as::<_, RateRule>(
-        "SELECT scope, scope_id, rpm, burst FROM rate_limit_rules WHERE enabled = TRUE",
+        "SELECT scope, scope_id, rpm, burst, model FROM rate_limit_rules WHERE enabled = TRUE",
     )
     .fetch_all(pool)
     .await

@@ -1,7 +1,7 @@
 <template>
   <div class="usage-page" v-loading="loading">
     <div class="toolbar">
-      <span class="month-label">
+      <span v-if="viewMode === 'summary'" class="month-label">
         统计月份：<b class="month">{{ usage?.month ?? '—' }}</b>
       </span>
       <span class="toolbar-right">
@@ -11,7 +11,19 @@
           <el-radio-button value="keys">按 API Key</el-radio-button>
           <el-radio-button value="ips">按来源 IP</el-radio-button>
         </el-radio-group>
-        <el-button :icon="Refresh" :loading="loading" @click="loadData">刷新</el-button>
+        <el-radio-group
+          v-if="isAdmin && viewMode !== 'summary'"
+          v-model="breakdownRange"
+          size="small"
+          @change="loadBreakdown"
+        >
+          <el-radio-button value="30m">30 分钟</el-radio-button>
+          <el-radio-button value="1d">1 天</el-radio-button>
+          <el-radio-button value="7d">7 天</el-radio-button>
+          <el-radio-button value="30d">30 天</el-radio-button>
+          <el-radio-button value="90d">90 天</el-radio-button>
+        </el-radio-group>
+        <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
       </span>
     </div>
 
@@ -19,7 +31,7 @@
 
     <template v-else-if="isAdmin && viewMode === 'users'">
       <el-card shadow="never" class="panel">
-        <template #header><span>本月按用户（全站）</span></template>
+        <template #header><span>{{ rangeLabel }}按用户（全站）</span></template>
         <el-table :data="adminUsage?.by_user ?? []" stripe>
           <el-table-column label="用户" min-width="160">
             <template #default="{ row }">
@@ -37,7 +49,7 @@
 
     <template v-else-if="isAdmin && viewMode === 'keys'">
       <el-card shadow="never" class="panel">
-        <template #header><span>本月按 API Key（全站）</span></template>
+        <template #header><span>{{ rangeLabel }}按 API Key（全站）</span></template>
         <el-table :data="adminUsage?.by_key ?? []" stripe>
           <el-table-column label="Key" min-width="200">
             <template #default="{ row }">
@@ -58,7 +70,7 @@
 
     <template v-else-if="isAdmin && viewMode === 'ips'">
       <el-card shadow="never" class="panel">
-        <template #header><span>本月按来源 IP（全站；X-Forwarded-For 优先，缺省取对端地址）</span></template>
+        <template #header><span>{{ rangeLabel }}按来源 IP（全站；X-Forwarded-For 优先，缺省取对端地址）</span></template>
         <el-table :data="adminUsage?.by_ip ?? []" stripe>
           <el-table-column label="来源 IP" min-width="150">
             <template #default="{ row }">
@@ -204,6 +216,16 @@ const viewMode = ref<'summary' | 'users' | 'keys' | 'ips'>('summary')
 const usage = ref<UsageResp | null>(null)
 const adminUsage = ref<AdminUsageResp | null>(null)
 const loading = ref(false)
+
+/** 分组视图（按用户 / API Key / 来源 IP）时间范围，对应后端 ?range= */
+type BreakdownRange = '30m' | '1d' | '7d' | '30d' | '90d'
+const breakdownRange = ref<BreakdownRange>('30d')
+const rangeLabel = computed(
+  () =>
+    ({ '30m': '近 30 分钟', '1d': '近 1 天', '7d': '近 7 天', '30d': '近 30 天', '90d': '近 90 天' })[
+      breakdownRange.value
+    ],
+)
 
 /** 趋势：时间范围（天，0 = 今天每 30 分钟）与用户筛选（0 = 全部用户） */
 const trendDays = ref(30)
@@ -514,6 +536,28 @@ async function loadData(): Promise<void> {
   }
 }
 
+/** 分组视图数据：按当前时间范围拉取 by_user/by_key/by_ip（?range=） */
+async function loadBreakdown(): Promise<void> {
+  if (!isAdmin.value) return
+  loading.value = true
+  try {
+    const data = await request<AdminUsageResp>(`/api/admin/usage?range=${breakdownRange.value}`)
+    adminUsage.value = data
+    // by_model/last_7_days 后端恒为本月口径，同步回填不改变汇总视图语义
+    usage.value = data
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '加载用量数据失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 刷新当前视图：分组视图按范围拉取，其余走完整加载（含趋势） */
+function refresh(): void {
+  if (isAdmin.value && viewMode.value !== 'summary') void loadBreakdown()
+  else void loadData()
+}
+
 onMounted(() => {
   window.addEventListener('resize', handleResize)
   void loadData()
@@ -526,6 +570,9 @@ watch(viewMode, (v) => {
       disposeCharts()
       initCharts()
     })
+  } else if (isAdmin.value) {
+    // 切入分组视图：确保数据与当前所选时间范围一致
+    void loadBreakdown()
   }
 })
 
