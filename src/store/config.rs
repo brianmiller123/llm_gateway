@@ -139,6 +139,9 @@ pub struct AdminRoute {
     pub extra_body: serde_json::Value,
     /// 模型级开关：system 消息收拢到头部（管理员按模型启用）
     pub strict_system_head: bool,
+    /// 模型级开关：多条 system 收拢时是否合并为单条（TRUE = 合并，
+    /// MiniMax 类；FALSE = 保持多条独立前移，qwen3 类）
+    pub system_head_merge: bool,
     /// H3：reasoning_effort 值域钳制模式（NULL = passthrough）
     pub reasoning_effort_mode: Option<String>,
     /// H3：thinking 形态（NULL = 剥离；thinking_param / reasoning_split / enable_thinking）
@@ -146,10 +149,9 @@ pub struct AdminRoute {
     /// H2：Responses 方言字段透传白名单（逗号分隔；NULL = 全部剥离）
     pub responses_passthrough_fields: Option<String>,
 }
-
 pub async fn list_routes(pool: &PgPool) -> Result<Vec<AdminRoute>, sqlx::Error> {
     sqlx::query_as::<_, AdminRoute>(
-        "SELECT id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields \
+        "SELECT id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, system_head_merge, reasoning_effort_mode, thinking_form, responses_passthrough_fields \
          FROM model_routes ORDER BY priority, id",
     )
     .fetch_all(pool)
@@ -166,14 +168,15 @@ pub async fn create_route(
     enabled: bool,
     extra_body: &serde_json::Value,
     strict_system_head: bool,
+    system_head_merge: bool,
     reasoning_effort_mode: Option<&str>,
     thinking_form: Option<&str>,
     responses_passthrough_fields: Option<&str>,
 ) -> Result<AdminRoute, sqlx::Error> {
     sqlx::query_as::<_, AdminRoute>(
-        "INSERT INTO model_routes (model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields",
+        "INSERT INTO model_routes (model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, system_head_merge, reasoning_effort_mode, thinking_form, responses_passthrough_fields) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, system_head_merge, reasoning_effort_mode, thinking_form, responses_passthrough_fields",
     )
     .bind(model_pattern)
     .bind(provider_id)
@@ -183,6 +186,7 @@ pub async fn create_route(
     .bind(enabled)
     .bind(extra_body)
     .bind(strict_system_head)
+    .bind(system_head_merge)
     .bind(reasoning_effort_mode)
     .bind(thinking_form)
     .bind(responses_passthrough_fields)
@@ -202,6 +206,7 @@ pub async fn update_route(
     // None = 不修改；Some(空对象) = 清空
     extra_body: Option<&serde_json::Value>,
     strict_system_head: Option<bool>,
+    system_head_merge: Option<bool>,
     // H3：None = 不修改；Some(None) = 清空回 passthrough；Some(Some(v)) = 设置
     reasoning_effort_mode: Option<Option<String>>,
     thinking_form: Option<Option<String>>,
@@ -237,9 +242,10 @@ pub async fn update_route(
             strict_system_head = COALESCE($10, strict_system_head), \
             reasoning_effort_mode = CASE WHEN $12 THEN $11 ELSE reasoning_effort_mode END, \
             thinking_form = CASE WHEN $14 THEN $13 ELSE thinking_form END, \
-            responses_passthrough_fields = CASE WHEN $16 THEN $15 ELSE responses_passthrough_fields END \
+            responses_passthrough_fields = CASE WHEN $16 THEN $15 ELSE responses_passthrough_fields END, \
+            system_head_merge = COALESCE($17, system_head_merge) \
          WHERE id = $1 \
-         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields",
+         RETURNING id, model_pattern, provider_id, priority, fallback_ids, upstream_model, enabled, extra_body, strict_system_head, system_head_merge, reasoning_effort_mode, thinking_form, responses_passthrough_fields",
     )
     .bind(id)
     .bind(model_pattern)
@@ -257,6 +263,7 @@ pub async fn update_route(
     .bind(thinking_provided)
     .bind(passthrough_val)
     .bind(passthrough_provided)
+    .bind(system_head_merge)
     .fetch_optional(pool)
     .await
 }

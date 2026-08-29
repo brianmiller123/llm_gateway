@@ -252,6 +252,11 @@ export interface RouteRow {
   /** 上游实际模型名（映射）；null = 透传客户端模型名 */
   upstream_model: string | null
   enabled: boolean
+  /** 模型级开关：system 消息收拢到消息数组头部（qwen3「system message must
+   *  be at the beginning」/ MiniMax 类严格上游） */
+  strict_system_head: boolean
+  /** 多条 system 收拢时是否合并为单条（true = 合并；false = 仅前移保持多条独立） */
+  system_head_merge: boolean
   /** 模型级 extra_body（覆盖渠道级同名叶键；{} = 未配置） */
   extra_body?: Record<string, unknown>
 }

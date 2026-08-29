@@ -35,6 +35,9 @@ pub struct ModelRoute {
     /// 模型级开关：Chat 请求 system 消息收拢到头部（MiniMax 类严格上游；
     /// 管理员按模型启用，默认关闭）
     pub strict_system_head: bool,
+    /// 模型级开关：多条 system 收拢时是否合并为单条（TRUE = 合并，
+    /// MiniMax 类；FALSE = 保持多条独立前移，qwen3 类）
+    pub system_head_merge: bool,
     /// H3：出站 reasoning_effort 值域钳制模式（NULL/passthrough = 原值透传；
     /// deepseek / low_high / openrouter 见 model_family::clamp_reasoning_effort）
     pub reasoning_effort_mode: Option<String>,
@@ -71,7 +74,7 @@ pub async fn load_providers(pool: &PgPool) -> Result<Vec<Provider>, sqlx::Error>
 
 pub async fn load_routes(pool: &PgPool) -> Result<Vec<ModelRoute>, sqlx::Error> {
     sqlx::query_as::<_, ModelRoute>(
-        "SELECT model_pattern, provider_id, fallback_ids, upstream_model, extra_body, strict_system_head, reasoning_effort_mode, thinking_form, responses_passthrough_fields
+        "SELECT model_pattern, provider_id, fallback_ids, upstream_model, extra_body, strict_system_head, system_head_merge, reasoning_effort_mode, thinking_form, responses_passthrough_fields
          FROM model_routes WHERE enabled = TRUE ORDER BY priority ASC, id ASC",
     )
     .fetch_all(pool)

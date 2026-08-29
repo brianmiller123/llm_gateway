@@ -738,9 +738,14 @@ struct RouteReq {
     enabled: bool,
     #[serde(default = "empty_object")]
     extra_body: serde_json::Value,
-    /// 模型级开关：Chat 请求 system 消息收拢到头部（MiniMax 类严格上游）
+    /// 模型级开关：Chat 请求 system 消息收拢到头部（qwen3「system message
+    /// must be at the beginning」/ MiniMax 类严格上游）
     #[serde(default)]
     strict_system_head: bool,
+    /// 多条 system 收拢时是否合并为单条（true = 合并，MiniMax 类；
+    /// false = 仅前移保持多条独立，qwen3 类；strict_system_head 关闭时无效果）
+    #[serde(default = "default_true")]
+    system_head_merge: bool,
     /// H3：reasoning_effort 值域钳制模式（缺省/空 = passthrough）
     #[serde(default)]
     reasoning_effort_mode: Option<String>,
@@ -877,6 +882,7 @@ async fn create_route(
         req.enabled,
         &req.extra_body,
         req.strict_system_head,
+        req.system_head_merge,
         effort_mode.as_deref(),
         thinking_form.as_deref(),
         passthrough.as_deref(),
@@ -913,6 +919,10 @@ struct RoutePatch {
     /// None/缺省 = 不修改
     #[serde(default)]
     strict_system_head: Option<bool>,
+    /// 多条 system 收拢时是否合并为单条（None/缺省 = 不修改；
+    /// strict_system_head 关闭时无效果）
+    #[serde(default)]
+    system_head_merge: Option<bool>,
     /// H3：外层 None = 不改动；内层 None/null = 清空回 passthrough；Some = 设置
     #[serde(default)]
     reasoning_effort_mode: Option<Option<String>>,
@@ -990,6 +1000,7 @@ async fn update_route(
         req.enabled,
         req.extra_body.as_ref(),
         req.strict_system_head,
+        req.system_head_merge,
         effort_mode,
         thinking_form,
         passthrough,

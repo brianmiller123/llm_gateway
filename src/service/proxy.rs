@@ -311,13 +311,14 @@ fn effective_extra(route_extra: &Value, provider_extra: &Value) -> Option<Value>
 }
 
 /// L1：模型级开关启用时，把 Chat 请求 `messages` 中全部 system 消息收拢到
-/// 头部（多条合并为单条）。默认关闭，不影响常规上游。返回是否改写。
-fn apply_system_head(body: &mut serde_json::Value, enabled: bool) -> bool {
+/// 头部（多条时按 `merge` 决定拼接为单条或保持多条独立）。默认关闭，
+/// 不影响常规上游。返回是否改写。
+fn apply_system_head(body: &mut serde_json::Value, enabled: bool, merge: bool) -> bool {
     if !enabled {
         return false;
     }
     match body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        Some(messages) => crate::service::system_head::collect_system_to_head(messages),
+        Some(messages) => crate::service::system_head::collect_system_to_head(messages, merge),
         None => false,
     }
 }
@@ -735,6 +736,14 @@ async fn proxy_authed(
     // P1-3：客户端模型带 `[1m]` 后缀（无论是否被剥离映射）→ 原生 Anthropic
     // 上游需要 context-1m-2025-08-07 beta 才真正启用 1M 上下文
     let wants_1m = model.ends_with("[1m]") || outbound_model.ends_with("[1m]");
+    // L1：system 收拢的最终裁决——路由开关优先，MiniMax 模型族强制收拢
+    //（多条 system 必 400，合并为单条是唯一可行形态）；merge 决定多条
+    // system 收拢后拼接为单条（MiniMax 强制 true）还是保持多条独立前移
+    //（qwen3 类「system must be at the beginning」上游）
+    let system_head = route.strict_system_head
+        || crate::service::model_family::is_mini_max(&gating_model);
+    let system_head_merge =
+        route.system_head_merge || crate::service::model_family::is_mini_max(&gating_model);
     let build_outbound_raw = |provider: &Provider| -> Result<(Vec<u8>, &'static str), AppError> {
         // extra_body 透传：渠道级 + 路由级（模型级覆盖同名叶键）深合并进出站体；
         // 全局开关关闭时保留配置但不合并（临时停用不丢配置）
@@ -756,12 +765,8 @@ async fn proxy_authed(
             apply_extra(&mut chat, extra.as_ref());
             // P1-7：MiniMax 系模型强制收拢 system 到头部（多条 system 400 防护，
             // cc-switch 无条件收拢的具名动机；其余上游维持路由开关语义）
-            apply_system_head(
-                &mut chat,
-                route.strict_system_head || crate::service::model_family::is_mini_max(&gating_model),
-            );
+            apply_system_head(&mut chat, system_head, system_head_merge);
             apply_reasoning_config(&mut chat, &route, &gating_model);
-            chat["model"] = serde_json::Value::String(outbound_model.clone());
             return Ok((
                 serde_json::to_vec(&chat).map_err(AppError::internal)?,
                 "/chat/completions",
@@ -782,10 +787,7 @@ async fn proxy_authed(
                 crate::service::responses::convert_request(&enriched, &gating_model).map_err(AppError::BadRequest)?;
             ensure_include_usage(&mut chat, streamed);
             apply_extra(&mut chat, extra.as_ref());
-            apply_system_head(
-                &mut chat,
-                route.strict_system_head || crate::service::model_family::is_mini_max(&gating_model),
-            );
+            apply_system_head(&mut chat, system_head, system_head_merge);
             apply_dialect_field_gate(&mut chat, &route);
             apply_reasoning_config(&mut chat, &route, &gating_model);
             chat["model"] = serde_json::Value::String(outbound_model.clone());
@@ -794,10 +796,7 @@ async fn proxy_authed(
             let mut json = json.clone();
             ensure_include_usage(&mut json, streamed);
             apply_extra(&mut json, extra.as_ref());
-            apply_system_head(
-                &mut json,
-                route.strict_system_head || crate::service::model_family::is_mini_max(&gating_model),
-            );
+            apply_system_head(&mut json, system_head, system_head_merge);
             apply_reasoning_config(&mut json, &route, &gating_model);
             // L8：剥离客户端 `_` 前缀私有字段（cc-switch body_filter 同款）
             strip_underscore_fields(&mut json);
@@ -809,13 +808,13 @@ async fn proxy_authed(
             let needs_rebuild = extra.is_some()
                 || roles_rewritten
                 || had_content_encoding
-                || route.strict_system_head
+                || system_head
                 || outbound_model != model
                 || has_underscore_fields(&json);
             if needs_rebuild {
                 let mut json = json.clone();
                 apply_extra(&mut json, extra.as_ref());
-                apply_system_head(&mut json, route.strict_system_head);
+                apply_system_head(&mut json, system_head, system_head_merge);
                 apply_reasoning_config(&mut json, &route, &gating_model);
                 strip_underscore_fields(&mut json);
                 json["model"] = serde_json::Value::String(outbound_model.clone());

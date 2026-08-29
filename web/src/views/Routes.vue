@@ -76,6 +76,8 @@ interface RouteForm {
   fallback_ids: number[]
   upstream_model: string
   enabled: boolean
+  strict_system_head: boolean
+  system_head_merge: boolean
 }
 
 const dialogVisible = ref(false)
@@ -89,6 +91,8 @@ const form = reactive<RouteForm>({
   fallback_ids: [],
   upstream_model: '',
   enabled: true,
+  strict_system_head: false,
+  system_head_merge: true,
 })
 
 const rules: FormRules<RouteForm> = {
@@ -133,6 +137,8 @@ function resetForm() {
   form.fallback_ids = []
   form.upstream_model = ''
   form.enabled = true
+  form.strict_system_head = false
+  form.system_head_merge = true
   formRef.value?.clearValidate()
 }
 
@@ -149,6 +155,8 @@ function openEdit(r: RouteRow) {
   form.fallback_ids = [...r.fallback_ids]
   form.upstream_model = r.upstream_model ?? ''
   form.enabled = r.enabled
+  form.strict_system_head = r.strict_system_head
+  form.system_head_merge = r.system_head_merge
   formRef.value?.clearValidate()
   dialogVisible.value = true
 }
@@ -168,8 +176,9 @@ async function submit() {
       provider_id: form.provider_id,
       priority: form.priority,
       fallback_ids: form.fallback_ids,
-      upstream_model: form.upstream_model.trim() || null,
       enabled: form.enabled,
+      strict_system_head: form.strict_system_head,
+      system_head_merge: form.system_head_merge,
     }
     if (editingId.value === null) {
       await request('/api/admin/routes', {
@@ -255,6 +264,13 @@ onMounted(loadData)
             >启用</el-button>
           </template>
         </el-table-column>
+        <el-table-column label="系统消息置顶" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.strict_system_head && row.system_head_merge" size="small" type="warning">置顶+合并</el-tag>
+            <el-tag v-else-if="row.strict_system_head" size="small" type="info">置顶</el-tag>
+            <span v-else style="color: #c0c4cc">-</span>
+          </template>
+        </el-table-column>
         <template #empty>
           <el-empty description="暂无路由规则" />
         </template>
@@ -268,7 +284,7 @@ onMounted(loadData)
       :close-on-click-modal="false"
       @closed="resetForm"
     >
-      <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
+      <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="模型匹配" prop="model_pattern">
           <el-select
             v-model="form.model_pattern"
@@ -311,6 +327,24 @@ onMounted(loadData)
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
         </el-form-item>
+        <el-form-item label="系统消息置顶">
+          <div class="system-head-box">
+            <el-switch v-model="form.strict_system_head" />
+            <span class="field-hint">
+              开启后把请求中全部 system 消息移到消息数组开头（qwen3 等上游报
+              "system message must be at the beginning" 时开启）
+            </span>
+            <template v-if="form.strict_system_head">
+              <el-divider direction="vertical" />
+              <el-switch v-model="form.system_head_merge" />
+              <span class="field-label">合并系统消息</span>
+              <span class="field-hint">
+                开启 = 多条 system 按序拼接为开头单条（MiniMax 类）；
+                关闭 = 仅置顶、保持多条独立
+              </span>
+            </template>
+          </div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -331,6 +365,25 @@ onMounted(loadData)
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.system-head-box {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  line-height: 1.5;
+}
+
+.field-label {
+  font-size: 13px;
+  color: #606266;
+  white-space: nowrap;
+}
+
+.field-hint {
+  font-size: 12px;
+  color: #909399;
 }
 
 .toolbar-actions {
