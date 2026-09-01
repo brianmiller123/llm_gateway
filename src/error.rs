@@ -18,6 +18,9 @@ pub enum AppError {
     RateLimited(f64),
     #[error("monthly quota exceeded")]
     QuotaExceeded,
+    /// Coding Plan 周期配额耗尽且策略为拦截（429 insufficient_quota）
+    #[error("{0}")]
+    PlanQuotaExceeded(String),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("internal error: {0}")]
@@ -108,6 +111,12 @@ impl IntoResponse for AppError {
                     StatusCode::TOO_MANY_REQUESTS,
                     "insufficient_quota",
                     "Monthly quota exceeded, please contact administrator".to_string(),
+                    None,
+                ),
+                AppError::PlanQuotaExceeded(m) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "insufficient_quota",
+                    m,
                     None,
                 ),
                 AppError::BadRequest(m) => (

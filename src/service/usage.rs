@@ -7,9 +7,12 @@ use crate::store::usage::{record_usage, Usage, UsageMeta};
 
 /// 月度用量计数缓存：key = (user_id, "YYYY-MM") → (tokens, cost)
 /// 记账事务提交后更新；配额预检查读取；启动/周期从 DB 重载兜底（防重启后配额清零）
+/// plan_usage：Coding Plan 当期计数 (user_id, plan_id) → (period_key, tokens)，
+/// 与月度缓存同语义（DB 真值覆盖 + 提交后增量）
 #[derive(Default)]
 pub struct UsageCache {
     monthly: Mutex<HashMap<(i64, String), (i64, f64)>>,
+    plan_usage: Mutex<HashMap<(i64, i64), (String, i64)>>,
 }
 
 impl UsageCache {
@@ -33,6 +36,27 @@ impl UsageCache {
         e.1 += cost;
     }
 
+    /// Plan 当期已用 tokens（period_key 不匹配视为新周期 → 0）
+    pub fn get_plan(&self, user_id: i64, plan_id: i64, period_key: &str) -> i64 {
+        match self.plan_usage.lock().get(&(user_id, plan_id)) {
+            Some((k, v)) if k == period_key => *v,
+            _ => 0,
+        }
+    }
+
+    pub fn incr_plan(&self, user_id: i64, plan_id: i64, period_key: &str, tokens: i64) {
+        let mut map = self.plan_usage.lock();
+        let e = map
+            .entry((user_id, plan_id))
+            .or_insert((period_key.to_string(), 0));
+        if e.0 == period_key {
+            e.1 = e.1.saturating_add(tokens);
+        } else {
+            // 周期翻转：以本笔增量重置
+            *e = (period_key.to_string(), tokens.max(0));
+        }
+    }
+
     /// 从 DB 全量重载当月计数（只覆盖不清理，避免并发 incr 在快照与写入之间丢失；
     /// 条目数按 用户×月 增长，有界）。启动时与周期 reload 中调用。
     pub async fn reload_from_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
@@ -43,9 +67,17 @@ impl UsageCache {
         .bind(&month)
         .fetch_all(pool)
         .await?;
-        let mut map = self.monthly.lock();
-        for (user_id, tokens, cost) in rows {
-            map.insert((user_id, month.clone()), (tokens, cost));
+        {
+            let mut map = self.monthly.lock();
+            for (user_id, tokens, cost) in rows {
+                map.insert((user_id, month.clone()), (tokens, cost));
+            }
+        }
+        // Coding Plan 当期快照：先取数后持锁（MutexGuard 不得跨 await，非 Send）
+        let snapshots = crate::store::plans::load_usage_snapshots(pool).await?;
+        let mut pmap = self.plan_usage.lock();
+        for s in snapshots {
+            pmap.insert((s.user_id, s.plan_id), (s.period_key, s.used));
         }
         Ok(())
     }
@@ -161,6 +193,12 @@ pub async fn record(
                 let month = chrono::Utc::now().format("%Y-%m").to_string();
                 let tokens = usage.map(|u| u.total()).unwrap_or(0);
                 st.usage.incr(user_id, &month, tokens, cost);
+                // Coding Plan 周期计数推进 + 阈值告警检查（80/95/100%）
+                if let Some(bill) = meta.plan.as_ref() {
+                    st.usage
+                        .incr_plan(user_id, bill.plan_id, &bill.period_key, tokens);
+                    crate::service::plans::after_usage_record(st, user_id);
+                }
             }
             tracing::info!(
                 request_id = %meta.request_id,

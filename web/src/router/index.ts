@@ -22,6 +22,24 @@ const router = createRouter({
         { path: 'users', name: 'users', component: () => import('@/views/Users.vue'), meta: { title: '用户管理', admin: true } },
         { path: 'audit', name: 'audit', component: () => import('@/views/Audit.vue'), meta: { title: '审计日志', admin: true } },
         {
+          path: 'my-plan',
+          name: 'my-plan',
+          component: () => import('@/views/MyPlan.vue'),
+          meta: { title: '我的套餐' },
+        },
+        {
+          path: 'plans',
+          name: 'plans',
+          component: () => import('@/views/Plans.vue'),
+          meta: { title: 'Coding Plan', admin: true },
+        },
+        {
+          path: 'plan-monitor',
+          name: 'plan-monitor',
+          component: () => import('@/views/PlanMonitor.vue'),
+          meta: { title: 'Plan 用量看板', admin: true },
+        },
+        {
           path: 'monitor',
           name: 'monitor',
           component: () => import('@/views/Realtime.vue'),

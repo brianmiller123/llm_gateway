@@ -209,6 +209,88 @@ pub async fn test_connection(settings: &LdapSettings) -> Result<String, String> 
     }
 }
 
+/// 分组同步用：目录用户全量枚举条目
+#[derive(Debug, Clone)]
+pub struct LdapUserEntry {
+    pub username: String,
+    pub dn: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+}
+/// 从用户过滤器提取与 {0} 配对的用户名属性（uid / sAMAccountName 等）。
+/// "(&(objectClass=inetOrgPerson)(uid={0}))" → "uid"；无法解析时回退 uid。
+fn username_attr(filter: &str) -> &str {
+    let Some(i) = filter.find("{0}") else {
+        return "uid";
+    };
+    let before = &filter[..i];
+    let start = before
+        .trim_end_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_')
+        .len();
+    let attr = &before[start..];
+    if attr.is_empty() { "uid" } else { attr }
+}
+
+/// 目录用户全量列表（分组 LDAP 同步数据源）。
+/// 过滤器 {0} → * 枚举全部条目；30s 超时（大目录全量拉取）。
+pub async fn list_users(
+    settings: &LdapSettings,
+) -> Result<Vec<LdapUserEntry>, LdapError> {
+    if !settings.is_configured() {
+        return Err(LdapError::NotConfigured);
+    }
+    let work = async {
+        let (conn, mut ldap) = LdapConnAsync::with_settings(
+            LdapConnSettings::new().set_starttls(settings.starttls),
+            &settings.url,
+        )
+        .await?;
+        ldap3::drive!(conn);
+        if let (Some(dn), Some(pw)) = (&settings.bind_dn, &settings.bind_password) {
+            ldap.simple_bind(dn, pw).await?;
+        }
+        let filter = settings.user_filter.replace("{0}", "*");
+        let attr = username_attr(&settings.user_filter).to_string();
+        let attrs: Vec<&str> = vec!["dn", &attr, "mail", "displayName", "cn"];
+        let rs = ldap
+            .search(&settings.base_dn, Scope::Subtree, &filter, attrs)
+            .await?;
+        ldap.unbind().await.ok();
+        let mut out = Vec::new();
+        for e in rs.0 {
+            let entry = SearchEntry::construct(e);
+            let first = |a: &str| entry.attrs.get(a).and_then(|v| v.first()).cloned();
+            let Some(username) = first(&attr).or_else(|| {
+                // 属性缺失时从 DN 首 RDN 兜底解析（cn=alice,dc=... → alice）
+                entry
+                    .dn
+                    .split(',')
+                    .next()
+                    .and_then(|rdn| rdn.split_once('='))
+                    .map(|(_, v)| v.to_string())
+            }) else {
+                continue;
+            };
+            if username.is_empty() {
+                continue;
+            }
+            out.push(LdapUserEntry {
+                username,
+                dn: entry.dn,
+                email: first("mail"),
+                display_name: first("displayName").or_else(|| first("cn")),
+            });
+        }
+        Ok(out)
+    };
+    match timeout(Duration::from_secs(30), work).await {
+        Ok(r) => r,
+        Err(_) => Err(LdapError::Transport(
+            "LDAP 用户列表拉取超时（30s）".into(),
+        )),
+    }
+}
+
 /// 管理员判定：memberOf 命中即管理员；memberOf 缺失（目录未启用 overlay）时
 /// 对 groupOfNames 做补充搜索。目录已提供 memberOf 且无命中 → 直接判定非管理员
 /// （避免每次登录多开一条 LDAP 连接，也避免 10s+10s 超时叠加导致登录卡顿）。

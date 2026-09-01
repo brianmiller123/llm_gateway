@@ -22,9 +22,18 @@
         <el-menu-item index="/usage">
           <el-icon><DataLine /></el-icon><span>用量统计</span>
         </el-menu-item>
+        <el-menu-item index="/my-plan">
+          <el-icon><Trophy /></el-icon><span>我的套餐</span>
+        </el-menu-item>
         <template v-if="auth.isAdmin">
           <el-menu-item index="/users">
             <el-icon><UserFilled /></el-icon><span>用户管理</span>
+          </el-menu-item>
+          <el-menu-item index="/plans">
+            <el-icon><Medal /></el-icon><span>Coding Plan</span>
+          </el-menu-item>
+          <el-menu-item index="/plan-monitor">
+            <el-icon><PieChart /></el-icon><span>Plan 用量看板</span>
           </el-menu-item>
           <el-menu-item index="/audit">
             <el-icon><Document /></el-icon><span>审计日志</span>

@@ -638,7 +638,7 @@ async fn proxy_authed(
             roles_rewritten |= normalize_tools(&mut json);
         }
     }
-    let model: String = json
+    let mut model: String = json
         .get("model")
         .and_then(|m| m.as_str())
         .filter(|m| !m.is_empty())
@@ -650,9 +650,18 @@ async fn proxy_authed(
     //    置于模型解析后执行——缺 model 字段/坏 JSON 的请求在上方解析即 400）
     crate::service::ratelimit::apply_rate_limits(st, user_id, key_id, &model)?;
 
-    // 4. 配额预检查
+    // 4b. Coding Plan 配额：超出按策略拦截(429)/降级改写模型/仅告警放行。
+    // 降级改写 json["model"] 并标记 plan_downgraded——零改写快路径直传原始
+    // 客户端字节，必须强制走重建路径才能让改写生效
+    let mut plan_downgraded = false;
     if let Some(uid) = user_id {
         usage::check_quota(st, uid)?;
+        if let Some(downgraded) = crate::service::plans::check_plan(st, uid, &model)? {
+            tracing::info!(user_id = uid, from = %model, to = %downgraded, "plan overage: downgraded model");
+            json["model"] = serde_json::Value::String(downgraded.clone());
+            model = downgraded;
+            plan_downgraded = true;
+        }
     }
 
     // 5. 路由解析 → 候选上游（主 + 降级链）
@@ -810,7 +819,9 @@ async fn proxy_authed(
                 || had_content_encoding
                 || system_head
                 || outbound_model != model
-                || has_underscore_fields(&json);
+                || has_underscore_fields(&json)
+                // Plan 降级改写了 json["model"]：快路径直传原始字节会绕过改写
+                || plan_downgraded;
             if needs_rebuild {
                 let mut json = json.clone();
                 apply_extra(&mut json, extra.as_ref());
@@ -837,6 +848,17 @@ async fn proxy_authed(
         Ok((bytes, upstream_path))
     };
 
+    // Coding Plan 计量载荷：生效 Plan → (plan_id, period_start, period_key)
+    let plan_bill = user_id.and_then(|uid| {
+        let rt = st.plans.read().get(&uid).cloned()?;
+        let now = chrono::Utc::now();
+        Some(crate::store::usage::PlanBill {
+            plan_id: rt.plan_id,
+            period_start: rt.period_start(now),
+            period_key: rt.period_key(now),
+        })
+    });
+
     let mut meta = UsageMeta {
         request_id,
         user_id,
@@ -856,6 +878,7 @@ async fn proxy_authed(
         pricing_models: std::iter::once(model.clone())
             .chain(route.upstream_model.clone())
             .collect(),
+        plan: plan_bill,
     };
 
 

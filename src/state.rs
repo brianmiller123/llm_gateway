@@ -26,6 +26,8 @@ pub struct AppState {
     pub prices: Arc<RwLock<HashMap<String, ModelPrice>>>,
     /// 用户访问授权白名单：user_id → 规则列表（空/缺省 = 默认放行）
     pub user_access: Arc<RwLock<HashMap<i64, Vec<UserAccessRule>>>>,
+    /// Coding Plan 运行时：user_id → 生效 Plan（多分组按 priority 择优；reload 刷新）
+    pub plans: Arc<RwLock<HashMap<i64, crate::store::plans::PlanRuntime>>>,
     /// 管理员用户 id 集合（授权检查时跳过）
     pub admin_ids: Arc<RwLock<HashSet<i64>>>,
     /// M3：进程内每渠道熔断器（连续可重试失败 → 短窗跳过；仅内存态）
@@ -45,6 +47,8 @@ pub struct AppState {
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
     pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,
     pub quota_alerts: Arc<Mutex<HashSet<(i64, String)>>>,
+    /// Plan 阈值告警进程内去重：(user_id, plan_id, period_key, level)
+    pub plan_alerts_seen: Arc<Mutex<HashSet<(i64, i64, String, i16)>>>,
 }
 
 impl AppState {
@@ -90,6 +94,7 @@ impl AppState {
             quotas: Arc::new(RwLock::new(HashMap::new())),
             prices: Arc::new(RwLock::new(HashMap::new())),
             user_access: Arc::new(RwLock::new(HashMap::new())),
+            plans: Arc::new(RwLock::new(HashMap::new())),
             admin_ids: Arc::new(RwLock::new(HashSet::new())),
             breaker: Arc::new(crate::service::breaker::Breaker::new_with(breaker_cfg)),
             limiter: Arc::new(RateLimiter::new()),
@@ -107,6 +112,7 @@ impl AppState {
             responses_history: Arc::new(
                 crate::service::responses::history::ResponseHistoryStore::new(),
             ),
+            plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             quota_alerts: Arc::new(Mutex::new(HashSet::new())),
         };
         state.reload().await?;
@@ -161,6 +167,7 @@ impl AppState {
             user_access.entry(r.user_id).or_default().push(r);
         }
         let admin_ids: HashSet<i64> = crate::store::users::load_admin_ids(&self.pool).await?;
+        let plan_runtimes = crate::store::plans::load_plan_runtimes(&self.pool).await?;
 
         *self.providers.write() = providers;
         *self.routes.write() = routes;
@@ -169,6 +176,7 @@ impl AppState {
         *self.prices.write() = prices;
         *self.user_access.write() = user_access;
         *self.admin_ids.write() = admin_ids;
+        *self.plans.write() = plan_runtimes;
         *self.extra_body_enabled.write() =
             crate::store::config::load_extra_body_enabled(&self.pool).await?;
         *self.api_endpoints.write() =

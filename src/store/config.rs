@@ -827,3 +827,63 @@ pub async fn list_api_test_results(
     .fetch_all(pool)
     .await
 }
+
+// ---------- 系统设置（SMTP，Coding Plan 告警邮件） ----------
+
+/// SMTP 配置（system_settings 单行扩展；password 为 AES-GCM 密文）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SmtpSettings {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password_enc: String,
+    pub from: String,
+}
+
+impl SmtpSettings {
+    /// host/port/from 齐备即可发信（username/password 仅在服务器要求认证时必需）
+    pub fn configured(&self) -> bool {
+        !self.host.trim().is_empty() && self.port > 0 && !self.from.trim().is_empty()
+    }
+}
+
+pub async fn load_smtp_settings(pool: &PgPool) -> Result<SmtpSettings, sqlx::Error> {
+    let row: (String, i32, String, String, String) = sqlx::query_as(
+        "SELECT smtp_host, smtp_port, smtp_username, smtp_password_enc, smtp_from \
+         FROM system_settings WHERE id = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(SmtpSettings {
+        host: row.0,
+        port: row.1.clamp(0, u16::MAX as i32) as u16,
+        username: row.2,
+        password_enc: row.3,
+        from: row.4,
+    })
+}
+
+/// 保存 SMTP；password_enc 传 None = 不修改
+pub async fn save_smtp_settings(
+    pool: &PgPool,
+    host: &str,
+    port: u16,
+    username: &str,
+    password_enc: Option<&str>,
+    from: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE system_settings SET \
+           smtp_host = $1, smtp_port = $2, smtp_username = $3, \
+           smtp_password_enc = COALESCE($4, smtp_password_enc), smtp_from = $5 \
+         WHERE id = 1",
+    )
+    .bind(host)
+    .bind(port as i32)
+    .bind(username)
+    .bind(password_enc)
+    .bind(from)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

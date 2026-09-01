@@ -513,3 +513,182 @@ export interface PublicEndpointsResp {
   responses: PublicEndpointInfo | null
   messages: PublicEndpointInfo | null
 }
+
+// ---------- Coding Plan 与用户分组 ----------
+
+/** Plan 过量策略 */
+export type OverageAction = 'block' | 'downgrade' | 'log'
+/** 统计周期：自然日 / 自然月 / 总量 */
+export type PeriodType = 'daily' | 'monthly' | 'total'
+
+export interface CodingPlan {
+  id: number
+  name: string
+  description: string
+  priority: number
+  token_limit: number
+  token_limit_display: string
+  period_type: PeriodType
+  overage_action: OverageAction
+  downgrade_model: string | null
+  alert_channels: string[]
+  webhook_url: string
+  enabled: boolean
+  updated_at: string
+}
+
+export interface PlanSummary extends CodingPlan {
+  used_tokens: number
+  active_users: number
+  group_count: number
+  member_count: number
+}
+
+export interface PlansResp {
+  plans: PlanSummary[]
+}
+
+export interface DailyUsage {
+  stat_date: string
+  call_count: number
+  tokens: number
+}
+
+export interface PeriodUsage {
+  period_start: string
+  tokens: number
+  users: number
+}
+
+export interface PlanUserUsage {
+  user_id: number
+  username: string
+  display_name: string | null
+  call_count: number
+  tokens: number
+}
+
+export interface PlanUsageResp {
+  plan: CodingPlan
+  trend: DailyUsage[]
+  periods: PeriodUsage[]
+  range: { from: string; to: string }
+  users: {
+    rows: PlanUserUsage[]
+    total: number
+    limit: number
+    offset: number
+  }
+}
+
+export interface PlanAlert {
+  id: number
+  plan_id: number | null
+  plan_name: string
+  user_id: number | null
+  username: string
+  level: number
+  period_key: string
+  used: number
+  limit_tokens: number
+  message: string
+  delivered: Record<string, string>
+  created_at: string
+}
+
+export interface PlanAlertsResp {
+  alerts: PlanAlert[]
+}
+
+export interface UserGroup {
+  id: number
+  name: string
+  description: string
+  plan_id: number | null
+  plan_name: string | null
+  plan_enabled: boolean | null
+  ldap_sync: boolean
+  member_count: number
+  last_sync_at: string | null
+  last_sync_result: string
+  created_at: string
+  updated_at: string
+}
+
+export interface GroupsResp {
+  groups: UserGroup[]
+}
+
+export interface GroupMember {
+  user_id: number
+  username: string
+  display_name: string | null
+  email: string | null
+  source: 'manual' | 'ldap' | 'all'
+  status: number
+  added_at: string
+}
+
+export interface MembersResp {
+  members: GroupMember[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface UserPick {
+  id: number
+  username: string
+  display_name: string | null
+  email: string | null
+  source: string
+  status: number
+  is_member: boolean
+}
+
+export interface UserPickResp {
+  users: UserPick[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface MyPlanResp {
+  plan: {
+    id: number
+    name: string
+    group: string
+    period_type: PeriodType
+    token_limit: number
+    token_limit_display: string
+    overage_action: OverageAction
+    downgrade_model: string | null
+  } | null
+  period: {
+    key: string
+    used: number
+    remaining: number
+    percent: number
+  } | null
+  daily: DailyUsage[]
+}
+
+export interface MyNotificationsResp {
+  notifications: PlanAlert[]
+}
+
+export interface SmtpSettings {
+  host: string
+  port: number
+  username: string
+  from: string
+  has_password: boolean
+}
+
+export interface SmtpSettingsResp {
+  host: string
+  port: number
+  username: string
+  from: string
+  has_password: boolean
+}

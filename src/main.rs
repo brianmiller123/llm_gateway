@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 后台任务：配置热加载 + 用量日聚合
     state.spawn_reload_tasks();
     tokio::spawn(worker::aggregator::run(state.pool.clone()));
+    tokio::spawn(worker::plan_sync::run(state.clone()));
 
     // HTTPS 主服务（443）；HTTP（80）：开启重定向时仅 301，关闭时直接服务完整应用
     let https = tokio::spawn(serve_https(app.clone(), cfg.clone()));

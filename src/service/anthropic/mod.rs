@@ -96,10 +96,10 @@ pub fn error_response(err: &AppError) -> Response {
             "rate_limit_error",
             format!("Rate limit exceeded, retry after {}s", secs.ceil().max(1.0) as u64),
         ),
-        AppError::QuotaExceeded => (
+        AppError::QuotaExceeded | AppError::PlanQuotaExceeded(_) => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
-            "Monthly quota exceeded, please contact administrator".into(),
+            "quota exceeded, please contact administrator".into(),
         ),
         AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "invalid_request_error", m.clone()),
         AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error", m.clone()),

@@ -1,5 +1,6 @@
 pub mod admin_config;
 pub mod console;
+pub mod plans;
 pub mod status;
 pub mod v1;
 
@@ -22,6 +23,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(status::routes())
         .merge(console::routes(state.clone()))
         .merge(admin_config::routes(state.clone()))
+        .merge(plans::routes(state.clone()))
         // 控制台前端静态资源（Vue dist）；目录不存在时 ServeDir 自然 404
         .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         // SPA 深层路由（浏览器导航）→ index.html；API 未匹配路径 → JSON 404

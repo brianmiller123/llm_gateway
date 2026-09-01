@@ -8,6 +8,8 @@ pub mod inline_think;
 pub mod keys_crypto;
 pub mod ldap;
 pub mod model_family;
+pub mod notify;
+pub mod plans;
 pub mod proxy;
 pub mod ratelimit;
 pub mod rectify;

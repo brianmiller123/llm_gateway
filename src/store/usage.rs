@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use sqlx::PgPool;
 use std::net::IpAddr;
 use uuid::Uuid;
@@ -23,9 +24,19 @@ pub struct UsageMeta {
     /// 计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
     /// 依次查价；仅记账使用）
     pub pricing_models: Vec<String>,
+    /// Coding Plan 计量（None = 用户无生效 Plan，跳过计数器写入）
+    pub plan: Option<PlanBill>,
 }
 
-/// 供应商返回的 usage（双形态）：Chat Completions 用 prompt/completion_tokens，
+/// Coding Plan 计量载荷：生效 Plan 存在时随请求携带（proxy 期解析自 PlanRuntime）。
+/// period_start 由 PlanRuntime.period_start(now) 按周期类型解析（UTC）；
+/// period_key 用于内存缓存周期翻转判定。
+#[derive(Debug, Clone)]
+pub struct PlanBill {
+    pub plan_id: i64,
+    pub period_start: NaiveDate,
+    pub period_key: String,
+}
 /// Responses API 用 input/output_tokens；缺失字段自动回退为 None（记账按 0 计）。
 /// 缓存桶（cache_read/cache_write）来自 prompt_tokens_details.cached_tokens 等多源
 /// 归一化（详见 responses::dto::Usage），用于按缓存费率计费与明细对账。
@@ -125,6 +136,23 @@ pub async fn record_usage(
         .execute(&mut *tx)
         .await?;
     }
+
+    // Coding Plan 周期计数器：与明细写入同事务 UPSERT（原子一致）；
+    // tokens 饱和加法已在上方计算，plan 计量与月度口径一致
+    if let (Some(user_id), Some(bill)) = (meta.user_id, meta.plan.as_ref()) {
+        sqlx::query(
+            "INSERT INTO plan_usage_counters (user_id, plan_id, period_start, tokens)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (user_id, plan_id, period_start) DO UPDATE SET
+               tokens = plan_usage_counters.tokens + EXCLUDED.tokens, updated_at = now()",
+        )
+        .bind(user_id)
+        .bind(bill.plan_id)
+        .bind(bill.period_start)
+        .bind(tokens)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await
 }
 
@@ -157,6 +185,8 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
                     COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost),0)
              FROM usage_logs, m
              WHERE usage_logs.id > $1 AND usage_logs.id <= m.max_id
+               -- 匿名请求（auth=none，user_id 为 NULL）无归属，跳过聚合防 NOT NULL 违例卡死水位
+               AND usage_logs.user_id IS NOT NULL
              GROUP BY user_id, model, (created_at AT TIME ZONE 'UTC')::date
              ON CONFLICT (user_id, model, stat_date) DO UPDATE SET
                call_count    = usage_daily.call_count    + EXCLUDED.call_count,

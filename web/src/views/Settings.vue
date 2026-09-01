@@ -106,6 +106,43 @@
       </el-form>
     </el-card>
       </el-tab-pane>
+      <el-tab-pane label="告警邮件（SMTP）" name="smtp">
+        <el-card shadow="never" class="panel" v-loading="smtpLoading">
+          <el-form label-position="top" @submit.prevent>
+            <el-form-item label="SMTP 服务器" required>
+              <el-input v-model="smtpForm.host" placeholder="smtp.example.com" clearable />
+            </el-form-item>
+            <el-form-item label="端口">
+              <el-input-number v-model="smtpForm.port" :min="0" :max="65535" controls-position="right" />
+              <span class="hint">465 使用隐式 TLS，其余端口使用 STARTTLS；0 = 未配置</span>
+            </el-form-item>
+            <el-form-item label="账号（可选）">
+              <el-input v-model="smtpForm.username" placeholder="服务器要求认证时填写" clearable />
+            </el-form-item>
+            <el-form-item label="密码">
+              <el-input
+                v-model="smtpForm.password"
+                type="password"
+                show-password
+                :placeholder="smtpHasPassword ? '已保存（留空则保持不变）' : 'SMTP 密码'"
+                autocomplete="new-password"
+              />
+            </el-form-item>
+            <el-form-item label="发件人" required>
+              <el-input v-model="smtpForm.from" placeholder="LLM Gateway <gateway@example.com>" clearable />
+            </el-form-item>
+            <el-form-item label="测试收件人">
+              <div class="actions">
+                <el-input v-model="smtpTestTo" placeholder="you@example.com" style="width: 260px" />
+                <el-button :loading="smtpTesting" @click="doSmtpTest">发送测试邮件</el-button>
+              </div>
+            </el-form-item>
+            <div class="actions">
+              <el-button type="primary" :icon="Check" :loading="smtpSaving" @click="doSmtpSave">保存</el-button>
+            </div>
+          </el-form>
+        </el-card>
+       </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -115,7 +152,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Check, Connection, Delete, Plus } from '@element-plus/icons-vue'
 import { request } from '@/api/client'
-import type { HeaderSettingsResp, LdapSettingsResp } from '@/api/types'
+import type { HeaderSettingsResp, LdapSettingsResp, SmtpSettingsResp } from '@/api/types'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -261,8 +298,87 @@ async function saveHeaders() {
   }
 }
 
-onMounted(load)
+// ---------- 告警邮件（SMTP） ----------
+const smtpLoading = ref(false)
+const smtpSaving = ref(false)
+const smtpTesting = ref(false)
+const smtpHasPassword = ref(false)
+const smtpTestTo = ref('')
+const smtpForm = reactive({
+  host: '',
+  port: 0,
+  username: '',
+  password: '',
+  from: '',
+})
+
+async function loadSmtp() {
+  smtpLoading.value = true
+  try {
+    const resp = await request<SmtpSettingsResp>('/api/admin/smtp')
+    smtpForm.host = resp.host
+    smtpForm.port = resp.port
+    smtpForm.username = resp.username
+    smtpForm.from = resp.from
+    smtpForm.password = ''
+    smtpHasPassword.value = resp.has_password
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '加载 SMTP 配置失败')
+  } finally {
+    smtpLoading.value = false
+  }
+}
+
+async function doSmtpSave() {
+  if (!smtpForm.host.trim() || !smtpForm.from.trim()) {
+    ElMessage.warning('SMTP 服务器与发件人为必填项')
+    return
+  }
+  smtpSaving.value = true
+  try {
+    await request('/api/admin/smtp', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        host: smtpForm.host.trim(),
+        port: smtpForm.port,
+        username: smtpForm.username.trim(),
+        password: smtpForm.password === '' ? null : smtpForm.password,
+        from: smtpForm.from.trim(),
+      }),
+    })
+    ElMessage.success('SMTP 配置已保存')
+    smtpForm.password = ''
+    await loadSmtp()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  } finally {
+    smtpSaving.value = false
+  }
+}
+
+async function doSmtpTest() {
+  if (!smtpTestTo.value.trim()) {
+    ElMessage.warning('请填写测试收件人邮箱')
+    return
+  }
+  smtpTesting.value = true
+  try {
+    await request('/api/admin/smtp/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: smtpTestTo.value.trim() }),
+    })
+    ElMessage.success('测试邮件已发送')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '发送失败（请先保存配置）')
+  } finally {
+    smtpTesting.value = false
+  }
+}
+
 onMounted(loadHeaders)
+onMounted(loadSmtp)
 </script>
 
 <style scoped>

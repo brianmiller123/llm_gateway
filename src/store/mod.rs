@@ -1,7 +1,9 @@
 pub mod audit;
 pub mod access;
 pub mod config;
+pub mod groups;
 pub mod keys;
+pub mod plans;
 pub mod rules;
 pub mod tokens;
 pub mod upstream;

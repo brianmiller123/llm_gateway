@@ -36,6 +36,7 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 
 ldap3 = { version = "0.11", default-features = false, features = ["tls-rustls"] }
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "tokio1", "rustls-tls", "tokio1-rustls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
