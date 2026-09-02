@@ -20,9 +20,9 @@ pub mod stream;
 pub mod transform;
 
 use axum::body::Body;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::Response;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::AppError;
 use crate::store::upstream::Provider;
@@ -94,7 +94,10 @@ pub fn error_response(err: &AppError) -> Response {
         AppError::RateLimited(secs) => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
-            format!("Rate limit exceeded, retry after {}s", secs.ceil().max(1.0) as u64),
+            format!(
+                "Rate limit exceeded, retry after {}s",
+                secs.ceil().max(1.0) as u64
+            ),
         ),
         AppError::QuotaExceeded | AppError::PlanQuotaExceeded(_) => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -221,12 +224,18 @@ mod tests {
 
     #[test]
     fn reshapes_openai_error_body() {
-        let upstream = br#"{"error":{"message":"quota exceeded","type":"insufficient_quota","code":429}}"#;
+        let upstream =
+            br#"{"error":{"message":"quota exceeded","type":"insufficient_quota","code":429}}"#;
         let out = reshape_upstream_error(429, upstream, &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "rate_limit_error");
-        assert!(v["error"]["message"].as_str().unwrap().starts_with("quota exceeded"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("quota exceeded")
+        );
         // M3：结构化排障字段
         assert_eq!(v["error"]["provider"], "p");
         assert_eq!(v["error"]["model"], "m");
@@ -238,16 +247,27 @@ mod tests {
         let out = reshape_upstream_error(500, b"gateway timeout", &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["error"]["type"], "api_error");
-        assert!(v["error"]["message"].as_str().unwrap().starts_with("gateway timeout"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("gateway timeout")
+        );
         assert_eq!(v["error"]["body_type"], "text");
     }
 
     #[test]
     fn reshapes_minimax_base_resp() {
-        let upstream = br#"{"data":{},"base_resp":{"status_code":1004,"status_msg":"invalid api key"}}"#;
+        let upstream =
+            br#"{"data":{},"base_resp":{"status_code":1004,"status_msg":"invalid api key"}}"#;
         let out = reshape_upstream_error(401, upstream, &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert!(v["error"]["message"].as_str().unwrap().starts_with("invalid api key"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid api key")
+        );
     }
 
     /// M9：context 拼进 message；超长 message 截断
@@ -261,11 +281,8 @@ mod tests {
         assert!(msg.contains("request_id=00000000"), "{msg}");
         // 超长 message：截断
         let big = "y".repeat(5000);
-        let out = reshape_upstream_error(
-            502,
-            format!(r#"{{"message":"{big}"}}"#).as_bytes(),
-            &tctx(),
-        );
+        let out =
+            reshape_upstream_error(502, format!(r#"{{"message":"{big}"}}"#).as_bytes(), &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.chars().count() <= 1800, "len={}", msg.len());

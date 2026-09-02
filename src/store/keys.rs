@@ -81,12 +81,13 @@ pub async fn find_encrypted(
     user_id: i64,
     key_id: i64,
 ) -> Result<Option<Option<String>>, sqlx::Error> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT key_encrypted FROM api_keys WHERE id = $1 AND user_id = $2 AND status = 1")
-            .bind(key_id)
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT key_encrypted FROM api_keys WHERE id = $1 AND user_id = $2 AND status = 1",
+    )
+    .bind(key_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|r| r.0))
 }
 

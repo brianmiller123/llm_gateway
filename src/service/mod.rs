@@ -4,6 +4,7 @@ pub mod breaker;
 pub mod canonical;
 pub mod console;
 pub mod endpoints;
+pub mod health;
 pub mod inline_think;
 pub mod keys_crypto;
 pub mod ldap;

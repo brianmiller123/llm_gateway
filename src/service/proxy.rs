@@ -1,15 +1,15 @@
 use std::error::Error;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::stream::{once, Stream, StreamExt};
+use futures_util::stream::{Stream, StreamExt, once};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -82,9 +82,9 @@ where
             if wait.as_mut().poll(cx).is_ready() {
                 this.timed_out = true;
                 let what = if this.first { "first byte" } else { "idle" };
-                return Poll::Ready(Some(Err(Box::<dyn Error + Send + Sync>::from(
-                    format!("upstream stream {what} timeout"),
-                ))));
+                return Poll::Ready(Some(Err(Box::<dyn Error + Send + Sync>::from(format!(
+                    "upstream stream {what} timeout"
+                )))));
             }
         }
         match this.inner.as_mut().poll_next(cx) {
@@ -157,7 +157,9 @@ where
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
                 // 事件流动：重置心跳窗口
-                this.wait.as_mut().reset(tokio::time::Instant::now() + this.interval);
+                this.wait
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.interval);
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => {
@@ -166,7 +168,9 @@ where
             }
             Poll::Pending => {
                 if this.wait.as_mut().poll(cx).is_ready() {
-                    this.wait.as_mut().reset(tokio::time::Instant::now() + this.interval);
+                    this.wait
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.interval);
                     Poll::Ready(Some(Ok(Bytes::from_static(b": ping\n\n"))))
                 } else {
                     Poll::Pending
@@ -323,7 +327,6 @@ fn apply_system_head(body: &mut serde_json::Value, enabled: bool, merge: bool) -
     }
 }
 
-
 /// M9：非流式上游响应体读取上限（cc-switch hyper_client MAX_RESPONSE_BODY_BYTES 同款）
 const MAX_UPSTREAM_BODY_BYTES: usize = 128 * 1024 * 1024;
 
@@ -370,7 +373,10 @@ fn strip_underscore_at_depth(v: &mut Value, depth: usize, in_schema_map: bool) {
                 strip_underscore_at_depth(
                     val,
                     depth + 1,
-                    matches!(k.as_str(), "properties" | "patternProperties" | "definitions" | "$defs"),
+                    matches!(
+                        k.as_str(),
+                        "properties" | "patternProperties" | "definitions" | "$defs"
+                    ),
                 );
             }
         }
@@ -399,7 +405,10 @@ fn has_underscore_at_depth(v: &Value, depth: usize, in_schema_map: bool) -> bool
                     has_underscore_at_depth(
                         val,
                         depth + 1,
-                        matches!(k.as_str(), "properties" | "patternProperties" | "definitions" | "$defs"),
+                        matches!(
+                            k.as_str(),
+                            "properties" | "patternProperties" | "definitions" | "$defs"
+                        ),
                     )
                 })
         }
@@ -412,14 +421,26 @@ fn has_underscore_at_depth(v: &Value, depth: usize, in_schema_map: bool) -> bool
 /// H3：路由级 reasoning_effort 钳制模式应用到出站体。
 /// M9：无配置也必须跑一遍——转换层下发的显式关闭标记 "none" 需统一移除
 ///（openrouter 模式下忠实转发为 reasoning:{effort:none}），防枚举 400。
-fn apply_effort_mode(body: &mut Value, route: &crate::store::upstream::ModelRoute, gating_model: &str) {
+fn apply_effort_mode(
+    body: &mut Value,
+    route: &crate::store::upstream::ModelRoute,
+    gating_model: &str,
+) {
     let mode = route.reasoning_effort_mode.as_deref().unwrap_or("");
     // P1-10：zen 模式按 gating model 查档位表（GATEWAY_ZEN_EFFORT_TABLE）
-    crate::service::model_family::apply_reasoning_effort_mode_for_model(body, mode, Some(gating_model));
+    crate::service::model_family::apply_reasoning_effort_mode_for_model(
+        body,
+        mode,
+        Some(gating_model),
+    );
 }
 
 /// H3：effort 钳制 + thinking 形态统一应用（所有出站 Chat 体路径共用）
-fn apply_reasoning_config(body: &mut Value, route: &crate::store::upstream::ModelRoute, gating_model: &str) {
+fn apply_reasoning_config(
+    body: &mut Value,
+    route: &crate::store::upstream::ModelRoute,
+    gating_model: &str,
+) {
     apply_effort_mode(body, route, gating_model);
     crate::service::model_family::apply_thinking_form(body, route.thinking_form.as_deref());
 }
@@ -528,9 +549,11 @@ pub async fn proxy(
         Ok(v) => v,
         Err(e) => return Err(fail_with_request_id(e, request_id)),
     };
-    proxy_authed(st, headers, body, endpoint, client_ip, user_id, key_id, false, request_id)
-        .await
-        .map_err(|e| fail_with_request_id(e, request_id))
+    proxy_authed(
+        st, headers, body, endpoint, client_ip, user_id, key_id, false, request_id,
+    )
+    .await
+    .map_err(|e| fail_with_request_id(e, request_id))
 }
 
 /// P1-6：早期失败日志 + 请求 id 包装（响应头由 IntoResponse 附带）
@@ -550,13 +573,17 @@ pub async fn proxy_test(
 ) -> Result<Response, AppError> {
     let _active = ActiveRequestGuard::enter(&st.active_requests);
     let request_id = Uuid::new_v4();
-    proxy_authed(st, headers, body, endpoint, client_ip, None, None, true, request_id)
-        .await
-        .map_err(|e| fail_with_request_id(e, request_id))
+    proxy_authed(
+        st, headers, body, endpoint, client_ip, None, None, true, request_id,
+    )
+    .await
+    .map_err(|e| fail_with_request_id(e, request_id))
 }
 fn apply_extra(body: &mut Value, extra: Option<&Value>) {
     let Some(extra) = extra else { return };
-    let Some(dst) = body.as_object_mut() else { return };
+    let Some(dst) = body.as_object_mut() else {
+        return;
+    };
     let Some(src) = extra.as_object() else { return };
     for (k, sv) in src {
         if EXTRA_MANAGED_KEYS.contains(&k.as_str()) {
@@ -570,7 +597,6 @@ fn apply_extra(body: &mut Value, extra: Option<&Value>) {
         }
     }
 }
-
 
 /// 已鉴权代理管线：端点开关 → 限流 → 配额 → 路由 → 转发（含降级）→ 记账
 async fn proxy_authed(
@@ -644,7 +670,10 @@ async fn proxy_authed(
         .filter(|m| !m.is_empty())
         .map(str::to_string)
         .ok_or_else(|| AppError::BadRequest("missing 'model' field".into()))?;
-    let streamed = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let streamed = json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
 
     // 3. 三层限流（模型限定规则按客户端模型名精确匹配，独立桶计量；
     //    置于模型解析后执行——缺 model 字段/坏 JSON 的请求在上方解析即 400）
@@ -749,8 +778,8 @@ async fn proxy_authed(
     //（多条 system 必 400，合并为单条是唯一可行形态）；merge 决定多条
     // system 收拢后拼接为单条（MiniMax 强制 true）还是保持多条独立前移
     //（qwen3 类「system must be at the beginning」上游）
-    let system_head = route.strict_system_head
-        || crate::service::model_family::is_mini_max(&gating_model);
+    let system_head =
+        route.strict_system_head || crate::service::model_family::is_mini_max(&gating_model);
     let system_head_merge =
         route.system_head_merge || crate::service::model_family::is_mini_max(&gating_model);
     let build_outbound_raw = |provider: &Provider| -> Result<(Vec<u8>, &'static str), AppError> {
@@ -792,15 +821,18 @@ async fn proxy_authed(
                 &mut enriched,
             )
             .map_err(AppError::BadRequest)?;
-            let mut chat =
-                crate::service::responses::convert_request(&enriched, &gating_model).map_err(AppError::BadRequest)?;
+            let mut chat = crate::service::responses::convert_request(&enriched, &gating_model)
+                .map_err(AppError::BadRequest)?;
             ensure_include_usage(&mut chat, streamed);
             apply_extra(&mut chat, extra.as_ref());
             apply_system_head(&mut chat, system_head, system_head_merge);
             apply_dialect_field_gate(&mut chat, &route);
             apply_reasoning_config(&mut chat, &route, &gating_model);
             chat["model"] = serde_json::Value::String(outbound_model.clone());
-            Ok((serde_json::to_vec(&chat).map_err(AppError::internal)?, "/chat/completions"))
+            Ok((
+                serde_json::to_vec(&chat).map_err(AppError::internal)?,
+                "/chat/completions",
+            ))
         } else if streamed && !endpoint.responses && !endpoint.anthropic {
             let mut json = json.clone();
             ensure_include_usage(&mut json, streamed);
@@ -810,7 +842,10 @@ async fn proxy_authed(
             // L8：剥离客户端 `_` 前缀私有字段（cc-switch body_filter 同款）
             strip_underscore_fields(&mut json);
             json["model"] = serde_json::Value::String(outbound_model.clone());
-            Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
+            Ok((
+                serde_json::to_vec(&json).map_err(AppError::internal)?,
+                endpoint.upstream,
+            ))
         } else {
             // extra_body 合并 / role 归一化 / 模型名映射 / 私有字段剥离 → 需重建请求体；
             // 全都未发生时保持原始字节直传（零改写快路径）
@@ -829,7 +864,10 @@ async fn proxy_authed(
                 apply_reasoning_config(&mut json, &route, &gating_model);
                 strip_underscore_fields(&mut json);
                 json["model"] = serde_json::Value::String(outbound_model.clone());
-                Ok((serde_json::to_vec(&json).map_err(AppError::internal)?, endpoint.upstream))
+                Ok((
+                    serde_json::to_vec(&json).map_err(AppError::internal)?,
+                    endpoint.upstream,
+                ))
             } else {
                 Ok((body.to_vec(), endpoint.upstream))
             }
@@ -881,7 +919,6 @@ async fn proxy_authed(
         plan: plan_bill,
     };
 
-
     // 7. 转发 + 记账
     // P0-4：请求工具上下文（custom / namespace / tool_search / web_search 桥接
     // 的响应侧还原依据；仅 Responses 客户端需要构建）
@@ -915,7 +952,10 @@ async fn proxy_authed(
                 crate::service::anthropic::should_convert(endpoint.anthropic, provider);
             let converted = crate::service::responses::should_convert(endpoint.responses, provider);
             let (outbound, upstream_path) = build_outbound(provider)?;
-            let provider_key = match crate::crypto::decrypt(&provider.api_key_encrypted, &st.cfg.master_key) {
+            let provider_key = match crate::crypto::decrypt(
+                &provider.api_key_encrypted,
+                &st.cfg.master_key,
+            ) {
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "provider key decrypt failed");
@@ -928,7 +968,10 @@ async fn proxy_authed(
                 provider,
                 &provider_key,
                 &outbound,
-                Endpoint { upstream: upstream_path, ..endpoint },
+                Endpoint {
+                    upstream: upstream_path,
+                    ..endpoint
+                },
                 request_id,
                 true,
                 &headers,
@@ -936,7 +979,13 @@ async fn proxy_authed(
             )
             .await;
             // P0-8/P0-9 整流未命中的 4xx：错误体已预读，直接按方言整形返回
-            if let Ok(SentOutcome::PreRead { status, content_type, bytes, headers: rl }) = &sent {
+            if let Ok(SentOutcome::PreRead {
+                status,
+                content_type,
+                bytes,
+                headers: rl,
+            }) = &sent
+            {
                 let latency = started.elapsed().as_millis() as i64;
                 st.breaker.record_success(provider.id);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
@@ -944,12 +993,20 @@ async fn proxy_authed(
                 if anthropic_converted {
                     return Ok(attach_upstream_headers(
                         Response::builder()
-                            .status(if status.is_success() { StatusCode::BAD_GATEWAY } else { *status })
+                            .status(if status.is_success() {
+                                StatusCode::BAD_GATEWAY
+                            } else {
+                                *status
+                            })
                             .header(header::CONTENT_TYPE, "application/json")
                             .header("X-Request-Id", request_id.to_string())
-                            .body(Body::from(crate::service::anthropic::reshape_upstream_error(
-                                status.as_u16(), bytes, &ctx,
-                            )))
+                            .body(Body::from(
+                                crate::service::anthropic::reshape_upstream_error(
+                                    status.as_u16(),
+                                    bytes,
+                                    &ctx,
+                                ),
+                            ))
                             .map_err(AppError::internal)?,
                         rl,
                     ));
@@ -957,12 +1014,17 @@ async fn proxy_authed(
                 if converted {
                     return Ok(attach_upstream_headers(
                         Response::builder()
-                            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+                            .status(
+                                StatusCode::from_u16(status.as_u16())
+                                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                            )
                             .header(header::CONTENT_TYPE, "application/json")
                             .header("X-Request-Id", request_id.to_string())
                             .body(Body::from(
                                 crate::service::responses::reshape_upstream_error_for_responses(
-                                    status.as_u16(), bytes, &ctx,
+                                    status.as_u16(),
+                                    bytes,
+                                    &ctx,
                                 ),
                             ))
                             .map_err(AppError::internal)?,
@@ -1054,7 +1116,12 @@ async fn proxy_authed(
                                     "upstream stream error envelope within priming window; failing over"
                                 );
                                 last_failed = Some(provider);
-                                last_failure = Some((502, upstream_error_envelope(&msg), "application/json".to_string(), Vec::new()));
+                                last_failure = Some((
+                                    502,
+                                    upstream_error_envelope(&msg),
+                                    "application/json".to_string(),
+                                    Vec::new(),
+                                ));
                                 st.breaker.record_failure(provider.id);
                                 continue 'candidates;
                             }
@@ -1070,7 +1137,12 @@ async fn proxy_authed(
                                         "upstream stream error frame within priming window; failing over"
                                     );
                                     last_failed = Some(provider);
-                                    last_failure = Some((502, upstream_error_envelope(&msg), "application/json".to_string(), Vec::new()));
+                                    last_failure = Some((
+                                        502,
+                                        upstream_error_envelope(&msg),
+                                        "application/json".to_string(),
+                                        Vec::new(),
+                                    ));
                                     st.breaker.record_failure(provider.id);
                                     continue 'candidates;
                                 }
@@ -1081,10 +1153,16 @@ async fn proxy_authed(
                             }
                         }
                         Some(Err(e)) => {
-                            let msg = format!("upstream stream failed before productive output: {e}");
+                            let msg =
+                                format!("upstream stream failed before productive output: {e}");
                             tracing::warn!(provider = %provider.name, error = %e, "stream priming transport error");
                             last_failed = Some(provider);
-                            last_failure = Some((502, upstream_error_envelope(&msg), "application/json".to_string(), Vec::new()));
+                            last_failure = Some((
+                                502,
+                                upstream_error_envelope(&msg),
+                                "application/json".to_string(),
+                                Vec::new(),
+                            ));
                             st.breaker.record_failure(provider.id);
                             if e.to_string().contains("header timeout") {
                                 saw_timeout = true;
@@ -1101,7 +1179,12 @@ async fn proxy_authed(
                             };
                             tracing::warn!(provider = %provider.name, "{msg}");
                             last_failed = Some(provider);
-                            last_failure = Some((502, upstream_error_envelope(&msg), "application/json".to_string(), Vec::new()));
+                            last_failure = Some((
+                                502,
+                                upstream_error_envelope(&msg),
+                                "application/json".to_string(),
+                                Vec::new(),
+                            ));
                             st.breaker.record_failure(provider.id);
                             continue 'candidates;
                         }
@@ -1122,7 +1205,10 @@ async fn proxy_authed(
             // 转换器内部在 [DONE]/流尾收尾（message_delta/message_stop）并记账；
             // 仅 SSE content-type 才转换，非 SSE / 非 2xx 错误体缓冲后整形为
             // Anthropic 错误 JSON 返回（不伪装成流，cc-switch 错误方言整形同款）
-            if anthropic_converted && status.is_success() && content_type.contains("text/event-stream") {
+            if anthropic_converted
+                && status.is_success()
+                && content_type.contains("text/event-stream")
+            {
                 let stream = crate::service::anthropic::stream::wrap_chat_stream_to_anthropic(
                     st.clone(),
                     meta.clone(),
@@ -1214,9 +1300,10 @@ async fn proxy_authed(
             if converted && status.is_success() {
                 // 200 但响应体不是 SSE：上游用 JSON 报错（或忽略 stream 参数直接回了
                 // 完整 Chat completion）。透传原始体会让 Responses SSE 客户端拿到无法
-                let bytes = read_body_capped(resp.take().expect("resp present"), MAX_UPSTREAM_BODY_BYTES)
-                    .await
-                    .unwrap_or_default();
+                let bytes =
+                    read_body_capped(resp.take().expect("resp present"), MAX_UPSTREAM_BODY_BYTES)
+                        .await
+                        .unwrap_or_default();
                 let usage = parse_usage(&bytes);
                 usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency).await;
                 if let Some(sse) = crate::service::responses::stream::synthesize_sse_from_chat_body(
@@ -1273,7 +1360,10 @@ async fn proxy_authed(
                 );
                 return Ok(attach_upstream_headers(
                     Response::builder()
-                        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+                        .status(
+                            StatusCode::from_u16(status.as_u16())
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                        )
                         .header(header::CONTENT_TYPE, "application/json")
                         .header("X-Request-Id", request_id.to_string())
                         .body(Body::from(
@@ -1327,11 +1417,7 @@ async fn proxy_authed(
             let latency = started.elapsed().as_millis() as i64;
             usage::record(st, &meta, None, status, latency).await;
             // L5：错误上下文归属实际最后失败的候选（此前固定 candidates[0]）
-            let ctx = error_context(
-                last_failed.unwrap_or(&candidates[0]),
-                &model,
-                request_id,
-            );
+            let ctx = error_context(last_failed.unwrap_or(&candidates[0]), &model, request_id);
             let (status_out, body, ct) = if endpoint.anthropic {
                 (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1413,7 +1499,10 @@ async fn proxy_authed(
                 provider,
                 &provider_key,
                 &outbound,
-                Endpoint { upstream: upstream_path, ..endpoint },
+                Endpoint {
+                    upstream: upstream_path,
+                    ..endpoint
+                },
                 request_id,
                 false,
                 &headers,
@@ -1422,7 +1511,13 @@ async fn proxy_authed(
             .await;
             // P0-8/P0-9 整流未命中的 4xx：错误体已预读，直接按方言整形返回
             //（此前非流式循环对 PreRead 走 unreachable!——非流式 4xx 会 panic）
-            if let Ok(SentOutcome::PreRead { status, content_type, bytes, headers: rl }) = &sent {
+            if let Ok(SentOutcome::PreRead {
+                status,
+                content_type,
+                bytes,
+                headers: rl,
+            }) = &sent
+            {
                 let latency = started.elapsed().as_millis() as i64;
                 st.breaker.record_success(provider.id);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
@@ -1430,12 +1525,20 @@ async fn proxy_authed(
                 if anthropic_converted {
                     return Ok(attach_upstream_headers(
                         Response::builder()
-                            .status(if status.is_success() { StatusCode::BAD_GATEWAY } else { *status })
+                            .status(if status.is_success() {
+                                StatusCode::BAD_GATEWAY
+                            } else {
+                                *status
+                            })
                             .header(header::CONTENT_TYPE, "application/json")
                             .header("X-Request-Id", request_id.to_string())
-                            .body(Body::from(crate::service::anthropic::reshape_upstream_error(
-                                status.as_u16(), bytes, &ctx,
-                            )))
+                            .body(Body::from(
+                                crate::service::anthropic::reshape_upstream_error(
+                                    status.as_u16(),
+                                    bytes,
+                                    &ctx,
+                                ),
+                            ))
                             .map_err(AppError::internal)?,
                         rl,
                     ));
@@ -1443,12 +1546,17 @@ async fn proxy_authed(
                 if converted {
                     return Ok(attach_upstream_headers(
                         Response::builder()
-                            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+                            .status(
+                                StatusCode::from_u16(status.as_u16())
+                                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                            )
                             .header(header::CONTENT_TYPE, "application/json")
                             .header("X-Request-Id", request_id.to_string())
                             .body(Body::from(
                                 crate::service::responses::reshape_upstream_error_for_responses(
-                                    status.as_u16(), bytes, &ctx,
+                                    status.as_u16(),
+                                    bytes,
+                                    &ctx,
                                 ),
                             ))
                             .map_err(AppError::internal)?,
@@ -1656,15 +1764,13 @@ async fn proxy_authed(
             let usage = parse_usage(&bytes);
             usage::record(st, &meta, usage.as_ref(), status, latency).await;
             // L5：错误上下文归属实际最后失败的候选（此前固定 candidates[0]）
-            let ctx = error_context(
-                last_failed.unwrap_or(&candidates[0]),
-                &model,
-                request_id,
-            );
+            let ctx = error_context(last_failed.unwrap_or(&candidates[0]), &model, request_id);
             let body = if endpoint.anthropic {
                 crate::service::anthropic::reshape_upstream_error(status, &bytes, &ctx)
             } else if endpoint.responses {
-                crate::service::responses::reshape_upstream_error_for_responses(status, &bytes, &ctx)
+                crate::service::responses::reshape_upstream_error_for_responses(
+                    status, &bytes, &ctx,
+                )
             } else {
                 bytes
             };
@@ -1695,11 +1801,7 @@ async fn proxy_authed(
 /// raw）/ br / zstd / zst；identity/缺失直通；不支持编码返回错误信息（调用方 400）。
 /// L1：逗号分隔的堆叠编码按逆序解码（cc-switch content_encoding.rs:126-131 同款），
 /// 且解压输出受预算约束（防 zip bomb——解压后超限直接报错）。
-fn decompress_request_body(
-    body: &[u8],
-    content_encoding: Option<&str>,
-) -> Result<Vec<u8>, String> {
-
+fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>, String> {
     let Some(enc) = content_encoding.map(|s| s.trim().to_ascii_lowercase()) else {
         return Ok(body.to_vec());
     };
@@ -1738,7 +1840,10 @@ fn decode_single_coding(input: &[u8], enc: &str, out: &mut Vec<u8>) -> Result<()
             .map_err(|e| format!("gzip decode failed: {e}")),
         "deflate" => {
             // zlib 容器优先，失败回退 raw deflate（部分客户端发裸流）
-            if flate2::read::ZlibDecoder::new(limited).read_to_end(out).is_err() {
+            if flate2::read::ZlibDecoder::new(limited)
+                .read_to_end(out)
+                .is_err()
+            {
                 out.clear();
                 let raw_limited: &mut dyn Read =
                     &mut input.take((MAX_DECOMPRESSED_BODY_BYTES + 1) as u64);
@@ -1824,8 +1929,21 @@ async fn send_with_rectify(
     client_headers: &HeaderMap,
     wants_1m: bool,
 ) -> Result<SentOutcome, Box<dyn Error + Send + Sync>> {
-    let resp = send_upstream(st, provider, provider_key, outbound, endpoint, request_id, streamed, client_headers, wants_1m).await?;
-    if !st.cfg.rectify_enabled || !crate::service::rectify::is_rectifiable_status(resp.status().as_u16()) {
+    let resp = send_upstream(
+        st,
+        provider,
+        provider_key,
+        outbound,
+        endpoint,
+        request_id,
+        streamed,
+        client_headers,
+        wants_1m,
+    )
+    .await?;
+    if !st.cfg.rectify_enabled
+        || !crate::service::rectify::is_rectifiable_status(resp.status().as_u16())
+    {
         return Ok(SentOutcome::Response(resp));
     }
     let status = resp.status();
@@ -1846,17 +1964,35 @@ async fn send_with_rectify(
                 provider = %provider.name, status = %status.as_u16(),
                 "rectified outbound body (media downgrade / thinking strip); retrying same provider once"
             );
-            let retried = send_upstream(st, provider, provider_key, &fixed, endpoint, request_id, streamed, client_headers, wants_1m).await?;
+            let retried = send_upstream(
+                st,
+                provider,
+                provider_key,
+                &fixed,
+                endpoint,
+                request_id,
+                streamed,
+                client_headers,
+                wants_1m,
+            )
+            .await?;
             Ok(SentOutcome::Response(retried))
         }
-        None => Ok(SentOutcome::PreRead { status, content_type, bytes, headers: rl }),
+        None => Ok(SentOutcome::PreRead {
+            status,
+            content_type,
+            bytes,
+            headers: rl,
+        }),
     }
 }
 /// P0-7/P1-5：上游响应头转发白名单（429 透传时客户端 SDK 据此退避；
 /// cc-switch handlers.rs:1866-1876 复制上游头同款动机）：
 /// - retry-after / x-ratelimit-* / anthropic-ratelimit-*：限流与退避
 /// - openai-organization / openai-processing-ms：组织路由回显与上游耗时诊断
-fn rate_limit_headers(resp: &reqwest::Response) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+fn rate_limit_headers(
+    resp: &reqwest::Response,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
     resp.headers()
         .iter()
         .filter(|(name, _)| {
@@ -1873,7 +2009,9 @@ fn rate_limit_headers(resp: &reqwest::Response) -> Vec<(axum::http::HeaderName, 
 /// 从「预读流（SSE 错误体）或未消费响应（JSON 错误体）」收集错误体字节
 ///（转换路径错误整形共用；防 resp 已被流式预读消费后的 expect panic）
 async fn collect_stream_or_body(
-    stream_opt: &mut Option<Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>>>,
+    stream_opt: &mut Option<
+        Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>>,
+    >,
     resp: &mut Option<reqwest::Response>,
 ) -> Vec<u8> {
     if let Some(mut stream) = stream_opt.take() {
@@ -1937,7 +2075,11 @@ impl<'a> UpstreamErrorContext<'a> {
     }
 }
 
-fn error_context<'a>(provider: &'a Provider, model: &'a str, request_id: Uuid) -> UpstreamErrorContext<'a> {
+fn error_context<'a>(
+    provider: &'a Provider,
+    model: &'a str,
+    request_id: Uuid,
+) -> UpstreamErrorContext<'a> {
     UpstreamErrorContext {
         provider: &provider.name,
         model,
@@ -1993,10 +2135,7 @@ fn first_chunk_error(bytes: &[u8]) -> Option<String> {
     }
     let payload: &[u8] = if let Some(rest) = trimmed.strip_prefix(b"data:") {
         // 取首个 data 行（到 \n 为止）
-        let line_end = rest
-            .iter()
-            .position(|b| *b == b'\n')
-            .unwrap_or(rest.len());
+        let line_end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
         &rest[..line_end]
     } else {
         trimmed
@@ -2022,7 +2161,9 @@ fn first_chunk_error(bytes: &[u8]) -> Option<String> {
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("upstream error");
-            return Some(format!("upstream returned error payload in first chunk: {msg}"));
+            return Some(format!(
+                "upstream returned error payload in first chunk: {msg}"
+            ));
         }
     }
     if v.get("type").and_then(|t| t.as_str()) == Some("error") {
@@ -2031,7 +2172,9 @@ fn first_chunk_error(bytes: &[u8]) -> Option<String> {
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str())
             .unwrap_or("upstream error");
-        return Some(format!("upstream returned error payload in first chunk: {msg}"));
+        return Some(format!(
+            "upstream returned error payload in first chunk: {msg}"
+        ));
     }
     None
 }
@@ -2102,8 +2245,8 @@ impl PrimeState {
                 // P0-2：帧内错误 envelope（{"error":{…}} 或具名 event: error 帧）
                 // ——多帧合并 chunk 时 first_chunk_error 只查首行，此处逐帧兜底。
                 // 错误帧优先级最高（覆盖同 chunk 后续 [DONE] 的提交信号）
-                let frame_error = frame_error_message(&v, event_name.as_deref())
-                    .map(PrimeSignal::Error);
+                let frame_error =
+                    frame_error_message(&v, event_name.as_deref()).map(PrimeSignal::Error);
                 if let Some(e) = frame_error {
                     signal = e;
                     break;
@@ -2243,7 +2386,6 @@ fn attach_upstream_headers(
     response
 }
 
-
 /// 主上游 + 降级链（去重、仅启用）
 fn resolve_candidates(st: &AppState, route: &crate::store::upstream::ModelRoute) -> Vec<Provider> {
     let providers = st.providers.read();
@@ -2327,7 +2469,11 @@ async fn send_upstream(
     };
     let mut req = st.client.post(&url);
     // 认证形态：x-api-key（Anthropic 原生风格）或 Authorization: Bearer（默认）
-    if provider.auth_scheme.trim().eq_ignore_ascii_case("x-api-key") {
+    if provider
+        .auth_scheme
+        .trim()
+        .eq_ignore_ascii_case("x-api-key")
+    {
         req = req.header("x-api-key", provider_key);
     } else {
         req = req.header(header::AUTHORIZATION, format!("Bearer {provider_key}"));
@@ -2429,9 +2575,7 @@ async fn send_upstream(
     tokio::time::timeout(timeout, req.send())
         .await
         .map_err(|_| "upstream header timeout".to_string())?
-        .map_err(|e| {
-            redact_secrets(format!("upstream request failed: {e}"), provider_key).into()
-        })
+        .map_err(|e| redact_secrets(format!("upstream request failed: {e}"), provider_key).into())
 }
 
 fn content_type_of(resp: &reqwest::Response) -> String {
@@ -2585,7 +2729,9 @@ pub fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8]) -> (Option<Usage>, bool) {
     let mut usage = None;
     let mut done = false;
     loop {
-        let Some(idx) = find_event_end(buf) else { break };
+        let Some(idx) = find_event_end(buf) else {
+            break;
+        };
         let event: Vec<u8> = buf.drain(..idx).collect();
         let text = String::from_utf8_lossy(&event);
         for line in text.lines() {
@@ -2644,11 +2790,7 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2)
         .position(|w| w == b"\n\n")
         .map(|i| i + 2)
-        .or_else(|| {
-            buf.windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|i| i + 4)
-        })
+        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
 }
 
 #[cfg(test)]
@@ -2705,14 +2847,14 @@ mod tests {
             })
         );
         // 网关保留字段被剥离
-        let provider = serde_json::json!({ "model": "x", "stream": true, "stream_options": {}, "top_k": 1 });
+        let provider =
+            serde_json::json!({ "model": "x", "stream": true, "stream_options": {}, "top_k": 1 });
         let eff = effective_extra(&serde_json::json!({}), &provider).expect("merged");
         assert_eq!(eff, serde_json::json!({ "top_k": 1 }));
         // 全空 / 全为保留字段 → None（出站走原始字节快路径）
         assert!(effective_extra(&serde_json::json!({}), &serde_json::json!({})).is_none());
         assert!(
-            effective_extra(&serde_json::json!({}), &serde_json::json!({ "model": "x" }))
-                .is_none()
+            effective_extra(&serde_json::json!({}), &serde_json::json!({ "model": "x" })).is_none()
         );
     }
 
@@ -2757,9 +2899,24 @@ mod tests {
             extra_headers: serde_json::json!({}),
             supports_images: true,
         };
-        let chat = Endpoint { api: "/v1/chat/completions", upstream: "/chat/completions", responses: false, anthropic: false };
-        let resp = Endpoint { api: "/v1/responses", upstream: "/responses", responses: true, anthropic: false };
-        let msg = Endpoint { api: "/v1/messages", upstream: "/messages", responses: false, anthropic: true };
+        let chat = Endpoint {
+            api: "/v1/chat/completions",
+            upstream: "/chat/completions",
+            responses: false,
+            anthropic: false,
+        };
+        let resp = Endpoint {
+            api: "/v1/responses",
+            upstream: "/responses",
+            responses: true,
+            anthropic: false,
+        };
+        let msg = Endpoint {
+            api: "/v1/messages",
+            upstream: "/messages",
+            responses: false,
+            anthropic: true,
+        };
         // 原生透传：全部支持
         assert!(pairing_unsupported(chat, &mk("openai")).is_none());
         assert!(pairing_unsupported(resp, &mk("openai-responses")).is_none());
@@ -2782,11 +2939,20 @@ mod tests {
         assert!(is_stream_retryable(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(is_stream_retryable(StatusCode::UNAUTHORIZED));
         assert!(is_stream_retryable(StatusCode::FORBIDDEN));
-        assert!(is_stream_retryable(StatusCode::REQUEST_TIMEOUT), "408 可切换");
-        assert!(is_stream_retryable(StatusCode::NOT_FOUND), "M25：404 可切换（换家有该模型）");
+        assert!(
+            is_stream_retryable(StatusCode::REQUEST_TIMEOUT),
+            "408 可切换"
+        );
+        assert!(
+            is_stream_retryable(StatusCode::NOT_FOUND),
+            "M25：404 可切换（换家有该模型）"
+        );
         assert!(!is_stream_retryable(StatusCode::BAD_REQUEST));
         assert!(!is_stream_retryable(StatusCode::UNPROCESSABLE_ENTITY));
-        assert!(!is_stream_retryable(StatusCode::NOT_IMPLEMENTED), "501 不可重试");
+        assert!(
+            !is_stream_retryable(StatusCode::NOT_IMPLEMENTED),
+            "501 不可重试"
+        );
     }
 
     /// L1：latest_reminder → user、developer → system（messages[] 与 input[] 双形态）
@@ -2972,9 +3138,18 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         // 非 anthropic 端点不解析
         assert!(session_id_from_metadata(&json, false).is_none());
         // 无 _session_ → None
-        assert!(session_id_from_metadata(&serde_json::json!({"metadata": {"user_id": "plain"}}), true).is_none());
+        assert!(
+            session_id_from_metadata(&serde_json::json!({"metadata": {"user_id": "plain"}}), true)
+                .is_none()
+        );
         // 空后缀 → None
-        assert!(session_id_from_metadata(&serde_json::json!({"metadata": {"user_id": "x_session_"}}), true).is_none());
+        assert!(
+            session_id_from_metadata(
+                &serde_json::json!({"metadata": {"user_id": "x_session_"}}),
+                true
+            )
+            .is_none()
+        );
     }
 
     /// P0-2：priming 窗口信号判定——三方言产出性输出 / 终态 / 中性
@@ -3034,7 +3209,10 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         );
         // 跨块：事件被 TCP 切开仍正确判定
         let mut p = PrimeState::default();
-        assert_eq!(p.feed(b"data: {\"choices\":[{\"delta\":{\"con"), PrimeSignal::Neutral);
+        assert_eq!(
+            p.feed(b"data: {\"choices\":[{\"delta\":{\"con"),
+            PrimeSignal::Neutral
+        );
         assert_eq!(p.feed(b"tent\":\"Hi\"}}]}\n\n"), PrimeSignal::Productive);
         // 多帧合并 chunk：role delta + 错误 envelope + [DONE] → Error 优先
         //（first_chunk_error 只查首行，帧级检测必须兜住次帧错误）
@@ -3059,10 +3237,16 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
     #[test]
     fn first_chunk_error_detects_error_envelope_in_sse_frame() {
         assert!(first_chunk_error(b"data: {\"error\":{\"message\":\"boom\"}}\n\n").is_some());
-        assert!(first_chunk_error(b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n").is_some());
+        assert!(
+            first_chunk_error(b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n")
+                .is_some()
+        );
         assert!(first_chunk_error(b"{\"error\":{\"message\":\"boom\"}}").is_some());
         // 正常 delta 不误判
-        assert!(first_chunk_error(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n").is_none());
+        assert!(
+            first_chunk_error(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+                .is_none()
+        );
     }
 
     /// P0-2：错误 envelope 字节

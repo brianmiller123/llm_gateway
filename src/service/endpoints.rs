@@ -86,7 +86,10 @@ mod tests {
             ("x-forwarded-host", "api.example.com"),
             ("x-forwarded-proto", "http"),
         ]);
-        assert_eq!(derive_public_base(None, &headers, true), "http://api.example.com");
+        assert_eq!(
+            derive_public_base(None, &headers, true),
+            "http://api.example.com"
+        );
     }
 
     #[test]
@@ -97,7 +100,10 @@ mod tests {
         // 默认 TLS 部署 → https
         assert_eq!(derive_public_base(None, &headers, true), "https://gw:8080");
         // 无 Host → localhost
-        assert_eq!(derive_public_base(None, &HeaderMap::new(), true), "https://localhost");
+        assert_eq!(
+            derive_public_base(None, &HeaderMap::new(), true),
+            "https://localhost"
+        );
         // 非法 XFP 回退启发式
         let headers = h(&[("host", "gw"), ("x-forwarded-proto", "gopher")]);
         assert_eq!(derive_public_base(None, &headers, true), "https://gw");

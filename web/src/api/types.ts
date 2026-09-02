@@ -416,6 +416,19 @@ export interface StatusComponent {
   /** 30 天可用率（0..1；无数据为 null） */
   uptime_30d: number | null
   calls_30d: number
+  /** /1/status 主动探测元数据（供应商组件；系统组件为 null） */
+  probe: StatusProbe | null
+}
+
+export interface StatusProbe {
+  /** 实际探测的完整 URL */
+  endpoint: string
+  /** HTTP 状态码（网络层失败为 null） */
+  http_status: number | null
+  latency_ms: number | null
+  checked_at: string
+  /** healthy=判定通过 / degraded=格式或自报异常 / down=不可达 / inconclusive=端点不可用作依据 */
+  verdict: 'healthy' | 'degraded' | 'down' | 'inconclusive'
 }
 
 export interface StatusDayPoint {
@@ -518,8 +531,10 @@ export interface PublicEndpointsResp {
 
 /** Plan 过量策略 */
 export type OverageAction = 'block' | 'downgrade' | 'log'
-/** 统计周期：自然日 / 自然月 / 总量 */
-export type PeriodType = 'daily' | 'monthly' | 'total'
+/** 统计周期：小时级 / 自然日 / 自然月 / 总量 */
+export type PeriodType = 'hourly' | 'daily' | 'monthly' | 'total'
+/** hourly 锚点：fixed=UTC 整点网格 / join=按开通时间偏移 */
+export type AnchorMode = 'fixed' | 'join'
 
 export interface CodingPlan {
   id: number
@@ -529,6 +544,9 @@ export interface CodingPlan {
   token_limit: number
   token_limit_display: string
   period_type: PeriodType
+  /** hourly 窗口长度（小时，1..=168）；非 hourly 恒为 1 */
+  period_hours: number
+  period_anchor_mode: AnchorMode
   overage_action: OverageAction
   downgrade_model: string | null
   alert_channels: string[]
@@ -659,6 +677,8 @@ export interface MyPlanResp {
     name: string
     group: string
     period_type: PeriodType
+    period_hours: number
+    period_anchor_mode: AnchorMode
     token_limit: number
     token_limit_display: string
     overage_action: OverageAction

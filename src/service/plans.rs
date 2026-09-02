@@ -98,7 +98,9 @@ async fn do_sync(st: &AppState, group_id: i64, group_name: &str) -> Result<(u64,
         .await
         {
             Ok(id) => ids.push(id),
-            Err(err) => tracing::warn!(username = %e.username, error = %err, "ldap sync user upsert failed"),
+            Err(err) => {
+                tracing::warn!(username = %e.username, error = %err, "ldap sync user upsert failed")
+            }
         }
     }
     let (added, removed) = groups::reconcile_ldap_members(&st.pool, group_id, &ids)

@@ -31,7 +31,10 @@ pub async fn load_user_access(pool: &PgPool) -> Result<Vec<UserAccessRule>, sqlx
 }
 
 /// 某用户的规则（含供应商名，按 id 排序）
-pub async fn list_user_access(pool: &PgPool, user_id: i64) -> Result<Vec<AdminAccessRule>, sqlx::Error> {
+pub async fn list_user_access(
+    pool: &PgPool,
+    user_id: i64,
+) -> Result<Vec<AdminAccessRule>, sqlx::Error> {
     sqlx::query_as::<_, AdminAccessRule>(
         "SELECT r.id, r.user_id, r.provider_id, p.name AS provider_name, r.model_pattern \
          FROM user_access_rules r \

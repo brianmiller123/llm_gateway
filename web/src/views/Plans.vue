@@ -8,9 +8,13 @@ const loading = ref(false)
 const plans = ref<PlansResp['plans']>([])
 
 const PERIOD_LABELS: Record<PeriodType, string> = {
+  hourly: '小时级重置',
   daily: '自然日重置',
   monthly: '自然月重置',
   total: '总量不重置',
+}
+function periodText(pt: PeriodType, hours?: number): string {
+  return pt === 'hourly' ? `每 ${hours ?? 1} 小时重置` : PERIOD_LABELS[pt]
 }
 const OVERAGE_LABELS: Record<OverageAction, string> = {
   block: '拦截请求（429）',
@@ -57,6 +61,8 @@ const form = reactive({
   limit_value: 500,
   limit_unit: 'M',
   period_type: 'monthly' as PeriodType,
+  period_hours: 1,
+  period_anchor_mode: 'fixed' as 'fixed' | 'join',
   overage_action: 'block' as OverageAction,
   downgrade_model: '',
   alert_channels: ['in_site'] as string[],
@@ -78,7 +84,8 @@ function openCreate() {
   form.limit_value = 500
   form.limit_unit = 'M'
   form.period_type = 'monthly'
-  form.overage_action = 'block'
+  form.period_hours = 1
+  form.period_anchor_mode = 'fixed'
   form.downgrade_model = ''
   form.alert_channels = ['in_site']
   form.webhook_url = ''
@@ -98,7 +105,8 @@ function openEdit(p: CodingPlan) {
     form.limit_unit = m[2] || 'K'
   }
   form.period_type = p.period_type
-  form.overage_action = p.overage_action
+  form.period_hours = p.period_hours
+  form.period_anchor_mode = p.period_anchor_mode
   form.downgrade_model = p.downgrade_model ?? ''
   form.alert_channels = p.alert_channels.length ? p.alert_channels : ['in_site']
   form.webhook_url = p.webhook_url
@@ -126,6 +134,8 @@ async function doSave() {
     priority: form.priority,
     token_limit: tokenLimitString(),
     period_type: form.period_type,
+    period_hours: form.period_type === 'hourly' ? form.period_hours : undefined,
+    period_anchor_mode: form.period_type === 'hourly' ? form.period_anchor_mode : undefined,
     overage_action: form.overage_action,
     downgrade_model: form.overage_action === 'downgrade' ? form.downgrade_model.trim() : null,
     alert_channels: form.alert_channels,
@@ -228,8 +238,8 @@ onMounted(loadPlans)
         <el-table-column label="token 上限" width="120">
           <template #default="{ row }">{{ row.token_limit_display }}</template>
         </el-table-column>
-        <el-table-column label="统计周期" width="110">
-          <template #default="{ row }">{{ PERIOD_LABELS[row.period_type as PeriodType] }}</template>
+        <el-table-column label="统计周期" width="130">
+          <template #default="{ row }">{{ periodText(row.period_type, row.period_hours) }}</template>
         </el-table-column>
         <el-table-column label="超额策略" min-width="150">
           <template #default="{ row }">
@@ -305,10 +315,26 @@ onMounted(loadPlans)
         </el-form-item>
         <el-form-item label="统计周期">
           <el-radio-group v-model="form.period_type">
+            <el-radio-button value="hourly">小时级重置</el-radio-button>
             <el-radio-button value="daily">自然日重置</el-radio-button>
             <el-radio-button value="monthly">自然月重置</el-radio-button>
             <el-radio-button value="total">总量不重置</el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="form.period_type === 'hourly'" label="重置间隔">
+          <div class="limit-row">
+            <el-input-number v-model="form.period_hours" :min="1" :max="168" :step="1" controls-position="right" />
+            <span class="hint">每 N 小时清零一次（1..168）</span>
+          </div>
+        </el-form-item>
+        <el-form-item v-if="form.period_type === 'hourly'" label="重置锚点">
+          <el-radio-group v-model="form.period_anchor_mode">
+            <el-radio-button value="fixed">固定整点（UTC）</el-radio-button>
+            <el-radio-button value="join">按开通时间偏移</el-radio-button>
+          </el-radio-group>
+          <div class="hint">
+            固定整点：从 UTC 1970-01-01 起每 N 小时切窗；开通时间：以成员加入分组时刻为锚点
+          </div>
         </el-form-item>
         <el-form-item label="超额策略">
           <el-radio-group v-model="form.overage_action">

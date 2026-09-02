@@ -97,7 +97,10 @@ fn raise_thinking_budget(body: &mut Value) -> bool {
     if !thinking_enabled {
         return changed;
     }
-    match body.pointer("/thinking/budget_tokens").and_then(|b| b.as_u64()) {
+    match body
+        .pointer("/thinking/budget_tokens")
+        .and_then(|b| b.as_u64())
+    {
         Some(b) if b < 32_000 => {
             body["thinking"]["budget_tokens"] = serde_json::json!(32_000);
             changed = true;
@@ -234,7 +237,9 @@ fn is_thinking_error(message: &str) -> bool {
         return true;
     }
     // 与 CCH 对齐的兜底（第三方渠道通用 invalid request 文案）
-    lower.contains("非法请求") || lower.contains("illegal request") || lower.contains("invalid request")
+    lower.contains("非法请求")
+        || lower.contains("illegal request")
+        || lower.contains("invalid request")
 }
 
 /// 图片 part → 文本标记（Chat `image_url` / Anthropic `image` / Responses
@@ -332,10 +337,8 @@ fn strip_thinking_blocks(body: &mut Value) -> usize {
 /// 顶层 thinking 是否应移除：thinking.type=enabled 且存在 assistant 消息但
 /// 最后一条不以 thinking 块开头（剥离后必然如此）
 fn remove_top_level_thinking_if_broken(body: &Value) -> bool {
-    let thinking_enabled = body
-        .pointer("/thinking/type")
-        .and_then(|t| t.as_str())
-        == Some("enabled");
+    let thinking_enabled =
+        body.pointer("/thinking/type").and_then(|t| t.as_str()) == Some("enabled");
     if !thinking_enabled {
         return false;
     }
@@ -384,11 +387,19 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let fixed = rectify_outbound(false, &outbound, &err("Image input is not supported for this model"), 400)
-            .expect("rectifiable");
+        let fixed = rectify_outbound(
+            false,
+            &outbound,
+            &err("Image input is not supported for this model"),
+            400,
+        )
+        .expect("rectifiable");
         let v: Value = serde_json::from_slice(&fixed).unwrap();
         assert_eq!(v["messages"][0]["content"][1]["type"], "text");
-        assert_eq!(v["messages"][0]["content"][1]["text"], UNSUPPORTED_IMAGE_MARKER);
+        assert_eq!(
+            v["messages"][0]["content"][1]["text"],
+            UNSUPPORTED_IMAGE_MARKER
+        );
     }
 
     #[test]
@@ -403,12 +414,17 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        assert!(rectify_outbound(false, &outbound, &err("Model only support text input"), 400).is_some());
+        assert!(
+            rectify_outbound(false, &outbound, &err("Model only support text input"), 400)
+                .is_some()
+        );
     }
 
     #[test]
     fn unrelated_error_not_rectified() {
-        let outbound = json!({"model": "m", "messages": []}).to_string().into_bytes();
+        let outbound = json!({"model": "m", "messages": []})
+            .to_string()
+            .into_bytes();
         assert!(rectify_outbound(false, &outbound, &err("invalid model name"), 400).is_none());
         // 错误匹配但请求无图片 → 不重试
         let no_image = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
@@ -432,8 +448,13 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let fixed = rectify_outbound(true, &outbound, &err("Invalid 'signature' in 'thinking' block"), 400)
-            .expect("rectifiable");
+        let fixed = rectify_outbound(
+            true,
+            &outbound,
+            &err("Invalid 'signature' in 'thinking' block"),
+            400,
+        )
+        .expect("rectifiable");
         let v: Value = serde_json::from_slice(&fixed).unwrap();
         let content = v["messages"][1]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -441,7 +462,15 @@ mod tests {
         // 剥离后 assistant 不以 thinking 开头且 thinking 仍 enabled → 顶层一并移除
         assert!(v.get("thinking").is_none());
         // 同一出站体走非 anthropic 路径不触发 thinking 整流
-        assert!(rectify_outbound(false, &outbound, &err("Invalid 'signature' in 'thinking' block"), 400).is_none());
+        assert!(
+            rectify_outbound(
+                false,
+                &outbound,
+                &err("Invalid 'signature' in 'thinking' block"),
+                400
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -456,8 +485,13 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let fixed = rectify_outbound(true, &outbound, &err("messages: text content blocks must start with a thinking block"), 400)
-            .expect("rectifiable");
+        let fixed = rectify_outbound(
+            true,
+            &outbound,
+            &err("messages: text content blocks must start with a thinking block"),
+            400,
+        )
+        .expect("rectifiable");
         let v: Value = serde_json::from_slice(&fixed).unwrap();
         assert!(v.get("thinking").is_none());
     }
@@ -484,13 +518,15 @@ mod tests {
         assert_eq!(v["thinking"]["budget_tokens"], 32000);
         assert_eq!(v["max_tokens"], 64000);
         // 非 anthropic 路径不触发
-        assert!(rectify_outbound(
-            false,
-            &outbound,
-            &err("thinking.budget_tokens must be at least 14000"),
-            400
-        )
-        .is_none());
+        assert!(
+            rectify_outbound(
+                false,
+                &outbound,
+                &err("thinking.budget_tokens must be at least 14000"),
+                400
+            )
+            .is_none()
+        );
         // 已合规 → 无修改
         let ok_outbound = json!({
             "model": "claude-x",
@@ -500,22 +536,33 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        assert!(rectify_outbound(
-            true,
-            &ok_outbound,
-            &err("thinking.budget_tokens must be at least 14000"),
-            400
-        )
-        .is_none(), "已合规不重试");
+        assert!(
+            rectify_outbound(
+                true,
+                &ok_outbound,
+                &err("thinking.budget_tokens must be at least 14000"),
+                400
+            )
+            .is_none(),
+            "已合规不重试"
+        );
     }
 
     /// P1-4：budget 错误形状识别
     #[test]
     fn thinking_budget_error_shape_matching() {
-        assert!(is_thinking_budget_error("max_tokens must be greater than thinking.budget_tokens"));
-        assert!(is_thinking_budget_error("thinking.budget_tokens must be >= 1024"));
-        assert!(is_thinking_budget_error("budget_tokens is less than the minimum allowed value"));
-        assert!(!is_thinking_budget_error("invalid signature in thinking block"));
+        assert!(is_thinking_budget_error(
+            "max_tokens must be greater than thinking.budget_tokens"
+        ));
+        assert!(is_thinking_budget_error(
+            "thinking.budget_tokens must be >= 1024"
+        ));
+        assert!(is_thinking_budget_error(
+            "budget_tokens is less than the minimum allowed value"
+        ));
+        assert!(!is_thinking_budget_error(
+            "invalid signature in thinking block"
+        ));
         assert!(!is_thinking_budget_error("budget_tokens"));
     }
 }

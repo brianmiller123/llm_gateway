@@ -146,7 +146,6 @@ pub async fn upsert_sync_user(
     .await
 }
 
-
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct MemberRow {
     pub user_id: i64,
@@ -288,14 +287,16 @@ pub async fn reconcile_ldap_members(
     Ok((added, removed))
 }
 
-pub async fn record_sync_failure(pool: &PgPool, group_id: i64, result: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE user_groups SET last_sync_at = now(), last_sync_result = $2 WHERE id = $1",
-    )
-    .bind(group_id)
-    .bind(result)
-    .execute(pool)
-    .await?;
+pub async fn record_sync_failure(
+    pool: &PgPool,
+    group_id: i64,
+    result: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE user_groups SET last_sync_at = now(), last_sync_result = $2 WHERE id = $1")
+        .bind(group_id)
+        .bind(result)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -356,7 +357,10 @@ pub struct MemberExportRow {
 }
 
 /// 全量成员（CSV 导出）
-pub async fn export_members(pool: &PgPool, group_id: i64) -> Result<Vec<MemberExportRow>, sqlx::Error> {
+pub async fn export_members(
+    pool: &PgPool,
+    group_id: i64,
+) -> Result<Vec<MemberExportRow>, sqlx::Error> {
     sqlx::query_as::<_, MemberExportRow>(
         "SELECT u.username, u.display_name, u.email, m.source, m.added_at \
          FROM user_group_members m JOIN users u ON u.id = m.user_id \

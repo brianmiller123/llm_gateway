@@ -15,15 +15,15 @@
 //! - tools 为空时剥离 tool_choice / parallel_tool_calls（M2，vLLM 严格上游 400 防护）
 //! - reasoning_effort 仅对支持该参数的模型族转发，none/off/disabled 不发（M3）
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::service::model_family::{effort_is_off, supports_reasoning_effort};
 
 use super::dto::{
-    self, arguments_string, present, value_to_string, ChatRequestOut, FunctionOut, MessageOut,
-    ToolCallOut,
+    self, ChatRequestOut, FunctionOut, MessageOut, ToolCallOut, arguments_string, present,
+    value_to_string,
 };
-use super::tool_ctx::{ToolContext, TOOL_SEARCH_PROXY_NAME};
+use super::tool_ctx::{TOOL_SEARCH_PROXY_NAME, ToolContext};
 
 const INPUT_TYPE_FUNCTION_CALL: &str = "function_call";
 const INPUT_TYPE_FUNCTION_CALL_OUTPUT: &str = "function_call_output";
@@ -104,7 +104,9 @@ pub fn responses_request_to_chat(req: &Value, gating_model: &str) -> Result<Valu
         response_format,
         tools,
         tool_choice,
-        parallel_tool_calls: has_tools.then(|| req.get("parallel_tool_calls").and_then(|v| v.as_bool())).flatten(),
+        parallel_tool_calls: has_tools
+            .then(|| req.get("parallel_tool_calls").and_then(|v| v.as_bool()))
+            .flatten(),
         user: raw_present(req.get("user")).cloned(),
         store: raw_present(req.get("store")).cloned(),
         metadata: raw_present(req.get("metadata")).cloned(),
@@ -141,7 +143,6 @@ pub fn responses_request_to_chat(req: &Value, gating_model: &str) -> Result<Valu
     Ok(v)
 }
 
-
 /// 输出上限字段选择（cc-switch TC:297-311 同款）：o 系列模型（o1/o3/o4…，
 /// 仅接受 max_completion_tokens）→ max_completion_tokens；其余（DeepSeek 等
 /// Chat 上游）→ max_tokens。`max_output_tokens` 为 0 视为未设置。
@@ -173,11 +174,7 @@ fn max_tokens_fields(req: &Value, model: &str) -> (Option<u64>, Option<u64>) {
 
 /// 字段存在且非 null
 fn raw_present(v: Option<&Value>) -> Option<&Value> {
-    if present(v) {
-        v
-    } else {
-        None
-    }
+    if present(v) { v } else { None }
 }
 
 /// L2：input item 角色归一化——仅识别 user/assistant/system；缺失/空/未知
@@ -236,7 +233,10 @@ fn instructions_text(v: &Value) -> String {
 }
 
 /// instructions + input → messages（含 reasoning 附挂与 tool_result 媒体抽取）
-fn request_messages_to_chat(req: &Value, tool_ctx: &ToolContext) -> Result<Vec<MessageOut>, String> {
+fn request_messages_to_chat(
+    req: &Value,
+    tool_ctx: &ToolContext,
+) -> Result<Vec<MessageOut>, String> {
     let mut messages: Vec<MessageOut> = Vec::new();
     if let Some(instructions) = raw_present(req.get("instructions")) {
         // instructions 支持 string 或 content parts 数组：数组扁平化为文本
@@ -284,7 +284,13 @@ fn request_messages_to_chat(req: &Value, tool_ctx: &ToolContext) -> Result<Vec<M
         // M12：单个对象形态（非 string/array）按单 item 处理
         //（cc-switch :629-642 同款；此前整请求 400）
         Value::Object(_) => {
-            input_item_to_chat_messages(input, &mut messages, &mut pending_reasoning, &mut pending_media, tool_ctx)?;
+            input_item_to_chat_messages(
+                input,
+                &mut messages,
+                &mut pending_reasoning,
+                &mut pending_media,
+                tool_ctx,
+            )?;
         }
         other => {
             return Err(format!(
@@ -385,7 +391,10 @@ fn input_item_to_chat_messages(
         INPUT_TYPE_TOOL_SEARCH_CALL => {
             append_pending_reasoning(pending_reasoning, item_embedded_reasoning(item));
             flush_pending_media(messages, pending_media);
-            append_tool_call_to_last_assistant(messages, tool_search_call_item_to_chat_tool_call(item));
+            append_tool_call_to_last_assistant(
+                messages,
+                tool_search_call_item_to_chat_tool_call(item),
+            );
             attach_reasoning_to_last_assistant(messages, pending_reasoning.take());
         }
         INPUT_TYPE_FUNCTION_CALL_OUTPUT => {
@@ -615,13 +624,16 @@ fn backfill_tool_call_reasoning_placeholders(messages: &mut [MessageOut]) {
     for m in messages.iter_mut() {
         if m.role == "assistant"
             && !m.tool_calls.is_empty()
-            && m.reasoning_content.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && m.reasoning_content
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
         {
             m.reasoning_content = Some(TOOL_CALL_REASONING_PLACEHOLDER.to_string());
         }
     }
 }
-
 
 /// content → Chat content（string / parts 数组 / 原样透传）
 fn input_content_to_chat_content(content: Option<&Value>) -> Result<Value, String> {
@@ -669,8 +681,7 @@ fn content_parts_to_chat_content(parts: &[Value]) -> Result<Value, String> {
                     chat_parts.push(json!({"type": "text", "text": text}));
                 }
             }
-            "input_image" | "input_file" | "input_audio" | "input_video" | "image_url"
-            | "file" => {
+            "input_image" | "input_file" | "input_audio" | "input_video" | "image_url" | "file" => {
                 if let Some(media) =
                     crate::service::tool_media::chat_media_part(&Value::Object(part.clone()))
                 {
@@ -691,7 +702,6 @@ fn content_parts_to_chat_content(parts: &[Value]) -> Result<Value, String> {
         Ok(Value::Array(chat_parts))
     }
 }
-
 
 fn function_call_item_to_chat_tool_call(
     item: &Value,
@@ -799,7 +809,11 @@ fn append_tool_call_to_last_assistant(messages: &mut Vec<MessageOut>, tool: Tool
             reasoning_content: None,
         });
     }
-    messages.last_mut().expect("assistant message exists").tool_calls.push(tool);
+    messages
+        .last_mut()
+        .expect("assistant message exists")
+        .tool_calls
+        .push(tool);
 }
 
 /// call_id 优先，回退 id（对应 Go `responsesCallID`）
@@ -854,7 +868,10 @@ fn tool_output_to_chat_content(
 /// - P0-4 `{type:tool_search}` → 注入代理 function（query/limit 单参，
 ///   cc-switch add_tool_search_tool :171-199 同款）
 /// - 其余 hosted 类型（file_search 等）防御性跳过 —— 不产出非法 wire 形态
-fn request_tools_to_chat(tools: Option<&Value>, tool_ctx: &ToolContext) -> Result<Vec<ToolCallOut>, String> {
+fn request_tools_to_chat(
+    tools: Option<&Value>,
+    tool_ctx: &ToolContext,
+) -> Result<Vec<ToolCallOut>, String> {
     let Some(tools) = raw_present(tools) else {
         return Ok(Vec::new());
     };
@@ -932,7 +949,12 @@ fn request_tools_to_chat(tools: Option<&Value>, tool_ctx: &ToolContext) -> Resul
         // P0-4：namespace 包装工具 → 子 function 逐个拍平（cc-switch add_namespace_tool
         // :201-218 同款；chat 名与 ToolContext 注册名一致，响应侧可还原）
         if tool_type == "namespace" {
-            let Some(namespace) = t.get("name").and_then(|n| n.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+            let Some(namespace) = t
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
                 continue;
             };
             let Some(children) = t
@@ -947,7 +969,8 @@ fn request_tools_to_chat(tools: Option<&Value>, tool_ctx: &ToolContext) -> Resul
                     Some(o) => o,
                     None => continue,
                 };
-                if let Some(converted) = function_tool_to_chat(child_obj, Some(namespace), tool_ctx) {
+                if let Some(converted) = function_tool_to_chat(child_obj, Some(namespace), tool_ctx)
+                {
                     out.push(converted);
                 }
             }
@@ -958,7 +981,8 @@ fn request_tools_to_chat(tools: Option<&Value>, tool_ctx: &ToolContext) -> Resul
                 out.push(converted);
             }
         } else if tool_type == "custom" {
-            let name = t.get("name")
+            let name = t
+                .get("name")
                 .map(value_to_string)
                 .unwrap_or_default()
                 .trim()
@@ -966,7 +990,8 @@ fn request_tools_to_chat(tools: Option<&Value>, tool_ctx: &ToolContext) -> Resul
             if name.is_empty() {
                 continue;
             }
-            let original_desc = t.get("description")
+            let original_desc = t
+                .get("description")
                 .map(value_to_string)
                 .unwrap_or_default();
             out.push(custom_tool_to_chat(&name, &original_desc, tool));
@@ -1004,7 +1029,9 @@ fn function_tool_to_chat(
         return None;
     }
     let chat_name = tool_ctx.chat_name_for(&name, namespace);
-    let description = field("description").map(|v| value_to_string(&v)).unwrap_or_default();
+    let description = field("description")
+        .map(|v| value_to_string(&v))
+        .unwrap_or_default();
     let parameters = normalize_function_parameters(field("parameters"));
     // L12：strict 结构化输出标志透传（嵌套子对象优先）
     let strict = nested
@@ -1098,10 +1125,15 @@ fn request_tool_choice_to_chat(
         return Err("invalid tool_choice".into());
     };
     let choice_type = map.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let named = |chat_name: String| Some(json!({"type": "function", "function": {"name": chat_name}}));
+    let named =
+        |chat_name: String| Some(json!({"type": "function", "function": {"name": chat_name}}));
     match choice_type {
         "function" => {
-            let name = map.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let name = map
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .trim();
             if !name.is_empty() {
                 let namespace = map
                     .get("namespace")
@@ -1114,7 +1146,11 @@ fn request_tool_choice_to_chat(
         }
         // P0-2：custom → 同名 function 必选形态（原样透传会被严格上游 400）
         "custom" => {
-            let name = map.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let name = map
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .trim();
             if !name.is_empty() {
                 return Ok(named(name.to_string()));
             }
@@ -1137,7 +1173,11 @@ fn request_text_to_chat_response_format(text: Option<&Value>) -> Result<Option<V
     let Some(format) = map.get("format").and_then(|f| f.as_object()) else {
         return Ok(None);
     };
-    let format_type = format.get("type").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let format_type = format
+        .get("type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
     if format_type.is_empty() {
         return Ok(None);
     }
@@ -1188,9 +1228,15 @@ mod tests {
         assert_eq!(o_out["max_completion_tokens"], json!(1024));
         assert!(o_out.get("max_tokens").is_none());
         // instructions → system
-        assert_eq!(out["messages"][0], json!({"role": "system", "content": "You are a helpful assistant."}));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "system", "content": "You are a helpful assistant."})
+        );
         // 多模态 user content parts
-        assert_eq!(out["messages"][1]["content"][0], json!({"type": "text", "text": "What is in this image?"}));
+        assert_eq!(
+            out["messages"][1]["content"][0],
+            json!({"type": "text", "text": "What is in this image?"})
+        );
         assert_eq!(
             out["messages"][1]["content"][1],
             json!({"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}})
@@ -1224,17 +1270,23 @@ mod tests {
     #[test]
     fn input_string_becomes_user_message() {
         let out = responses_request_to_chat(&json!({"model": "m", "input": "hello"}), "m").unwrap();
-        assert_eq!(out["messages"][0], json!({"role": "user", "content": "hello"}));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "user", "content": "hello"})
+        );
     }
 
     #[test]
     fn rejects_stateful_fields() {
-        let err = responses_request_to_chat(&json!({
-            "model": "m",
-            "input": "hi",
-            "conversation": "conv_1",
-            "previous_response_id": "resp_x"
-        }), "m")
+        let err = responses_request_to_chat(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "conversation": "conv_1",
+                "previous_response_id": "resp_x"
+            }),
+            "m",
+        )
         .unwrap_err();
         assert!(err.contains("stateful fields"), "{err}");
         assert!(err.contains("previous_response_id"));
@@ -1249,12 +1301,15 @@ mod tests {
 
     #[test]
     fn maps_tool_choice_function() {
-        let out = responses_request_to_chat(&json!({
-            "model": "m",
-            "input": "hi",
-            "tools": [{"type": "function", "name": "get_weather"}],
-            "tool_choice": {"type": "function", "name": "get_weather"}
-        }), "m")
+        let out = responses_request_to_chat(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "tools": [{"type": "function", "name": "get_weather"}],
+                "tool_choice": {"type": "function", "name": "get_weather"}
+            }),
+            "m",
+        )
         .unwrap();
         assert_eq!(
             out["tool_choice"],
@@ -1265,12 +1320,15 @@ mod tests {
     /// M2：tools 为空时 tool_choice / parallel_tool_calls 必须剥离（vLLM 400 防护）
     #[test]
     fn empty_tools_strips_tool_choice_and_parallel_tool_calls() {
-        let out = responses_request_to_chat(&json!({
-            "model": "m",
-            "input": "hi",
-            "tool_choice": "auto",
-            "parallel_tool_calls": true
-        }), "m")
+        let out = responses_request_to_chat(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "tool_choice": "auto",
+                "parallel_tool_calls": true
+            }),
+            "m",
+        )
         .unwrap();
         assert!(out.get("tool_choice").is_none());
         assert!(out.get("parallel_tool_calls").is_none());
@@ -1278,12 +1336,15 @@ mod tests {
 
     #[test]
     fn maps_text_format_json_schema() {
-        let out = responses_request_to_chat(&json!({
-            "model": "m",
-            "input": "hi",
-            "text": {"format": {"type": "json_schema", "name": "weather",
-                "schema": {"type": "object"}, "strict": true}}
-        }), "m")
+        let out = responses_request_to_chat(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "text": {"format": {"type": "json_schema", "name": "weather",
+                    "schema": {"type": "object"}, "strict": true}}
+            }),
+            "m",
+        )
         .unwrap();
         assert_eq!(out["response_format"]["type"], "json_schema");
         assert_eq!(out["response_format"]["json_schema"]["name"], "weather");
@@ -1293,39 +1354,58 @@ mod tests {
     /// M3：仅支持 reasoning_effort 的模型族转发；none 保留标记；不支持模型族不发
     #[test]
     fn reasoning_effort_model_family_gating() {
-        let gpt5 = responses_request_to_chat(&json!({
-            "model": "gpt-5.1", "input": "hi", "reasoning": {"effort": "high"}
-        }), "gpt-5.1")
+        let gpt5 = responses_request_to_chat(
+            &json!({
+                "model": "gpt-5.1", "input": "hi", "reasoning": {"effort": "high"}
+            }),
+            "gpt-5.1",
+        )
         .unwrap();
         assert_eq!(gpt5["reasoning_effort"], "high");
 
-        let none = responses_request_to_chat(&json!({
-            "model": "gpt-5.1", "input": "hi", "reasoning": {"effort": "none"}
-        }), "gpt-5.1")
+        let none = responses_request_to_chat(
+            &json!({
+                "model": "gpt-5.1", "input": "hi", "reasoning": {"effort": "none"}
+            }),
+            "gpt-5.1",
+        )
         .unwrap();
-        assert_eq!(none.get("reasoning_effort"), Some(&json!("none")), "显式关闭保留 none，由路由级 effort_mode 决定终态（M9）");
+        assert_eq!(
+            none.get("reasoning_effort"),
+            Some(&json!("none")),
+            "显式关闭保留 none，由路由级 effort_mode 决定终态（M9）"
+        );
 
-        let deepseek = responses_request_to_chat(&json!({
-            "model": "deepseek-chat", "input": "hi", "reasoning": {"effort": "high"}
-        }), "deepseek-chat")
+        let deepseek = responses_request_to_chat(
+            &json!({
+                "model": "deepseek-chat", "input": "hi", "reasoning": {"effort": "high"}
+            }),
+            "deepseek-chat",
+        )
         .unwrap();
-        assert!(deepseek.get("reasoning_effort").is_none(), "不支持的模型族不发");
+        assert!(
+            deepseek.get("reasoning_effort").is_none(),
+            "不支持的模型族不发"
+        );
     }
 
     /// L3：未知参数白名单透传（cc-switch EXTRA_CHAT_PASSTHROUGH_FIELDS 子集）
     #[test]
     fn passthrough_sampling_fields() {
-        let out = responses_request_to_chat(&json!({
-            "model": "m",
-            "input": "hi",
-            "frequency_penalty": 0.5,
-            "presence_penalty": 0.1,
-            "logit_bias": {"50256": -100},
-            "logprobs": true,
-            "n": 2,
-            "seed": 42,
-            "stop": ["\n\n"]
-        }), "m")
+        let out = responses_request_to_chat(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "frequency_penalty": 0.5,
+                "presence_penalty": 0.1,
+                "logit_bias": {"50256": -100},
+                "logprobs": true,
+                "n": 2,
+                "seed": 42,
+                "stop": ["\n\n"]
+            }),
+            "m",
+        )
         .unwrap();
         assert_eq!(out["frequency_penalty"], json!(0.5));
         assert_eq!(out["presence_penalty"], json!(0.1));
@@ -1355,25 +1435,27 @@ mod tests {
         let assistant = &out["messages"][0];
         assert_eq!(assistant["role"], "assistant");
         assert_eq!(assistant["tool_calls"][0]["type"], "function");
-        assert_eq!(
-            assistant["tool_calls"][0]["id"], "cust_1"
-        );
+        assert_eq!(assistant["tool_calls"][0]["id"], "cust_1");
         // 精确断言（canonical JSON）
         assert_eq!(
             assistant["tool_calls"][0]["function"]["arguments"],
-            serde_json::Value::String(
-                crate::service::canonical::canonical_json_string(
-                    &json!({"input": "*** Begin Patch\n*** End Patch"})
-                )
-            )
+            serde_json::Value::String(crate::service::canonical::canonical_json_string(
+                &json!({"input": "*** Begin Patch\n*** End Patch"})
+            ))
         );
         // 输出侧：tool 消息（canonical JSON 序列化整项），不再静默丢弃
         let tool_msg = &out["messages"][1];
         assert_eq!(tool_msg["role"], "tool");
         assert_eq!(tool_msg["tool_call_id"], "cust_1");
         let content = tool_msg["content"].as_str().unwrap();
-        assert!(content.contains("\"output\":\"Done!\""), "content={content}");
-        assert!(content.contains("custom_tool_call_output"), "保留 item 类型：{content}");
+        assert!(
+            content.contains("\"output\":\"Done!\""),
+            "content={content}"
+        );
+        assert!(
+            content.contains("custom_tool_call_output"),
+            "保留 item 类型：{content}"
+        );
         // 定义侧：降级 function + 原始定义嵌入 description
         let tool_def = &out["tools"][0];
         assert_eq!(tool_def["type"], "function");
@@ -1381,7 +1463,10 @@ mod tests {
         let desc = tool_def["function"]["description"].as_str().unwrap();
         assert!(desc.contains("Original tool definition:"));
         assert!(desc.contains("apply_patch"));
-        assert_eq!(tool_def["function"]["parameters"]["required"], json!(["input"]));
+        assert_eq!(
+            tool_def["function"]["parameters"]["required"],
+            json!(["input"])
+        );
     }
 
     /// H1 媒体半边：function_call_output 中的图片抽取为相邻 user 媒体消息
@@ -1429,7 +1514,10 @@ mod tests {
             ]
         });
         let out = responses_request_to_chat(&req, "gpt-test").unwrap();
-        assert_eq!(out["messages"][0]["reasoning_content"], "I should check weather");
+        assert_eq!(
+            out["messages"][0]["reasoning_content"],
+            "I should check weather"
+        );
     }
 
     /// M1：user 回合边界的 pending reasoning 回溯附挂到上一条 assistant
@@ -1468,16 +1556,24 @@ mod tests {
         let out = responses_request_to_chat(&req, "gpt-test").unwrap();
         // 工具降级为 function（query 单参 schema）
         assert_eq!(out["tools"][0]["function"]["name"], "web_search");
-        assert_eq!(out["tools"][0]["function"]["parameters"]["required"], json!(["query"]));
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["required"],
+            json!(["query"])
+        );
         // web_search_call → assistant tool_calls + tool 回执
         let msgs = out["messages"].as_array().unwrap();
-        let call_msg = msgs.iter().find(|m| m["role"] == "assistant" && !m["tool_calls"].is_null());
+        let call_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && !m["tool_calls"].is_null());
         assert!(call_msg.is_some(), "assistant tool_calls 存在");
         let tc = &call_msg.unwrap()["tool_calls"][0];
         assert_eq!(tc["id"], "ws_1");
         assert_eq!(tc["function"]["name"], "web_search");
         assert_eq!(tc["function"]["arguments"], "{\"query\":\"Rust async\"}");
-        let tool_msg = msgs.iter().find(|m| m["role"] == "tool").expect("tool 回执");
+        let tool_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool 回执");
         assert_eq!(tool_msg["tool_call_id"], "ws_1");
         assert!(tool_msg["content"].as_str().unwrap().contains("https://x"));
     }
@@ -1486,8 +1582,14 @@ mod tests {
     #[test]
     fn request_bridges_web_search_detection() {
         use crate::service::responses::tool_ctx::ToolContext;
-        assert!(ToolContext::from_request(&json!({"tools": [{"type": "web_search"}]})).bridges_web_search);
-        assert!(!ToolContext::from_request(&json!({"tools": [{"type": "function", "name": "f"}]})).bridges_web_search);
+        assert!(
+            ToolContext::from_request(&json!({"tools": [{"type": "web_search"}]}))
+                .bridges_web_search
+        );
+        assert!(
+            !ToolContext::from_request(&json!({"tools": [{"type": "function", "name": "f"}]}))
+                .bridges_web_search
+        );
         assert!(!ToolContext::from_request(&json!({})).bridges_web_search);
     }
 }

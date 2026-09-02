@@ -20,7 +20,10 @@ pub struct UserRow {
     pub created_at: DateTime<Utc>,
 }
 
-pub async fn find_by_username(pool: &PgPool, username: &str) -> Result<Option<UserRow>, sqlx::Error> {
+pub async fn find_by_username(
+    pool: &PgPool,
+    username: &str,
+) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
         .bind(username)
         .fetch_optional(pool)
@@ -171,4 +174,3 @@ pub async fn list_users(pool: &PgPool, month: &str) -> Result<Vec<UserWithUsage>
     .fetch_all(pool)
     .await
 }
-

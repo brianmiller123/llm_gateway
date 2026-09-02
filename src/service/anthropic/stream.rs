@@ -17,20 +17,20 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures_util::stream::{once, Stream, StreamExt};
+use futures_util::stream::{Stream, StreamExt, once};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 use crate::store::usage::UsageMeta;
 
 use super::super::responses::dto::{
-    delta_content_text, ChatStreamChunk, ToolCallDelta, Usage as DtoUsage,
+    ChatStreamChunk, ToolCallDelta, Usage as DtoUsage, delta_content_text,
 };
 use super::super::responses::stream::{ChatSseParser, SseEvent};
 use super::convert_resp::{anthropic_usage, stop_reason_from_finish};
@@ -71,7 +71,6 @@ impl NonToolBlock {
         block_stop_event(self.index)
     }
 }
-
 
 /// 无限空白 bug 的连续空白字符阈值（cc-switch INFINITE_WHITESPACE_THRESHOLD）
 const INFINITE_WHITESPACE_THRESHOLD: usize = 500;
@@ -223,8 +222,7 @@ impl ChatToAnthropicState {
             {
                 // 后到的 finish_reason 覆盖（部分上游多 finish chunk，真实终态在最后；
                 // message_delta 收尾时只发一次 —— 天然去重，cc-switch 同款）
-                self.pending_stop_reason =
-                    Some(stop_reason_from_finish(fr, self.has_tool_use));
+                self.pending_stop_reason = Some(stop_reason_from_finish(fr, self.has_tool_use));
             }
         }
         events
@@ -276,8 +274,8 @@ impl ChatToAnthropicState {
         // 先关块（计数 dropped_tools）再判定输出存在性。
         let close_events = self.close_open_blocks();
         // M16：块关闭后 started 复位，输出存在性改用 stopped 标志（曾打开过即算有输出）
-        let has_output = self.thinking_stopped || self.text_stopped
-            || self.tools.values().any(|t| t.started);
+        let has_output =
+            self.thinking_stopped || self.text_stopped || self.tools.values().any(|t| t.started);
         if self.dropped_tools > 0 && !has_output {
             events.clear();
             events.push(self.error_event(
@@ -311,14 +309,10 @@ impl ChatToAnthropicState {
 
     fn message_start_event(&self) -> String {
         // 首块带 usage 时提前上报（部分上游在首 chunk 携带 input_tokens）
-        let usage = self
-            .usage
-            .as_ref()
-            .map(anthropic_usage)
-            .unwrap_or_else(|| {
-                json!({"input_tokens": 0, "output_tokens": 0,
+        let usage = self.usage.as_ref().map(anthropic_usage).unwrap_or_else(|| {
+            json!({"input_tokens": 0, "output_tokens": 0,
                        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
-            });
+        });
         let message = json!({
             "id": format!("msg_{}", self.id),
             "type": "message",
@@ -329,7 +323,10 @@ impl ChatToAnthropicState {
             "stop_sequence": null,
             "usage": usage
         });
-        sse_frame("message_start", &json!({"type": "message_start", "message": message}))
+        sse_frame(
+            "message_start",
+            &json!({"type": "message_start", "message": message}),
+        )
     }
 
     fn append_thinking_delta(&mut self, delta: &str) -> Vec<String> {
@@ -423,7 +420,6 @@ impl ChatToAnthropicState {
         events
     }
 
-
     /// 工具增量：id+name 到齐才发 content_block_start；参数先缓冲（cc-switch 延迟启动）。
     /// M16：工具帧到达先关闭打开的非工具块（块序列单调）
     fn append_tool_delta(&mut self, tool_call: &ToolCallDelta) -> Vec<String> {
@@ -438,9 +434,7 @@ impl ChatToAnthropicState {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .and_then(|id| {
-                        self.tools.iter().find(|(_, b)| b.id == id).map(|(k, _)| *k)
-                    });
+                    .and_then(|id| self.tools.iter().find(|(_, b)| b.id == id).map(|(k, _)| *k));
                 let last_key = self.last_tool_key;
                 let max_key = self.tools.keys().copied().next_back();
                 super::super::responses::dto::resolve_no_index_tool_key(
@@ -463,7 +457,12 @@ impl ChatToAnthropicState {
             );
         }
         let block = self.tools.get_mut(&chat_index).expect("tool block exists");
-        if let Some(id) = tool_call.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(id) = tool_call
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             block.id = id.to_string();
         }
         if let Some(name) = tool_call
@@ -580,7 +579,10 @@ impl ChatToAnthropicState {
                     events.push(block_stop_event(block.anthropic_index));
                 } else {
                     self.dropped_tools += 1;
-                    tracing::warn!(chat_index, "dropping streamed tool_call without function name");
+                    tracing::warn!(
+                        chat_index,
+                        "dropping streamed tool_call without function name"
+                    );
                 }
             }
         }
@@ -593,18 +595,15 @@ impl ChatToAnthropicState {
             return Vec::new();
         }
         self.has_emitted_message_delta = true;
-        let stop_reason = self
-            .pending_stop_reason
-            .clone()
-            .unwrap_or_else(|| {
-                if truncated {
-                    "max_tokens".into()
-                } else if self.has_tool_use {
-                    "tool_use".into()
-                } else {
-                    "end_turn".into()
-                }
-            });
+        let stop_reason = self.pending_stop_reason.clone().unwrap_or_else(|| {
+            if truncated {
+                "max_tokens".into()
+            } else if self.has_tool_use {
+                "tool_use".into()
+            } else {
+                "end_turn".into()
+            }
+        });
         // P0-5：finish 帧时刻算出的 end_turn 早于 late-start 工具块（无名工具在
         // close_open_blocks 才置 has_tool_use）→ 消息含 tool_use 块却报 end_turn，
         // Claude Code 以 stop_reason 驱动工具循环会静默跳过执行。收尾时以最终
@@ -614,14 +613,10 @@ impl ChatToAnthropicState {
         } else {
             stop_reason
         };
-        let usage = self
-            .usage
-            .as_ref()
-            .map(anthropic_usage)
-            .unwrap_or_else(|| {
-                json!({"input_tokens": 0, "output_tokens": 0,
+        let usage = self.usage.as_ref().map(anthropic_usage).unwrap_or_else(|| {
+            json!({"input_tokens": 0, "output_tokens": 0,
                        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
-            });
+        });
         vec![sse_frame(
             "message_delta",
             &json!({
@@ -647,7 +642,6 @@ impl ChatToAnthropicState {
         self.next_block_index += 1;
         index
     }
-
 }
 
 fn input_json_delta_event(index: i64, partial_json: &str) -> String {
@@ -770,13 +764,15 @@ pub fn wrap_chat_stream_to_anthropic(
                             };
                             if !recorded.swap(true, Ordering::SeqCst) {
                                 crate::service::usage::record(
-                                    &st, &meta, usage.as_ref(), record_status, latency,
+                                    &st,
+                                    &meta,
+                                    usage.as_ref(),
+                                    record_status,
+                                    latency,
                                 )
                                 .await;
                             }
-                            return Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::from(
-                                frames,
-                            ));
+                            return Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::from(frames));
                         }
                         return Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::new());
                     }
@@ -821,7 +817,11 @@ pub fn wrap_chat_stream_to_anthropic(
                     out.extend_from_slice(&final_frames);
                     if !recorded.swap(true, Ordering::SeqCst) {
                         crate::service::usage::record(
-                            &st, &meta, usage.as_ref(), record_status, latency,
+                            &st,
+                            &meta,
+                            usage.as_ref(),
+                            record_status,
+                            latency,
                         )
                         .await;
                     }
@@ -849,7 +849,11 @@ pub fn wrap_chat_stream_to_anthropic(
                 };
                 if !recorded.swap(true, Ordering::SeqCst) {
                     crate::service::usage::record(
-                        &st, &meta, usage.as_ref(), record_status, latency,
+                        &st,
+                        &meta,
+                        usage.as_ref(),
+                        record_status,
+                        latency,
                     )
                     .await;
                 }
@@ -906,7 +910,12 @@ mod tests {
         }
     }
 
-    fn tool_delta(index: i64, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ToolCallDelta {
+    fn tool_delta(
+        index: i64,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> ToolCallDelta {
         ToolCallDelta {
             index: Some(index),
             id: id.map(str::to_string),
@@ -949,16 +958,26 @@ mod tests {
         frames.extend(s.process_chunk(&chunk(None, Some("thinking..."), None, None, vec![])));
         frames.extend(s.process_chunk(&chunk(Some("Hello"), None, None, None, vec![])));
         frames.extend(s.process_chunk(&chunk(
-            None, None, None,
+            None,
+            None,
+            None,
             Some(DtoUsage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 ..Default::default()
             }),
-            vec![tool_delta(0, Some("call_1"), Some("get_weather"), Some("{\"city\""))],
+            vec![tool_delta(
+                0,
+                Some("call_1"),
+                Some("get_weather"),
+                Some("{\"city\""),
+            )],
         )));
         frames.extend(s.process_chunk(&chunk(
-            None, None, Some("tool_calls"), None,
+            None,
+            None,
+            Some("tool_calls"),
+            None,
             vec![tool_delta(0, None, None, Some(":\"Paris\"}"))],
         )));
         frames.extend(s.finalize());
@@ -973,16 +992,16 @@ mod tests {
             seq,
             vec![
                 "message_start",
-                "content_block_start",   // thinking（index 0）
-                "content_block_delta",   // thinking_delta
-                "content_block_stop",    // M16：text 到达先关 thinking
-                "content_block_start",   // text（index 1）
-                "content_block_delta",   // text_delta
-                "content_block_stop",    // M16：工具帧到达先关 text
-                "content_block_start",   // tool_use（index 2，id+name 到齐）
-                "content_block_delta",   // input_json_delta {"city"
-                "content_block_delta",   // input_json_delta :"Paris"}
-                "content_block_stop",    // tool
+                "content_block_start", // thinking（index 0）
+                "content_block_delta", // thinking_delta
+                "content_block_stop",  // M16：text 到达先关 thinking
+                "content_block_start", // text（index 1）
+                "content_block_delta", // text_delta
+                "content_block_stop",  // M16：工具帧到达先关 text
+                "content_block_start", // tool_use（index 2，id+name 到齐）
+                "content_block_delta", // input_json_delta {"city"
+                "content_block_delta", // input_json_delta :"Paris"}
+                "content_block_stop",  // tool
                 "message_delta",
                 "message_stop",
             ]
@@ -990,15 +1009,15 @@ mod tests {
         assert!(joined.contains("\"partial_json\":\"{\\\"city\\\""));
     }
 
-
     #[test]
     fn content_parts_array_delta_emits_text_delta() {
         // Bug 回归：部分上游流式 delta.content 为 parts 数组，旧实现仅取 string
         // 形态 → 文本全丢 → message_stop 空内容（Claude Code 空回复）
         let mut s = ChatToAnthropicState::new("m1".into(), "m".into());
         let mut c = chunk(None, None, None, None, vec![]);
-        c.choices[0].delta.content =
-            Some(Value::Array(vec![json!({"type": "text", "text": "Hello parts"})]));
+        c.choices[0].delta.content = Some(Value::Array(vec![
+            json!({"type": "text", "text": "Hello parts"}),
+        ]));
         let frames = s.process_chunk(&c);
         let joined: String = frames.concat();
         assert!(joined.contains("content_block_delta"));
@@ -1023,12 +1042,22 @@ mod tests {
     fn tool_args_buffered_until_identity_known() {
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
         // 参数先到（无 id/name）→ 缓冲
-        let frames1 = s.process_chunk(&chunk(None, None, None, None,
-            vec![tool_delta(0, None, None, Some("{\"a\""))]));
+        let frames1 = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![tool_delta(0, None, None, Some("{\"a\""))],
+        ));
         assert!(frames1.iter().all(|f| !f.contains("content_block_start")));
         // id+name 到齐 → start + 冲刷缓冲 + 新增量
-        let frames2 = s.process_chunk(&chunk(None, None, None, None,
-            vec![tool_delta(0, Some("call_9"), Some("fn"), Some(":1}"))]));
+        let frames2 = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![tool_delta(0, Some("call_9"), Some("fn"), Some(":1}"))],
+        ));
         let joined: String = frames2.concat();
         assert!(joined.contains("\"type\":\"tool_use\""));
         assert!(joined.contains("\"partial_json\":\"{\\\"a\\\""));
@@ -1081,15 +1110,38 @@ mod tests {
             }),
         };
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
-        let frames1 = s.process_chunk(&chunk(None, None, None, None, vec![no_index(Some("call_a"), Some("read_file"), Some("{\"path\":\"a\"}"))]));
-        let frames2 = s.process_chunk(&chunk(None, None, Some("tool_calls"), None, vec![no_index(Some("call_b"), Some("exec_command"), Some("{\"cmd\":\"ls\"}"))]));
+        let frames1 = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![no_index(
+                Some("call_a"),
+                Some("read_file"),
+                Some("{\"path\":\"a\"}"),
+            )],
+        ));
+        let frames2 = s.process_chunk(&chunk(
+            None,
+            None,
+            Some("tool_calls"),
+            None,
+            vec![no_index(
+                Some("call_b"),
+                Some("exec_command"),
+                Some("{\"cmd\":\"ls\"}"),
+            )],
+        ));
         let joined: String = frames1.into_iter().chain(frames2).collect();
         assert!(joined.contains("\"id\":\"call_a\""));
         assert!(joined.contains("\"name\":\"read_file\""));
         assert!(joined.contains("\"id\":\"call_b\""));
         assert!(joined.contains("\"name\":\"exec_command\""));
         assert!(joined.contains("\"partial_json\":\"{\\\"cmd\\\":\\\"ls\\\"}\""));
-        assert!(!joined.contains("\"name\":\"read_file\"},\"input\""), "无串参");
+        assert!(
+            !joined.contains("\"name\":\"read_file\"},\"input\""),
+            "无串参"
+        );
         // 两个块各自完整，参数不互相覆盖
         let starts = joined.matches("content_block_start").count() / 2;
         assert_eq!(starts, 2, "两个独立 tool_use 块");
@@ -1107,19 +1159,48 @@ mod tests {
             }),
         };
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
-        let frames1 = s.process_chunk(&chunk(None, None, None, None, vec![no_index(Some("call_1"), Some("f"), Some("{\"a\""))]));
-        let frames2 = s.process_chunk(&chunk(None, None, None, None, vec![no_index(None, None, Some(":1}"))]));
+        let frames1 = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![no_index(Some("call_1"), Some("f"), Some("{\"a\""))],
+        ));
+        let frames2 = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![no_index(None, None, Some(":1}"))],
+        ));
         let joined: String = frames2.concat();
-        assert!(joined.contains("\"partial_json\":\":1}\""), "续帧并入 call_1");
-        assert_eq!(joined.matches("content_block_start").count(), 0, "续帧不新增块");
-        assert_eq!(frames1.concat().matches("content_block_start").count() / 2, 1, "首帧启动一个块");
+        assert!(
+            joined.contains("\"partial_json\":\":1}\""),
+            "续帧并入 call_1"
+        );
+        assert_eq!(
+            joined.matches("content_block_start").count(),
+            0,
+            "续帧不新增块"
+        );
+        assert_eq!(
+            frames1.concat().matches("content_block_start").count() / 2,
+            1,
+            "首帧启动一个块"
+        );
     }
 
     /// M4：content 里流首 <think> 块分离为 thinking
     #[test]
     fn inline_think_separated_into_thinking_block() {
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
-        let frames = s.process_chunk(&chunk(Some("<think>hmm</think>Answer"), None, None, None, vec![]));
+        let frames = s.process_chunk(&chunk(
+            Some("<think>hmm</think>Answer"),
+            None,
+            None,
+            None,
+            vec![],
+        ));
         let joined: String = frames.concat();
         assert!(joined.contains("\"type\":\"thinking_delta\""));
         assert!(joined.contains("\"thinking\":\"hmm\""));
@@ -1135,13 +1216,31 @@ mod tests {
     #[test]
     fn infinite_whitespace_aborts_tool_block() {
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
-        s.process_chunk(&chunk(None, None, None, None, vec![tool_delta(0, Some("call_1"), Some("f"), Some("{\"x\""))]));
+        s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![tool_delta(0, Some("call_1"), Some("f"), Some("{\"x\""))],
+        ));
         let garbage = " ".repeat(600);
-        let frames = s.process_chunk(&chunk(None, None, None, None, vec![tool_delta(0, None, None, Some(&garbage))]));
+        let frames = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![tool_delta(0, None, None, Some(&garbage))],
+        ));
         let joined: String = frames.concat();
         assert!(!joined.contains(&garbage[..500]), "超阈值垃圾增量不得下发");
         // 后续正常增量也被抑制（块已中止）
-        let frames = s.process_chunk(&chunk(None, None, None, None, vec![tool_delta(0, None, None, Some(":1}"))]));
+        let frames = s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![tool_delta(0, None, None, Some(":1}"))],
+        ));
         assert!(frames.concat().is_empty());
     }
 
@@ -1157,12 +1256,18 @@ mod tests {
     #[test]
     fn usage_three_buckets_in_message_delta() {
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
-        s.process_chunk(&chunk(Some("x"), None, Some("stop"), Some(DtoUsage {
-            prompt_tokens: Some(200),
-            completion_tokens: Some(9),
-            prompt_tokens_details: Some(json!({"cached_tokens": 150})),
-            ..Default::default()
-        }), vec![]));
+        s.process_chunk(&chunk(
+            Some("x"),
+            None,
+            Some("stop"),
+            Some(DtoUsage {
+                prompt_tokens: Some(200),
+                completion_tokens: Some(9),
+                prompt_tokens_details: Some(json!({"cached_tokens": 150})),
+                ..Default::default()
+            }),
+            vec![],
+        ));
         let frames = s.finalize();
         let joined: String = frames.concat();
         // 200 − 150 = 50 fresh input
@@ -1174,16 +1279,27 @@ mod tests {
     #[test]
     fn nameless_tool_late_starts_as_unknown_tool() {
         let mut s = ChatToAnthropicState::new("r".into(), "m".into());
-        s.process_chunk(&chunk(None, None, None, None,
-            vec![tool_delta(0, Some("call_1"), None, Some("{}"))]));
+        s.process_chunk(&chunk(
+            None,
+            None,
+            None,
+            None,
+            vec![tool_delta(0, Some("call_1"), None, Some("{}"))],
+        ));
         let frames = s.finalize();
         let joined: String = frames.concat();
         // M17：有载荷的无名工具合成 late-start（unknown_tool 兜底），调用对客户端
         // 始终可见；零载荷才丢弃（cc-switch streaming.rs:542-602 同款）
         assert!(joined.contains("\"tool_use\""), "无名工具合成 tool_use 块");
-        assert!(joined.contains("\"name\":\"unknown_tool\""), "name 兜底 unknown_tool");
+        assert!(
+            joined.contains("\"name\":\"unknown_tool\""),
+            "name 兜底 unknown_tool"
+        );
         assert!(joined.contains("\"id\":\"call_1\""), "id 保留");
-        assert!(joined.contains("event: message_stop"), "有工具输出 → 正常收尾");
+        assert!(
+            joined.contains("event: message_stop"),
+            "有工具输出 → 正常收尾"
+        );
         assert!(!joined.contains("event: error"), "不伪装成失败");
     }
 }

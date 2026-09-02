@@ -26,7 +26,10 @@ pub async fn run(pool: PgPool) {
             {
                 Ok(res) => {
                     if res.rows_affected() > 0 {
-                        tracing::info!(removed = res.rows_affected(), "expired refresh tokens cleaned");
+                        tracing::info!(
+                            removed = res.rows_affected(),
+                            "expired refresh tokens cleaned"
+                        );
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "refresh token cleanup failed"),

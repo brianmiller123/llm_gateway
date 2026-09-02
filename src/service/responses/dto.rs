@@ -5,7 +5,7 @@
 //! 宽松解析：请求/上游响应多数字段按 `Option<Value>` 透传，只对需要转换的字段做强类型。
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 字段存在且非 JSON null（对应 Go `rawJSONPresent`）
 pub fn present(v: Option<&Value>) -> bool {
@@ -277,9 +277,18 @@ impl Usage {
             total_tokens: get("total_tokens"),
             input_tokens: get("input_tokens"),
             output_tokens: get("output_tokens"),
-            prompt_tokens_details: v.get("prompt_tokens_details").filter(|d| d.is_object()).cloned(),
-            completion_tokens_details: v.get("completion_tokens_details").filter(|d| d.is_object()).cloned(),
-            input_tokens_details: v.get("input_tokens_details").filter(|d| d.is_object()).cloned(),
+            prompt_tokens_details: v
+                .get("prompt_tokens_details")
+                .filter(|d| d.is_object())
+                .cloned(),
+            completion_tokens_details: v
+                .get("completion_tokens_details")
+                .filter(|d| d.is_object())
+                .cloned(),
+            input_tokens_details: v
+                .get("input_tokens_details")
+                .filter(|d| d.is_object())
+                .cloned(),
             cache_read_input_tokens: get("cache_read_input_tokens"),
             cache_creation_input_tokens: get("cache_creation_input_tokens"),
             prompt_cache_hit_tokens: get("prompt_cache_hit_tokens"),
@@ -312,7 +321,9 @@ impl ChatStreamChunk {
                                     tool_calls: d
                                         .get("tool_calls")
                                         .and_then(|t| t.as_array())
-                                        .map(|arr| arr.iter().filter_map(lenient_tool_call).collect())
+                                        .map(|arr| {
+                                            arr.iter().filter_map(lenient_tool_call).collect()
+                                        })
                                         .unwrap_or_default(),
                                     refusal: d.get("refusal").and_then(lenient_text),
                                 })
@@ -328,7 +339,10 @@ impl ChatStreamChunk {
             model: v.get("model").and_then(lenient_text).unwrap_or_default(),
             created: v.get("created").and_then(lenient_i64),
             choices,
-            usage: v.get("usage").filter(|u| u.is_object()).map(Usage::from_value_lenient),
+            usage: v
+                .get("usage")
+                .filter(|u| u.is_object())
+                .map(Usage::from_value_lenient),
             error: v.get("error").filter(|e| !e.is_null()).cloned(),
         })
     }
@@ -491,7 +505,8 @@ impl Usage {
         self.completion_tokens.or(self.output_tokens).unwrap_or(0)
     }
     pub fn total(&self) -> i64 {
-        self.total_tokens.unwrap_or_else(|| self.input().saturating_add(self.output()))
+        self.total_tokens
+            .unwrap_or_else(|| self.input().saturating_add(self.output()))
     }
 
     /// 缓存命中 token（L3，cc-switch usage/parser.rs:12-26 同款优先级）：
@@ -598,14 +613,8 @@ fn input_details_with_cache(u: &Usage) -> Option<Value> {
     if write > 0 {
         obj.insert("cache_write_tokens".into(), json!(write));
     }
-    let any_nonzero = obj
-        .values()
-        .any(|v| v.as_i64().is_some_and(|n| n != 0));
-    if any_nonzero {
-        Some(base)
-    } else {
-        None
-    }
+    let any_nonzero = obj.values().any(|v| v.as_i64().is_some_and(|n| n != 0));
+    if any_nonzero { Some(base) } else { None }
 }
 
 fn zero_prompt_details() -> Value {
@@ -631,11 +640,7 @@ fn nonzero_input_details(details: Option<&Value>) -> Option<Value> {
         }),
         _ => false,
     };
-    if any_nonzero {
-        Some(d.clone())
-    } else {
-        None
-    }
+    if any_nonzero { Some(d.clone()) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +788,6 @@ pub struct ResponsesOutputContentOut {
     pub annotations: Vec<Value>,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryPartOut {
     pub r#type: String,
@@ -809,7 +813,12 @@ pub fn sse_frame(ev: &ResponsesStreamEventOut) -> String {
 }
 
 /// 构造通用输出 item（message/reasoning/function_call 共用的字段补全）
-pub fn output_item(r#type: &str, id: String, status: &str, content: Vec<ResponsesOutputContentOut>) -> ResponsesOutputOut {
+pub fn output_item(
+    r#type: &str,
+    id: String,
+    status: &str,
+    content: Vec<ResponsesOutputContentOut>,
+) -> ResponsesOutputOut {
     ResponsesOutputOut {
         r#type: r#type.to_string(),
         id,
@@ -882,7 +891,15 @@ mod tests {
         })
         .to_string();
         let chunk = ChatStreamChunk::from_json_str(&data).expect("must parse leniently");
-        assert_eq!(chunk.choices[0].delta.content.as_ref().and_then(delta_content_text).as_deref(), Some("Hello"));
+        assert_eq!(
+            chunk.choices[0]
+                .delta
+                .content
+                .as_ref()
+                .and_then(delta_content_text)
+                .as_deref(),
+            Some("Hello")
+        );
         let usage = chunk.usage.as_ref().expect("usage present");
         assert_eq!(usage.input(), 12);
         assert_eq!(usage.output(), 7);
@@ -931,7 +948,12 @@ mod tests {
         let chunk = ChatStreamChunk::from_json_str(&data).expect("must parse");
         assert_eq!(chunk.choices[0].delta.role.as_deref(), Some("assistant"));
         assert_eq!(
-            chunk.choices[0].delta.content.as_ref().and_then(delta_content_text).as_deref(),
+            chunk.choices[0]
+                .delta
+                .content
+                .as_ref()
+                .and_then(delta_content_text)
+                .as_deref(),
             Some("Hi")
         );
     }
@@ -950,7 +972,10 @@ mod tests {
         let chunk = ChatStreamChunk::from_json_str(&data).expect("must parse leniently");
         assert_eq!(chunk.id, "42");
         assert_eq!(chunk.created, Some(1700000000));
-        assert_eq!(chunk.choices[0].delta.reasoning_content.as_deref(), Some("hmm"));
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("hmm")
+        );
         assert_eq!(chunk.choices[0].delta.content, Some(Value::Null));
         // 真正的语法错误才返回 None
         assert!(ChatStreamChunk::from_json_str("{\"broken").is_none());
@@ -970,7 +995,10 @@ mod tests {
         let chunk = ChatStreamChunk::from_json_str(&data).expect("must parse leniently");
         let tc = &chunk.choices[0].delta.tool_calls[0];
         assert_eq!(tc.id.as_deref(), Some("call_1"));
-        assert_eq!(tc.function.as_ref().unwrap().name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            tc.function.as_ref().unwrap().name.as_deref(),
+            Some("get_weather")
+        );
         assert_eq!(
             tc.function.as_ref().unwrap().arguments.as_deref(),
             Some("{\"city\":\"Paris\"}")
@@ -982,7 +1010,9 @@ mod tests {
         assert_eq!(delta_content_text(&Value::Null), None);
         assert_eq!(delta_content_text(&json!("hi")), Some("hi".into()));
         assert_eq!(
-            delta_content_text(&json!([{"type": "text", "text": "a"}, {"type": "output_text", "text": "b"}])),
+            delta_content_text(
+                &json!([{"type": "text", "text": "a"}, {"type": "output_text", "text": "b"}])
+            ),
             Some("ab".into())
         );
         // 非文本 part 忽略，不产出乱码

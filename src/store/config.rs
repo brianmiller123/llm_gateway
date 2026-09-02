@@ -535,15 +535,14 @@ pub async fn replace_provider_models(
             .fetch_all(&mut *tx)
             .await?;
     for m in models {
-        sqlx::query("INSERT INTO models (provider_id, model_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(provider_id)
-            .bind(m)
-            .execute(&mut *tx)
-            .await?;
-        if enabled_patterns
-            .iter()
-            .any(|(p,)| pattern_hits(p, m))
-        {
+        sqlx::query(
+            "INSERT INTO models (provider_id, model_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(provider_id)
+        .bind(m)
+        .execute(&mut *tx)
+        .await?;
+        if enabled_patterns.iter().any(|(p,)| pattern_hits(p, m)) {
             continue;
         }
         // 复用同 provider 已禁用的精确路由（避免重复行），否则新建
@@ -652,10 +651,12 @@ pub async fn load_extra_body_enabled(pool: &PgPool) -> Result<bool, sqlx::Error>
 }
 
 pub async fn save_extra_body_enabled(pool: &PgPool, enabled: bool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE system_settings SET extra_body_enabled = $1, updated_at = now() WHERE id = 1")
-        .bind(enabled)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE system_settings SET extra_body_enabled = $1, updated_at = now() WHERE id = 1",
+    )
+    .bind(enabled)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

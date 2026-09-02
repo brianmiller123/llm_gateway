@@ -42,7 +42,10 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
 /// effort 值是否为「显式关闭推理」（cc-switch reasoning_requested :451-460 同款）。
 /// OpenAI `reasoning_effort` 枚举不含 none，显式关闭时不发字段（默认即关闭）。
 pub fn effort_is_off(effort: &str) -> bool {
-    matches!(effort.trim().to_ascii_lowercase().as_str(), "none" | "off" | "disabled")
+    matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled"
+    )
 }
 
 /// 路由级 `reasoning_effort_mode`（H3，cc-switch effortValueMode 子集）：
@@ -103,7 +106,9 @@ pub fn clamp_reasoning_effort_for<'a>(
                 .or_else(|| {
                     levels
                         .iter()
-                        .filter_map(|level| zen_effort_rank(level).map(|rank| (rank, level.as_str())))
+                        .filter_map(|level| {
+                            zen_effort_rank(level).map(|rank| (rank, level.as_str()))
+                        })
                         .max_by_key(|(rank, _)| *rank)
                 })
                 .map(|(_, level)| level)
@@ -143,8 +148,7 @@ fn zen_effort_levels_for(model: Option<&str>) -> Option<&'static [String]> {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
-                    (!levels.is_empty())
-                        .then(|| (pattern.trim().to_ascii_lowercase(), levels))
+                    (!levels.is_empty()).then(|| (pattern.trim().to_ascii_lowercase(), levels))
                 })
                 .collect()
         });
@@ -174,7 +178,6 @@ pub fn zen_effort_rank(effort: &str) -> Option<u8> {
     }
 }
 
-
 /// H3：对已构建的出站 Chat 请求体应用路由级 effort 钳制模式。
 /// - 显式关闭（none/off/disabled）：openrouter → 改写为 `reasoning: {effort: "none"}`
 ///   忠实转发（M9）；其余模式一律移除字段（OpenAI 枚举不含 none，直发 400）
@@ -189,7 +192,11 @@ pub fn apply_reasoning_effort_mode(body: &mut Value, mode: &str) {
 
 /// P1-10：带 gating model 的版本——zen 模式按模型查档位表
 ///（GATEWAY_ZEN_EFFORT_TABLE；无表 → 完全不发 reasoning_effort）
-pub fn apply_reasoning_effort_mode_for_model(body: &mut Value, mode: &str, gating_model: Option<&str>) {
+pub fn apply_reasoning_effort_mode_for_model(
+    body: &mut Value,
+    mode: &str,
+    gating_model: Option<&str>,
+) {
     let mode = mode.trim();
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -224,7 +231,10 @@ pub fn apply_reasoning_effort_mode_for_model(body: &mut Value, mode: &str, gatin
         obj.remove("reasoning_effort");
         obj.insert("reasoning".into(), serde_json::json!({"effort": clamped}));
     } else {
-        obj.insert("reasoning_effort".into(), serde_json::Value::String(clamped.to_string()));
+        obj.insert(
+            "reasoning_effort".into(),
+            serde_json::Value::String(clamped.to_string()),
+        );
     }
 }
 
@@ -330,11 +340,17 @@ mod tests {
         assert_eq!(clamp_reasoning_effort("medium", "low_high"), Some("high"));
         // openrouter：max 非法 → xhigh；未知丢弃
         assert_eq!(clamp_reasoning_effort("max", "openrouter"), Some("xhigh"));
-        assert_eq!(clamp_reasoning_effort("medium", "openrouter"), Some("medium"));
+        assert_eq!(
+            clamp_reasoning_effort("medium", "openrouter"),
+            Some("medium")
+        );
         assert_eq!(clamp_reasoning_effort("ultra", "openrouter"), Some("xhigh"));
         assert_eq!(clamp_reasoning_effort("bogus", "openrouter"), None);
         // passthrough：已知枚举透传、未知丢弃、显式关闭 → None
-        assert_eq!(clamp_reasoning_effort("xhigh", "passthrough"), Some("xhigh"));
+        assert_eq!(
+            clamp_reasoning_effort("xhigh", "passthrough"),
+            Some("xhigh")
+        );
         assert_eq!(clamp_reasoning_effort("none", "passthrough"), None);
         assert_eq!(clamp_reasoning_effort("bogus", "passthrough"), None);
     }
@@ -401,7 +417,11 @@ mod tests {
         assert!(b4.get("thinking").is_none());
         let mut b5 = serde_json::json!({"enable_thinking": true});
         apply_thinking_form(&mut b5, Some("reasoning_split"));
-        assert_eq!(b5["reasoning_split"], serde_json::json!(true), "客户端显式意图");
+        assert_eq!(
+            b5["reasoning_split"],
+            serde_json::json!(true),
+            "客户端显式意图"
+        );
         // effort 显式关闭：不产出
         let mut b6 = serde_json::json!({"reasoning_effort": "none"});
         apply_thinking_form(&mut b6, Some("thinking_param"));
@@ -411,7 +431,10 @@ mod tests {
     /// P1-10：zen 逐模型档位钳制（cc-switch map_reasoning_effort zen 同款语义）
     #[test]
     fn zen_effort_clamp_per_model_levels() {
-        let levels: Vec<String> = ["low", "high", "max"].iter().map(|s| s.to_string()).collect();
+        let levels: Vec<String> = ["low", "high", "max"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // 请求档 <= 最高合法档 → 向上钳到最近合法档
         assert_eq!(
             clamp_reasoning_effort_for("medium", "zen", Some(&levels)),
@@ -427,10 +450,7 @@ mod tests {
             Some("max")
         );
         // 无表 → 不发
-        assert_eq!(
-            clamp_reasoning_effort_for("high", "zen", None),
-            None
-        );
+        assert_eq!(clamp_reasoning_effort_for("high", "zen", None), None);
         // 请求值无法识别 → None
         assert_eq!(
             clamp_reasoning_effort_for("bogus", "zen", Some(&levels)),

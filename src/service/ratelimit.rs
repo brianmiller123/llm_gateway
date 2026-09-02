@@ -73,7 +73,12 @@ impl RateLimiter {
     /// 检查并消耗一个令牌；失败返回需等待的秒数（rpm<=0 且无余量时为无穷）。
     /// 登录等无主体场景使用；不参与恢复豁免。
     pub fn check(&self, key: &str, rpm: f64, burst: f64) -> Result<(), f64> {
-        self.check_rules_at(now_ts(), &[(key.to_string(), rpm, burst)], None, Duration::ZERO)
+        self.check_rules_at(
+            now_ts(),
+            &[(key.to_string(), rpm, burst)],
+            None,
+            Duration::ZERO,
+        )
     }
 
     /// 多规则原子检查（api_key > user > global，命中即拒）：
@@ -139,12 +144,7 @@ impl RateLimiter {
                 // 首次出现视同长空闲后恢复（冷启动不 429）
                 None => true,
             };
-            ids.insert(
-                id.to_string(),
-                Identity {
-                    last_active: now,
-                },
-            );
+            ids.insert(id.to_string(), Identity { last_active: now });
             idle_gap_ok && idle_exempt > Duration::ZERO
         } else {
             false
@@ -276,7 +276,10 @@ mod tests {
             vec!["global|model:gpt-4o"]
         );
         assert!(matched_rules(&rules, None, None, "gpt-4o-mini").is_empty());
-        assert!(matched_rules(&rules, None, None, "GPT-4O").is_empty(), "大小写敏感");
+        assert!(
+            matched_rules(&rules, None, None, "GPT-4O").is_empty(),
+            "大小写敏感"
+        );
     }
 
     /// 不限模型的规则对所有请求命中（既有行为不变）
@@ -303,7 +306,10 @@ mod tests {
     /// 同请求同时命中限模型与不限模型规则 → 两个桶（最严者先拒）
     #[test]
     fn model_rule_stacks_with_general_rule() {
-        let rules = vec![rule("global", None, None), rule("user", Some(1), Some("m2"))];
+        let rules = vec![
+            rule("global", None, None),
+            rule("user", Some(1), Some("m2")),
+        ];
         assert_eq!(
             keys(&matched_rules(&rules, Some(1), None, "m2")),
             vec!["global", "user:1|model:m2"]
@@ -394,42 +400,77 @@ mod tests {
 
         // alice 暂停前正常活动一次，进入长空闲
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(alice), Duration::from_secs(60))
-                .is_ok()
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(alice),
+                Duration::from_secs(60)
+            )
+            .is_ok()
         );
         now += Duration::from_secs(30);
         // bob（其他会话）耗尽全局桶
         for _ in 0..5 {
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(bob), Duration::from_secs(60))
-                .ok();
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(bob),
+                Duration::from_secs(60),
+            )
+            .ok();
         }
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(bob), Duration::from_secs(60))
-                .is_err()
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(bob),
+                Duration::from_secs(60)
+            )
+            .is_err()
         );
 
         // alice 静默 30s < 60s：无豁免，429
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(alice), Duration::from_secs(60))
-                .is_err(),
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(alice),
+                Duration::from_secs(60)
+            )
+            .is_err(),
             "空闲不足阈值不应豁免"
         );
         // alice 重新静默 60s+（模拟等待用户确认），bob 期间再次耗尽全局桶
         now += Duration::from_secs(120);
         for _ in 0..5 {
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(bob), Duration::from_secs(60))
-                .ok();
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(bob),
+                Duration::from_secs(60),
+            )
+            .ok();
         }
         // alice 恢复：首请求豁免放行
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(alice), Duration::from_secs(60))
-                .is_ok(),
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(alice),
+                Duration::from_secs(60)
+            )
+            .is_ok(),
             "长空闲后恢复的首请求应豁免"
         );
         // 第二个请求立即 429（豁免每空闲间隙仅一次；rpm=1 下桶仍空）
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(alice), Duration::from_secs(60))
-                .is_err(),
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(alice),
+                Duration::from_secs(60)
+            )
+            .is_err(),
             "豁免只覆盖首个请求"
         );
     }
@@ -485,8 +526,6 @@ mod tests {
         assert!(passes < 20, "持续超速压制下不可能全部通过");
     }
 
-
-
     /// 豁免阈值 0 = 功能关闭
     #[test]
     fn exemption_disabled_when_threshold_zero() {
@@ -516,7 +555,9 @@ mod tests {
         ];
         assert!(rl.check_rules_at(now, &rules, None, Duration::ZERO).is_ok());
         // 两个桶各剩 0 令牌
-        let err = rl.check_rules_at(now, &rules, None, Duration::ZERO).unwrap_err();
+        let err = rl
+            .check_rules_at(now, &rules, None, Duration::ZERO)
+            .unwrap_err();
         assert!((err - 1.0).abs() < 1e-9);
         // 单独验证 user:1 桶也已扣减（独立调用直接拒绝）
         let user_rule = vec![("user:1".to_string(), 60.0, 1.0)];
@@ -550,18 +591,33 @@ mod tests {
         let now = Duration::from_secs(1_000);
         let old = "u:8|k:8";
         for _ in 0..5 {
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(old), Duration::from_secs(60))
-                .ok();
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(old),
+                Duration::from_secs(60),
+            )
+            .ok();
         }
         let fresh = "u:7|k:7";
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(fresh), Duration::from_secs(60))
-                .is_ok(),
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(fresh),
+                Duration::from_secs(60)
+            )
+            .is_ok(),
             "全新主体首请求应豁免"
         );
         assert!(
-            rl.check_rules_at(now, &rules_global(1.0, 5.0), Some(fresh), Duration::from_secs(60))
-                .is_err()
+            rl.check_rules_at(
+                now,
+                &rules_global(1.0, 5.0),
+                Some(fresh),
+                Duration::from_secs(60)
+            )
+            .is_err()
         );
     }
 

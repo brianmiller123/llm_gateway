@@ -21,7 +21,9 @@ pub struct Session {
 
 pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Session, AppError> {
     if username.trim().is_empty() || password.is_empty() {
-        return Err(AppError::BadRequest("username and password are required".into()));
+        return Err(AppError::BadRequest(
+            "username and password are required".into(),
+        ));
     }
 
     let ldap_settings = st.ldap.read().clone();
@@ -45,7 +47,9 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
             }
             Err(LdapError::NotConfigured) => {}
             Err(LdapError::BadCredentials) => {
-                return Err(AppError::Unauthorized("invalid username or password".into()));
+                return Err(AppError::Unauthorized(
+                    "invalid username or password".into(),
+                ));
             }
             Err(LdapError::Transport(e)) => {
                 tracing::warn!(username, error = %e, "LDAP unavailable; falling back to local account");
@@ -59,7 +63,9 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Unauthorized("invalid username or password".into()))?;
     let Some(hash) = user.password_hash.clone() else {
-        return Err(AppError::Unauthorized("invalid username or password".into()));
+        return Err(AppError::Unauthorized(
+            "invalid username or password".into(),
+        ));
     };
     let password = password.to_string();
     // argon2 为纯 CPU 同步计算，移出 tokio worker 线程（防并发登录阻塞整个 runtime）
@@ -67,7 +73,9 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
         .await
         .map_err(AppError::internal)?;
     if !ok {
-        return Err(AppError::Unauthorized("invalid username or password".into()));
+        return Err(AppError::Unauthorized(
+            "invalid username or password".into(),
+        ));
     }
     issue_session(st, user).await
 }
@@ -136,7 +144,9 @@ pub async fn logout(st: &AppState, refresh_token: &str) -> Result<(), AppError> 
         .await
         .map_err(AppError::internal)?
     {
-        tokens::revoke(&st.pool, row.id).await.map_err(AppError::internal)?;
+        tokens::revoke(&st.pool, row.id)
+            .await
+            .map_err(AppError::internal)?;
     }
     Ok(())
 }

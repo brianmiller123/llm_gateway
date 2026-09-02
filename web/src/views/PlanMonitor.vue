@@ -11,9 +11,13 @@ const detail = ref<PlanUsageResp | null>(null)
 const detailLoading = ref(false)
 
 const PERIOD_LABELS: Record<string, string> = {
+  hourly: '小时级重置',
   daily: '自然日重置',
   monthly: '自然月重置',
   total: '总量不重置',
+}
+function periodLabel(pt: string, hours?: number): string {
+  return pt === 'hourly' ? `每 ${hours ?? 1} 小时重置` : PERIOD_LABELS[pt] ?? pt
 }
 
 function percent(used: number, limit: number): number {
@@ -189,7 +193,7 @@ onBeforeUnmount(() => {
         <el-card shadow="never">
           <div class="stat-label">总配额</div>
           <div class="stat-value">{{ detail.plan.token_limit_display }}</div>
-          <div class="stat-sub">{{ PERIOD_LABELS[detail.plan.period_type] }}</div>
+          <div class="stat-sub">{{ periodLabel(detail.plan.period_type, detail.plan.period_hours) }}</div>
         </el-card>
       </el-col>
       <el-col :span="8">

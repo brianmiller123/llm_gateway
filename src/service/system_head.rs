@@ -16,7 +16,7 @@
 //! model_routes.system_head_merge），默认关闭，不影响常规上游（多条
 //! system 对 OpenAI 兼容上游是合法输入）。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 将 `messages` 中全部 system 消息收拢到头部。
 /// `merge`：多条 system 时是否拼接为单条（false = 保持多条独立、仅前移）。
@@ -30,9 +30,10 @@ pub(crate) fn collect_system_to_head(messages: &mut Vec<Value>, merge: bool) -> 
     match system_count {
         0 => false,
         1 => {
-            let Some(index) = messages.iter().position(|m| {
-                m.get("role").and_then(|v| v.as_str()) == Some("system")
-            }) else {
+            let Some(index) = messages
+                .iter()
+                .position(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+            else {
                 return false;
             };
             if index > 0 {
@@ -170,7 +171,10 @@ mod tests {
         assert_eq!(msgs[0]["name"], "persona");
         assert_eq!(msgs[0]["content"], "rule A");
         assert_eq!(msgs[1]["role"], "system");
-        assert_eq!(msgs[1]["content"], json!([{"type": "text", "text": "rule B"}]));
+        assert_eq!(
+            msgs[1]["content"],
+            json!([{"type": "text", "text": "rule B"}])
+        );
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(msgs[3]["role"], "assistant");
     }

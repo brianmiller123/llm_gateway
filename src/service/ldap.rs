@@ -119,8 +119,11 @@ pub async fn authenticate(
     }
 
     let work = async {
-        let (conn, mut ldap) =
-            LdapConnAsync::with_settings(LdapConnSettings::new().set_starttls(settings.starttls), &settings.url).await?;
+        let (conn, mut ldap) = LdapConnAsync::with_settings(
+            LdapConnSettings::new().set_starttls(settings.starttls),
+            &settings.url,
+        )
+        .await?;
         ldap3::drive!(conn);
 
         // 服务账号 bind（可选；direct-bind 模式依赖目录匿名读搜索）
@@ -176,10 +179,12 @@ pub async fn test_connection(settings: &LdapSettings) -> Result<String, String> 
         return Err("LDAP URL 为空".into());
     }
     let work = async {
-        let (conn, mut ldap) =
-            LdapConnAsync::with_settings(LdapConnSettings::new().set_starttls(settings.starttls), &settings.url)
-                .await
-                .map_err(|e| format!("连接失败: {e}"))?;
+        let (conn, mut ldap) = LdapConnAsync::with_settings(
+            LdapConnSettings::new().set_starttls(settings.starttls),
+            &settings.url,
+        )
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
         ldap3::drive!(conn);
 
         if let (Some(dn), Some(pw)) = (&settings.bind_dn, &settings.bind_password) {
@@ -233,9 +238,7 @@ fn username_attr(filter: &str) -> &str {
 
 /// 目录用户全量列表（分组 LDAP 同步数据源）。
 /// 过滤器 {0} → * 枚举全部条目；30s 超时（大目录全量拉取）。
-pub async fn list_users(
-    settings: &LdapSettings,
-) -> Result<Vec<LdapUserEntry>, LdapError> {
+pub async fn list_users(settings: &LdapSettings) -> Result<Vec<LdapUserEntry>, LdapError> {
     if !settings.is_configured() {
         return Err(LdapError::NotConfigured);
     }
@@ -285,9 +288,7 @@ pub async fn list_users(
     };
     match timeout(Duration::from_secs(30), work).await {
         Ok(r) => r,
-        Err(_) => Err(LdapError::Transport(
-            "LDAP 用户列表拉取超时（30s）".into(),
-        )),
+        Err(_) => Err(LdapError::Transport("LDAP 用户列表拉取超时（30s）".into())),
     }
 }
 
@@ -337,13 +338,14 @@ async fn match_admin_groups(
         .map(|cn| format!("(cn={cn})"))
         .collect::<Vec<_>>()
         .join("");
-    let filter = format!(
-        "(&(objectClass=groupOfNames)(|{groups_filter})(member={user_dn}))"
-    );
+    let filter = format!("(&(objectClass=groupOfNames)(|{groups_filter})(member={user_dn}))");
     tracing::debug!(filter, user_dn, "LDAP admin group check");
     let search = async {
-        let (conn, mut ldap) =
-            LdapConnAsync::with_settings(LdapConnSettings::new().set_starttls(settings.starttls), &settings.url).await?;
+        let (conn, mut ldap) = LdapConnAsync::with_settings(
+            LdapConnSettings::new().set_starttls(settings.starttls),
+            &settings.url,
+        )
+        .await?;
         ldap3::drive!(conn);
         if let (Some(dn), Some(pw)) = (&settings.bind_dn, &settings.bind_password) {
             let r = ldap.simple_bind(dn, pw).await?;
@@ -363,6 +365,7 @@ async fn match_admin_groups(
 fn dn_has_cn(dn: &str, cns: &[String]) -> bool {
     cns.iter().any(|cn| {
         let target = format!("cn={cn}");
-        dn.split(',').any(|rdn| rdn.trim().eq_ignore_ascii_case(&target))
+        dn.split(',')
+            .any(|rdn| rdn.trim().eq_ignore_ascii_case(&target))
     })
 }

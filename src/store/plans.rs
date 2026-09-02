@@ -5,21 +5,51 @@
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 
+pub const PERIOD_HOURLY: &str = "hourly";
 pub const PERIOD_DAILY: &str = "daily";
 pub const PERIOD_MONTHLY: &str = "monthly";
 pub const PERIOD_TOTAL: &str = "total";
+
+/// hourly 锚点：fixed=UTC 整点网格（锚点=epoch）；join=用户开通时间偏移
+pub const ANCHOR_FIXED: &str = "fixed";
+pub const ANCHOR_JOIN: &str = "join";
 
 pub const OVERAGE_BLOCK: &str = "block";
 pub const OVERAGE_DOWNGRADE: &str = "downgrade";
 pub const OVERAGE_LOG: &str = "log";
 
-pub const VALID_PERIODS: [&str; 3] = [PERIOD_DAILY, PERIOD_MONTHLY, PERIOD_TOTAL];
+pub const VALID_PERIODS: [&str; 4] = [PERIOD_HOURLY, PERIOD_DAILY, PERIOD_MONTHLY, PERIOD_TOTAL];
+pub const VALID_ANCHOR_MODES: [&str; 2] = [ANCHOR_FIXED, ANCHOR_JOIN];
 pub const VALID_OVERAGES: [&str; 3] = [OVERAGE_BLOCK, OVERAGE_DOWNGRADE, OVERAGE_LOG];
 pub const VALID_ALERT_CHANNELS: [&str; 3] = ["in_site", "email", "webhook"];
+
+/// hourly 窗口长度上限（一周）；下限 1 = 每小时
+pub const MAX_PERIOD_HOURS: i32 = 168;
+
+/// 周期配置校验（create/update 共用；纯函数可单测）。
+/// period_hours 仅对 hourly 生效（其余类型任意合法值均被忽略）。
+pub fn validate_period_config(
+    period_type: &str,
+    period_hours: i32,
+    anchor_mode: &str,
+) -> Result<(), String> {
+    if !VALID_PERIODS.contains(&period_type) {
+        return Err(format!("invalid period_type: {period_type}"));
+    }
+    if !VALID_ANCHOR_MODES.contains(&anchor_mode) {
+        return Err(format!("invalid period_anchor_mode: {anchor_mode}"));
+    }
+    if period_type == PERIOD_HOURLY && !(1..=MAX_PERIOD_HOURS).contains(&period_hours) {
+        return Err(format!(
+            "period_hours must be within 1..={MAX_PERIOD_HOURS} for hourly plans"
+        ));
+    }
+    Ok(())
+}
 
 /// "1.5G"/"500M"/"2T"/"1024K"/纯数字 → 精确 token 数（十进制单位，大小写不敏感）
 pub fn parse_token_limit(raw: &str) -> Result<i64, String> {
@@ -78,6 +108,10 @@ pub struct CodingPlan {
     pub priority: i32,
     pub token_limit: i64,
     pub period_type: String,
+    /// hourly 窗口长度（小时，1..=168）；其余类型恒为 1，不参与计算
+    pub period_hours: i32,
+    /// hourly 锚点模式：fixed / join
+    pub period_anchor_mode: String,
     pub overage_action: String,
     pub downgrade_model: Option<String>,
     pub alert_channels: Value,
@@ -96,6 +130,8 @@ pub struct PlanSummary {
     pub priority: i32,
     pub token_limit: i64,
     pub period_type: String,
+    pub period_hours: i32,
+    pub period_anchor_mode: String,
     pub overage_action: String,
     pub downgrade_model: Option<String>,
     pub alert_channels: Value,
@@ -116,6 +152,12 @@ pub struct PlanRuntime {
     pub group_name: String,
     pub token_limit: i64,
     pub period_type: String,
+    /// hourly 窗口长度（小时）；其余类型忽略
+    pub period_hours: i32,
+    /// hourly 锚点：fixed=UTC 整点网格；join=成员 added_at（开通时间）
+    pub period_anchor_mode: String,
+    /// join 锚点数据源；fixed 时不参与计算
+    pub member_since: DateTime<Utc>,
     pub overage_action: String,
     pub downgrade_model: Option<String>,
     pub alert_channels: Vec<String>,
@@ -123,21 +165,42 @@ pub struct PlanRuntime {
 }
 
 impl PlanRuntime {
-    /// 当前统计周期起点（UTC）：daily=当日 / monthly=当月 1 日 / total=常量纪元
-    pub fn period_start(&self, now: DateTime<Utc>) -> NaiveDate {
+    /// 当前统计窗口起点时刻（UTC，纯时间函数）：daily=当日 00:00 / monthly=当月 1 日
+    /// 00:00 / total=常量纪元 / hourly=按锚点与 period_hours 切分的当前桶起点。
+    /// 宕机重启后按墙钟重算即可命中当前窗口——错过整段窗口即自然跳过，无需补偿任务。
+    pub fn period_start(&self, now: DateTime<Utc>) -> DateTime<Utc> {
         match self.period_type.as_str() {
-            PERIOD_DAILY => now.date_naive(),
-            PERIOD_MONTHLY => {
-                NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
-                    .expect("first of month is a valid date")
+            PERIOD_DAILY => now
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc(),
+            PERIOD_MONTHLY => NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                .expect("first of month is a valid date")
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc(),
+            PERIOD_HOURLY => {
+                // 锚点截断到整秒：保证与 DB 侧 extract(epoch)::bigint 桶键完全一致
+                let anchor_ts = match self.period_anchor_mode.as_str() {
+                    ANCHOR_JOIN => self.member_since.timestamp(),
+                    _ => 0, // fixed：epoch 锚点 → UTC 整点网格
+                };
+                let step = (self.period_hours.max(1) as i64).saturating_mul(3600);
+                // now < 锚点（时钟回拨/未来 added_at）钳为 0 → 桶起点 = 锚点
+                let elapsed = (now.timestamp() - anchor_ts).max(0);
+                DateTime::from_timestamp(anchor_ts + elapsed / step * step, 0)
+                    .expect("bucket start is a valid instant")
             }
-            _ => NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is a valid date"),
+            _ => DateTime::<Utc>::UNIX_EPOCH,
         }
     }
 
-    /// 缓存/告警去重键：d:2026-09-01 / m:2026-09 / t
+    /// 缓存/告警去重键：d:2026-09-01 / m:2026-09 / h:1788300000 / t。
+    /// hourly 用桶起点 epoch 秒，与 plan_usage_counters.period_start 一一对应。
     pub fn period_key(&self, now: DateTime<Utc>) -> String {
         match self.period_type.as_str() {
+            PERIOD_HOURLY => format!("h:{}", self.period_start(now).timestamp()),
             PERIOD_DAILY => format!("d:{}", now.date_naive()),
             PERIOD_MONTHLY => format!("m:{}-{:02}", now.year(), now.month()),
             _ => "t".to_string(),
@@ -153,6 +216,9 @@ struct RuntimeRow {
     group_name: String,
     token_limit: i64,
     period_type: String,
+    period_hours: i32,
+    period_anchor_mode: String,
+    member_since: DateTime<Utc>,
     overage_action: String,
     downgrade_model: Option<String>,
     alert_channels: Value,
@@ -161,12 +227,11 @@ struct RuntimeRow {
 }
 
 /// 全量用户 → 生效 Plan（enabled 限定；多分组取 priority 最高、同分取 plan_id 大）
-pub async fn load_plan_runtimes(
-    pool: &PgPool,
-) -> Result<HashMap<i64, PlanRuntime>, sqlx::Error> {
+pub async fn load_plan_runtimes(pool: &PgPool) -> Result<HashMap<i64, PlanRuntime>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RuntimeRow>(
         "SELECT m.user_id, p.id AS plan_id, p.name AS plan_name, g.name AS group_name, \
-                p.token_limit, p.period_type, p.overage_action, p.downgrade_model, \
+                p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
+                m.added_at AS member_since, p.overage_action, p.downgrade_model, \
                 p.alert_channels, p.webhook_url, p.priority \
          FROM user_group_members m \
          JOIN user_groups g ON g.id = m.group_id \
@@ -185,6 +250,9 @@ pub async fn load_plan_runtimes(
             group_name: r.group_name,
             token_limit: r.token_limit,
             period_type: r.period_type,
+            period_hours: r.period_hours,
+            period_anchor_mode: r.period_anchor_mode,
+            member_since: r.member_since,
             overage_action: r.overage_action,
             downgrade_model: r.downgrade_model,
             alert_channels: chan,
@@ -208,6 +276,7 @@ pub async fn load_plan_runtimes(
 pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx::Error> {
     sqlx::query_as::<_, PlanSummary>(
         "SELECT p.id, p.name, p.description, p.priority, p.token_limit, p.period_type, \
+                p.period_hours, p.period_anchor_mode, \
                 p.overage_action, p.downgrade_model, p.alert_channels, p.webhook_url, \
                 p.enabled, p.updated_at, \
                 COALESCE(u.used_tokens, 0)::bigint AS used_tokens, \
@@ -221,9 +290,13 @@ pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx
              FROM plan_usage_counters pc \
              JOIN coding_plans p2 ON p2.id = pc.plan_id \
              WHERE (p2.period_type = 'total') \
-                OR (p2.period_type = 'daily' AND pc.period_start = CURRENT_DATE) \
-                OR (p2.period_type = 'monthly' \
-                    AND pc.period_start = date_trunc('month', CURRENT_DATE)::date) \
+                OR (p2.period_type = 'daily' AND pc.period_start = \
+                    date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+                OR (p2.period_type = 'monthly' AND pc.period_start = \
+                    date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+                OR (p2.period_type = 'hourly' \
+                    AND pc.period_start > now() - make_interval(hours => p2.period_hours) \
+                    AND pc.period_start <= now()) \
              GROUP BY pc.plan_id \
          ) u ON u.plan_id = p.id \
          ORDER BY p.priority DESC, p.id",
@@ -234,8 +307,9 @@ pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx
 
 pub async fn find_plan(pool: &PgPool, id: i64) -> Result<Option<CodingPlan>, sqlx::Error> {
     sqlx::query_as::<_, CodingPlan>(
-        "SELECT id, name, description, priority, token_limit, period_type, overage_action, \
-                downgrade_model, alert_channels, webhook_url, enabled, created_at, updated_at \
+        "SELECT id, name, description, priority, token_limit, period_type, period_hours, \
+                period_anchor_mode, overage_action, downgrade_model, alert_channels, \
+                webhook_url, enabled, created_at, updated_at \
          FROM coding_plans WHERE id = $1",
     )
     .bind(id)
@@ -251,6 +325,8 @@ pub async fn create_plan(
     priority: i32,
     token_limit: i64,
     period_type: &str,
+    period_hours: i32,
+    period_anchor_mode: &str,
     overage_action: &str,
     downgrade_model: Option<&str>,
     alert_channels: &Value,
@@ -259,17 +335,21 @@ pub async fn create_plan(
 ) -> Result<CodingPlan, sqlx::Error> {
     sqlx::query_as::<_, CodingPlan>(
         "INSERT INTO coding_plans \
-           (name, description, priority, token_limit, period_type, overage_action, \
-            downgrade_model, alert_channels, webhook_url, enabled) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
-         RETURNING id, name, description, priority, token_limit, period_type, overage_action, \
-                   downgrade_model, alert_channels, webhook_url, enabled, created_at, updated_at",
+           (name, description, priority, token_limit, period_type, period_hours, \
+            period_anchor_mode, overage_action, downgrade_model, alert_channels, \
+            webhook_url, enabled) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+         RETURNING id, name, description, priority, token_limit, period_type, period_hours, \
+                   period_anchor_mode, overage_action, downgrade_model, alert_channels, \
+                   webhook_url, enabled, created_at, updated_at",
     )
     .bind(name)
     .bind(description)
     .bind(priority)
     .bind(token_limit)
     .bind(period_type)
+    .bind(period_hours)
+    .bind(period_anchor_mode)
     .bind(overage_action)
     .bind(downgrade_model)
     .bind(alert_channels)
@@ -288,6 +368,8 @@ pub async fn update_plan(
     priority: Option<i32>,
     token_limit: Option<i64>,
     period_type: Option<&str>,
+    period_hours: Option<i32>,
+    period_anchor_mode: Option<&str>,
     overage_action: Option<&str>,
     downgrade_model: Option<Option<&str>>,
     alert_channels: Option<&Value>,
@@ -301,23 +383,28 @@ pub async fn update_plan(
            priority = COALESCE($4, priority), \
            token_limit = COALESCE($5, token_limit), \
            period_type = COALESCE($6, period_type), \
-           overage_action = COALESCE($7, overage_action), \
-           downgrade_model = $8, \
-           alert_channels = COALESCE($9, alert_channels), \
-           webhook_url = COALESCE($10, webhook_url), \
-           enabled = COALESCE($11, enabled), \
+           period_hours = COALESCE($7, period_hours), \
+           period_anchor_mode = COALESCE($8, period_anchor_mode), \
+           overage_action = COALESCE($9, overage_action), \
+           downgrade_model = $10, \
+           alert_channels = COALESCE($11, alert_channels), \
+           webhook_url = COALESCE($12, webhook_url), \
+           enabled = COALESCE($13, enabled), \
            updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, name, description, priority, token_limit, period_type, overage_action, \
-                   downgrade_model, alert_channels, webhook_url, enabled, created_at, updated_at",
+         RETURNING id, name, description, priority, token_limit, period_type, period_hours, \
+                   period_anchor_mode, overage_action, downgrade_model, alert_channels, \
+                   webhook_url, enabled, created_at, updated_at",
     )
-    // $8 三态：None=不修改 / Some(None)=清空 / Some(Some(v))=设置
+    // $10 三态：None=不修改 / Some(None)=清空 / Some(Some(v))=设置
     .bind(id)
     .bind(name)
     .bind(description)
     .bind(priority)
     .bind(token_limit)
     .bind(period_type)
+    .bind(period_hours)
+    .bind(period_anchor_mode)
     .bind(overage_action)
     .bind(downgrade_model.map(|o| o.map(str::to_string)))
     .bind(alert_channels)
@@ -338,11 +425,10 @@ pub async fn delete_plan(pool: &PgPool, id: i64) -> Result<Option<i64>, sqlx::Er
     if exists.is_none() {
         return Ok(None);
     }
-    let (groups,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM user_groups WHERE plan_id = $1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let (groups,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_groups WHERE plan_id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM coding_plans WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -360,21 +446,29 @@ pub struct PlanUsageSnapshot {
     pub used: i64,
 }
 
-/// 各启用 Plan 的当期用量快照（缓存重载；只读不清理，与月度缓存同语义）
+/// 各启用 Plan 的当期用量快照（缓存重载；只读不清理，与月度缓存同语义）。
+/// 日期/月份界显式按 UTC 计算（CURRENT_DATE/date_trunc 裸用会随会话时区漂移）；
+/// hourly 以「(now - period_hours, now]」开区间窗命中当前桶（桶起点 ≤ now 恒成立，
+/// 上一桶起点 ≤ now - period_hours 被严格大于排除）。
 pub async fn load_usage_snapshots(pool: &PgPool) -> Result<Vec<PlanUsageSnapshot>, sqlx::Error> {
     sqlx::query_as::<_, PlanUsageSnapshot>(
         "SELECT pc.user_id, pc.plan_id, \
                 CASE p.period_type \
-                  WHEN 'daily' THEN 'd:' || to_char(pc.period_start, 'YYYY-MM-DD') \
-                  WHEN 'monthly' THEN 'm:' || to_char(pc.period_start, 'YYYY-MM') \
+                  WHEN 'daily' THEN 'd:' || to_char(pc.period_start AT TIME ZONE 'UTC', 'YYYY-MM-DD') \
+                  WHEN 'monthly' THEN 'm:' || to_char(pc.period_start AT TIME ZONE 'UTC', 'YYYY-MM') \
+                  WHEN 'hourly' THEN 'h:' || (extract(epoch from pc.period_start)::bigint)::text \
                   ELSE 't' END AS period_key, \
                 SUM(pc.tokens)::bigint AS used \
          FROM plan_usage_counters pc \
          JOIN coding_plans p ON p.id = pc.plan_id AND p.enabled = TRUE \
          WHERE (p.period_type = 'total') \
-            OR (p.period_type = 'daily' AND pc.period_start = CURRENT_DATE) \
-            OR (p.period_type = 'monthly' \
-                AND pc.period_start = date_trunc('month', CURRENT_DATE)::date) \
+            OR (p.period_type = 'daily' AND pc.period_start = \
+                date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+            OR (p.period_type = 'monthly' AND pc.period_start = \
+                date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+            OR (p.period_type = 'hourly' \
+                AND pc.period_start > now() - make_interval(hours => p.period_hours) \
+                AND pc.period_start <= now()) \
          GROUP BY pc.user_id, pc.plan_id, p.period_type, pc.period_start",
     )
     .fetch_all(pool)
@@ -414,12 +508,13 @@ pub async fn plan_daily_trend(
 
 #[derive(sqlx::FromRow, serde::Serialize)]
 pub struct PeriodUsage {
-    pub period_start: NaiveDate,
+    pub period_start: DateTime<Utc>,
     pub tokens: i64,
     pub users: i64,
 }
 
-/// Plan 历史周期用量（计数器即历史快照：daily 逐日、monthly 逐月、total 单行）
+/// Plan 历史周期用量（计数器即历史快照：hourly 逐桶、daily 逐日、monthly 逐月、total 单行；
+/// period_start 为窗口起点时刻 RFC3339 序列化）
 pub async fn plan_period_history(
     pool: &PgPool,
     plan_id: i64,
@@ -493,6 +588,7 @@ pub async fn plan_user_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn parses_units() {
@@ -516,22 +612,172 @@ mod tests {
         assert_eq!(format_token_limit(999), "999");
     }
 
-    #[test]
-    fn period_keys() {
-        let rt = |pt: &str| PlanRuntime {
+    fn rt(pt: &str) -> PlanRuntime {
+        rt_cfg(
+            pt,
+            1,
+            ANCHOR_FIXED,
+            Utc.timestamp_opt(0, 0).single().unwrap(),
+        )
+    }
+
+    fn rt_cfg(pt: &str, hours: i32, anchor: &str, member_since: DateTime<Utc>) -> PlanRuntime {
+        PlanRuntime {
             plan_id: 1,
             plan_name: "p".into(),
             group_name: "g".into(),
             token_limit: 1,
             period_type: pt.into(),
+            period_hours: hours,
+            period_anchor_mode: anchor.into(),
+            member_since,
             overage_action: OVERAGE_BLOCK.into(),
             downgrade_model: None,
             alert_channels: vec![],
             webhook_url: String::new(),
-        };
-        let now = Utc::now();
+        }
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    #[test]
+    fn period_keys() {
+        let now = utc(2026, 9, 2, 10, 30, 0);
         assert_eq!(rt("total").period_key(now), "t");
-        assert!(rt("daily").period_key(now).starts_with("d:"));
-        assert_eq!(rt("monthly").period_key(now).len(), 9);
+        assert_eq!(rt("daily").period_key(now), "d:2026-09-02");
+        assert_eq!(rt("monthly").period_key(now), "m:2026-09");
+        assert!(rt("hourly").period_key(now).starts_with("h:"));
+    }
+
+    #[test]
+    fn legacy_period_starts() {
+        let now = utc(2026, 9, 2, 10, 30, 5);
+        assert_eq!(rt("daily").period_start(now), utc(2026, 9, 2, 0, 0, 0));
+        assert_eq!(rt("monthly").period_start(now), utc(2026, 9, 1, 0, 0, 0));
+        assert_eq!(
+            rt("total").period_start(now),
+            Utc.timestamp_opt(0, 0).single().unwrap()
+        );
+    }
+    #[test]
+    fn hourly_fixed_on_the_hour() {
+        let p = rt_cfg("hourly", 1, ANCHOR_FIXED, utc(2026, 1, 1, 0, 0, 0));
+        // 整点入桶；桶内任意时刻同桶起点
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 10, 0, 0)),
+            utc(2026, 9, 2, 10, 0, 0)
+        );
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 10, 59, 59)),
+            utc(2026, 9, 2, 10, 0, 0)
+        );
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 9, 59, 59)),
+            utc(2026, 9, 2, 9, 0, 0)
+        );
+    }
+
+    #[test]
+    fn hourly_fixed_multi_hour_and_day_rollover() {
+        let p = rt_cfg("hourly", 5, ANCHOR_FIXED, utc(2026, 1, 1, 0, 0, 0));
+        // epoch 锚点 = 纯 UTC 网格：N 整除 24 时才与当日 00:00 对齐；
+        // 2026-09-02 的 5h 网格相位为 03:00（86400 % 18000 = 14400s，跨日相位漂移）
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 4, 59, 59)),
+            utc(2026, 9, 2, 3, 0, 0)
+        );
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 8, 0, 0)),
+            utc(2026, 9, 2, 8, 0, 0)
+        );
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 7, 59, 59)),
+            utc(2026, 9, 2, 3, 0, 0)
+        );
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 2, 0, 0)),
+            utc(2026, 9, 1, 22, 0, 0)
+        );
+        // 跨日网格连续：9/2 02:00 落在 [9/1 22:00, 9/2 03:00) 桶
+        let t = utc(2026, 9, 2, 2, 0, 0);
+        let s = p.period_start(t);
+        assert!(s <= t && t < s + chrono::Duration::hours(5));
+        assert_eq!(s.timestamp() % (5 * 3600), 0);
+        let p7 = rt_cfg("hourly", 7, ANCHOR_FIXED, utc(2026, 1, 1, 0, 0, 0));
+        // 7h 桶不整除 24h：桶起点全部落在 epoch 起的 7h 网格上
+        let got = p7.period_start(utc(2026, 9, 2, 2, 0, 0));
+        assert_eq!(got.timestamp() % (7 * 3600), 0);
+        assert_eq!(
+            p7.period_start(utc(2026, 9, 2, 2, 0, 0)),
+            utc(2026, 9, 1, 20, 0, 0)
+        );
+        assert!(got + chrono::Duration::hours(7) > utc(2026, 9, 2, 2, 0, 0));
+    }
+
+    #[test]
+    fn hourly_join_anchor_offset() {
+        // 开通时间 14:37:05 → 桶起点 14:37:05 / 16:37:05 / ...
+        let joined = utc(2026, 9, 1, 14, 37, 5);
+        let p = rt_cfg("hourly", 2, ANCHOR_JOIN, joined);
+        assert_eq!(p.period_start(utc(2026, 9, 1, 15, 0, 0)), joined);
+        assert_eq!(p.period_start(utc(2026, 9, 1, 16, 37, 4)), joined);
+        assert_eq!(
+            p.period_start(utc(2026, 9, 1, 16, 37, 5)),
+            utc(2026, 9, 1, 16, 37, 5)
+        );
+        assert_eq!(
+            p.period_start(utc(2026, 9, 2, 8, 0, 0)),
+            utc(2026, 9, 2, 6, 37, 5)
+        );
+    }
+
+    #[test]
+    fn hourly_future_anchor_clamps() {
+        // 时钟早于锚点（回拨/预开通）：钳到锚点本身，不产生负槽位
+        let joined = utc(2026, 9, 1, 14, 37, 5);
+        let p = rt_cfg("hourly", 3, ANCHOR_JOIN, joined);
+        assert_eq!(p.period_start(utc(2026, 9, 1, 10, 0, 0)), joined);
+        assert_eq!(
+            p.period_key(utc(2026, 9, 1, 10, 0, 0)),
+            format!("h:{}", joined.timestamp())
+        );
+    }
+
+    #[test]
+    fn hourly_key_is_bucket_epoch() {
+        let p = rt_cfg("hourly", 1, ANCHOR_FIXED, utc(2026, 1, 1, 0, 0, 0));
+        let now = utc(2026, 9, 2, 10, 30, 0);
+        let start = p.period_start(now);
+        assert_eq!(p.period_key(now), format!("h:{}", start.timestamp()));
+        // 相邻桶键不同（告警去重随周期翻转自动重挂）
+        assert_ne!(
+            p.period_key(start),
+            p.period_key(start + chrono::Duration::hours(1))
+        );
+    }
+
+    #[test]
+    fn validates_period_config() {
+        assert!(validate_period_config("hourly", 1, "fixed").is_ok());
+        assert!(validate_period_config("hourly", 168, "join").is_ok());
+        assert!(validate_period_config("hourly", 0, "fixed").is_err());
+        assert!(validate_period_config("hourly", 169, "fixed").is_err());
+        assert!(validate_period_config("monthly", 0, "fixed").is_ok());
+        assert!(validate_period_config("daily", 1, "bogus").is_err());
+        assert!(validate_period_config("weekly", 1, "fixed").is_err());
+    }
+
+    #[test]
+    fn db_bucket_window_parity() {
+        // 模拟 load_usage_snapshots 的 (now - N·h, now] 谓词：当前桶必命中，上一桶必排除
+        let p = rt_cfg("hourly", 2, ANCHOR_JOIN, utc(2026, 9, 1, 14, 0, 0));
+        let now = utc(2026, 9, 1, 17, 30, 0);
+        let cur = p.period_start(now);
+        let prev = cur - chrono::Duration::hours(2);
+        let in_window = |t: DateTime<Utc>| t > now - chrono::Duration::hours(2) && t <= now;
+        assert!(in_window(cur));
+        assert!(!in_window(prev));
     }
 }

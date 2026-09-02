@@ -10,17 +10,17 @@ mod worker;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tower_service::Service;
 use tracing_subscriber::EnvFilter;
 
@@ -70,7 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// HTTPS 服务：hyper-util + tokio-rustls 手动 accept 循环（axum 官方示例同款）
-async fn serve_https(app: Router, cfg: Arc<AppConfig>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn serve_https(
+    app: Router,
+    cfg: Arc<AppConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = rustls_server_config(PathBuf::from(&cfg.tls_key), PathBuf::from(&cfg.tls_cert))?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(cfg.https_addr).await?;
@@ -149,7 +152,9 @@ async fn serve_http_app(
 }
 
 /// HTTP：全部 301 到 HTTPS（Location 端口取自 https_addr，而非请求 Host）
-async fn serve_http_redirect(cfg: Arc<AppConfig>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn serve_http_redirect(
+    cfg: Arc<AppConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port = cfg
         .redirect_https_port
         .unwrap_or_else(|| cfg.https_addr.port());

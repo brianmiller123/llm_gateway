@@ -58,7 +58,9 @@ impl ResponseHistoryStore {
         if arr.is_empty() {
             return;
         }
-        let Ok(serialized) = serde_json::to_vec(&items) else { return };
+        let Ok(serialized) = serde_json::to_vec(&items) else {
+            return;
+        };
         if serialized.len() > MAX_ENTRY_BYTES {
             tracing::warn!(
                 response_id = response_id,
@@ -235,9 +237,10 @@ mod tests {
         }
         assert_eq!(s.len(), MAX_ENTRIES);
         assert!(s.restore("resp_000000000000").is_none(), "最老条目被逐出");
-        assert!(s
-            .restore(&format!("resp_{:012}", MAX_ENTRIES + 4))
-            .is_some());
+        assert!(
+            s.restore(&format!("resp_{:012}", MAX_ENTRIES + 4))
+                .is_some()
+        );
     }
 
     #[test]
@@ -270,9 +273,13 @@ mod tests {
 
     #[test]
     fn enrich_normalizes_string_and_missing_input() {
-        let s = store_with("resp_prev11111111", json!([{ "type": "message", "role": "assistant", "content": [] }]));
+        let s = store_with(
+            "resp_prev11111111",
+            json!([{ "type": "message", "role": "assistant", "content": [] }]),
+        );
         // input 为字符串
-        let mut req = json!({ "model": "m", "previous_response_id": "resp_prev11111111", "input": "hello" });
+        let mut req =
+            json!({ "model": "m", "previous_response_id": "resp_prev11111111", "input": "hello" });
         enrich_request_with_history(&s, &mut req).expect("enrich ok");
         assert_eq!(req["input"].as_array().unwrap().len(), 2);
         assert_eq!(req["input"][0]["role"], "assistant", "历史在前");
@@ -288,7 +295,10 @@ mod tests {
         let s = ResponseHistoryStore::new();
         let mut req = json!({ "model": "m", "previous_response_id": "resp_gone1111111" });
         let err = enrich_request_with_history(&s, &mut req).expect_err("unknown id");
-        assert!(err.contains("unknown previous_response_id"), "错误信息带修复指引: {err}");
+        assert!(
+            err.contains("unknown previous_response_id"),
+            "错误信息带修复指引: {err}"
+        );
     }
 
     #[test]
@@ -308,13 +318,26 @@ mod tests {
         let mut ev = ResponsesStreamEventOut {
             r#type: "response.completed".into(),
             response: None,
-            delta: None, item: None, output_index: None, content_index: None,
-            summary_index: None, item_id: None, part: None, input: None,
-            text: None, arguments: None,
+            delta: None,
+            item: None,
+            output_index: None,
+            content_index: None,
+            summary_index: None,
+            item_id: None,
+            part: None,
+            input: None,
+            text: None,
+            arguments: None,
         };
-        assert!(snapshot_from_events(std::slice::from_ref(&ev)).is_none(), "无 response 载荷");
+        assert!(
+            snapshot_from_events(std::slice::from_ref(&ev)).is_none(),
+            "无 response 载荷"
+        );
         ev.r#type = "response.output_text.delta".into();
-        assert!(snapshot_from_events(std::slice::from_ref(&ev)).is_none(), "非终态事件忽略");
+        assert!(
+            snapshot_from_events(std::slice::from_ref(&ev)).is_none(),
+            "非终态事件忽略"
+        );
         let _ = ev;
     }
 }

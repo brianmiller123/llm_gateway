@@ -8,13 +8,13 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::AppError;
 use crate::service::plans as plan_svc;
@@ -48,7 +48,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/groups/{id}",
-            patch(update_group).delete(delete_group).layer(admin.clone()),
+            patch(update_group)
+                .delete(delete_group)
+                .layer(admin.clone()),
         )
         .route(
             "/api/admin/groups/{id}/members",
@@ -81,9 +83,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         // ---------- SMTP（告警邮件） ----------
         .route(
             "/api/admin/smtp",
-            get(get_smtp)
-                .put(put_smtp)
-                .layer(admin.clone()),
+            get(get_smtp).put(put_smtp).layer(admin.clone()),
         )
         .route("/api/admin/smtp/test", post(test_smtp).layer(admin))
         // ---------- 普通用户 ----------
@@ -101,45 +101,37 @@ fn parse_limit_value(v: &Value) -> Result<i64, AppError> {
             .or_else(|| n.as_f64().map(|f| f as i64))
             .filter(|t| *t > 0)
             .ok_or_else(|| AppError::BadRequest("invalid token_limit".into())),
-        Value::String(s) => {
-            plan_store::parse_token_limit(s).map_err(AppError::BadRequest)
-        }
+        Value::String(s) => plan_store::parse_token_limit(s).map_err(AppError::BadRequest),
         _ => Err(AppError::BadRequest("invalid token_limit".into())),
     }
 }
 
 fn validate_plan_fields(
-    period_type: Option<&str>,
     overage_action: Option<&str>,
     channels: Option<&[String]>,
     overage_action_changed: bool,
     downgrade_model: Option<&Option<String>>,
     st: &AppState,
 ) -> Result<(), AppError> {
-    if let Some(p) = period_type {
-        if !plan_store::VALID_PERIODS.contains(&p) {
-            return Err(AppError::BadRequest(format!("invalid period_type: {p}")));
-        }
-    }
     let mut downgraded = false;
     if let Some(o) = overage_action {
         if !plan_store::VALID_OVERAGES.contains(&o) {
-            return Err(AppError::BadRequest(format!(
-                "invalid overage_action: {o}"
-            )));
+            return Err(AppError::BadRequest(format!("invalid overage_action: {o}")));
         }
         downgraded = o == plan_store::OVERAGE_DOWNGRADE;
     }
     if let Some(ch) = channels {
-        if ch.iter().any(|c| !plan_store::VALID_ALERT_CHANNELS.contains(&c.as_str())) {
+        if ch
+            .iter()
+            .any(|c| !plan_store::VALID_ALERT_CHANNELS.contains(&c.as_str()))
+        {
             return Err(AppError::BadRequest(
                 "invalid alert_channels (use in_site/email/webhook)".into(),
             ));
         }
     }
     // downgrade 需要目标模型且可路由（改写后无路由 = 必然 400，存期拦截）
-    let model_required = downgraded
-        || (overage_action_changed && overage_action.is_none());
+    let model_required = downgraded || (overage_action_changed && overage_action.is_none());
     let _ = model_required;
     if let Some(Some(target)) = downgrade_model {
         let routed = {
@@ -202,6 +194,12 @@ struct PlanCreateReq {
     token_limit: Value,
     #[serde(default = "default_period")]
     period_type: String,
+    /// hourly 窗口长度（小时，1..=168）；非 hourly 类型忽略
+    #[serde(default = "default_period_hours")]
+    period_hours: i32,
+    /// hourly 锚点：fixed=UTC 整点 / join=成员开通时间偏移
+    #[serde(default = "default_anchor_mode")]
+    period_anchor_mode: String,
     #[serde(default = "default_overage")]
     overage_action: String,
     #[serde(default)]
@@ -220,6 +218,12 @@ fn default_period() -> String {
 fn default_overage() -> String {
     plan_store::OVERAGE_BLOCK.into()
 }
+fn default_period_hours() -> i32 {
+    1
+}
+fn default_anchor_mode() -> String {
+    plan_store::ANCHOR_FIXED.into()
+}
 fn default_true() -> bool {
     true
 }
@@ -234,11 +238,10 @@ async fn create_plan(
         return Err(AppError::BadRequest("name is required".into()));
     }
     let limit = parse_limit_value(&req.token_limit)?;
-    let channels: Vec<String> = req
-        .alert_channels
-        .unwrap_or_else(|| vec!["in_site".into()]);
+    let channels: Vec<String> = req.alert_channels.unwrap_or_else(|| vec!["in_site".into()]);
+    plan_store::validate_period_config(&req.period_type, req.period_hours, &req.period_anchor_mode)
+        .map_err(AppError::BadRequest)?;
     validate_plan_fields(
-        Some(&req.period_type),
         Some(&req.overage_action),
         Some(&channels),
         true,
@@ -257,6 +260,8 @@ async fn create_plan(
         req.priority,
         limit,
         &req.period_type,
+        req.period_hours,
+        &req.period_anchor_mode,
         &req.overage_action,
         req.downgrade_model.as_deref(),
         &json!(channels),
@@ -276,7 +281,10 @@ async fn create_plan(
     )
     .await
     .map_err(AppError::internal)?;
-    Ok((StatusCode::CREATED, Json(json!({"plan": plan_row_to_value(&created)}))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"plan": plan_row_to_value(&created)})),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -286,6 +294,8 @@ struct PlanUpdateReq {
     priority: Option<i32>,
     token_limit: Option<Value>,
     period_type: Option<String>,
+    period_hours: Option<i32>,
+    period_anchor_mode: Option<String>,
     overage_action: Option<String>,
     /// Some(None) = 清空；Some(Some(m)) = 设置
     downgrade_model: Option<Option<String>>,
@@ -309,8 +319,16 @@ async fn update_plan(
         None => None,
     };
     let channels_json = req.alert_channels.as_ref().map(|c| json!(c));
+    // 周期配置按「请求字段 ∪ 现值」合并后整体校验（部分更新语义）
+    let eff_type = req.period_type.as_deref().unwrap_or(&before.period_type);
+    let eff_hours = req.period_hours.unwrap_or(before.period_hours);
+    let eff_anchor = req
+        .period_anchor_mode
+        .as_deref()
+        .unwrap_or(&before.period_anchor_mode);
+    plan_store::validate_period_config(eff_type, eff_hours, eff_anchor)
+        .map_err(AppError::BadRequest)?;
     validate_plan_fields(
-        req.period_type.as_deref(),
         req.overage_action.as_deref(),
         req.alert_channels.as_deref(),
         req.overage_action.is_some(),
@@ -333,6 +351,8 @@ async fn update_plan(
         req.priority,
         limit,
         req.period_type.as_deref(),
+        req.period_hours,
+        req.period_anchor_mode.as_deref(),
         req.overage_action.as_deref(),
         req.downgrade_model
             .as_ref()
@@ -400,7 +420,10 @@ async fn delete_plan(
 /// 名称唯一冲突 → 400 可读提示（其余 DB 错误照常 internal）
 fn map_plan_conflict(e: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(db) = &e {
-        if db.constraint().is_some_and(|c| c.contains("coding_plans_name_key")) {
+        if db
+            .constraint()
+            .is_some_and(|c| c.contains("coding_plans_name_key"))
+        {
             return AppError::BadRequest("同名 Coding Plan 已存在".into());
         }
     }
@@ -438,10 +461,9 @@ async fn plan_usage(
     let periods = plan_store::plan_period_history(&st.pool, id, 90)
         .await
         .map_err(AppError::internal)?;
-    let to: NaiveDate = p
-        .to
-        .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
-        .unwrap_or_else(|| Utc::now().date_naive());
+    let to: NaiveDate =
+        p.to.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| Utc::now().date_naive());
     let from: NaiveDate = p
         .from
         .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
@@ -474,21 +496,33 @@ async fn list_alerts(
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
     let limit = p.limit.unwrap_or(100).clamp(1, 500);
-    let rows: Vec<(i64, Option<i64>, String, Option<i64>, String, i16, String, i64, i64, String, Value, chrono::DateTime<Utc>)> =
-        sqlx::query_as(
-            "SELECT id, plan_id, plan_name, user_id, username, level, period_key, \
+    let rows: Vec<(
+        i64,
+        Option<i64>,
+        String,
+        Option<i64>,
+        String,
+        i16,
+        String,
+        i64,
+        i64,
+        String,
+        Value,
+        chrono::DateTime<Utc>,
+    )> = sqlx::query_as(
+        "SELECT id, plan_id, plan_name, user_id, username, level, period_key, \
                     used, limit_tokens, message, delivered, created_at \
              FROM plan_alerts \
              WHERE ($1::smallint IS NULL OR level = $1) \
                AND ($2::bigint IS NULL OR plan_id = $2) \
              ORDER BY id DESC LIMIT $3",
-        )
-        .bind(p.level)
-        .bind(p.plan_id)
-        .bind(limit)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(AppError::internal)?;
+    )
+    .bind(p.level)
+    .bind(p.plan_id)
+    .bind(limit)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(AppError::internal)?;
     let alerts: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -537,9 +571,15 @@ async fn create_group(
     if let Some(pid) = req.plan_id {
         ensure_plan_exists(&st, pid).await?;
     }
-    let group = groups::create_group(&st.pool, name, req.description.trim(), req.plan_id, req.ldap_sync)
-        .await
-        .map_err(map_group_conflict)?;
+    let group = groups::create_group(
+        &st.pool,
+        name,
+        req.description.trim(),
+        req.plan_id,
+        req.ldap_sync,
+    )
+    .await
+    .map_err(map_group_conflict)?;
     st.reload().await.map_err(AppError::internal)?;
     audit::log(
         &st.pool,
@@ -646,7 +686,10 @@ async fn ensure_plan_exists(st: &AppState, plan_id: i64) -> Result<(), AppError>
 
 fn map_group_conflict(e: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(db) = &e {
-        if db.constraint().is_some_and(|c| c.contains("user_groups_name_key")) {
+        if db
+            .constraint()
+            .is_some_and(|c| c.contains("user_groups_name_key"))
+        {
             return AppError::BadRequest("同名分组已存在".into());
         }
     }
@@ -812,7 +855,9 @@ async fn sync_group(
             .await
             .map_err(AppError::internal)?;
             st.reload().await.map_err(AppError::internal)?;
-            Ok(Json(json!({"ok": true, "added": added, "removed": removed})))
+            Ok(Json(
+                json!({"ok": true, "added": added, "removed": removed}),
+            ))
         }
         Err(e) => {
             let _ = groups::record_sync_failure(&st.pool, id, &format!("手动同步失败: {e}")).await;
@@ -994,6 +1039,8 @@ async fn my_plan(
             "name": p.plan_name,
             "group": p.group_name,
             "period_type": p.period_type,
+            "period_hours": p.period_hours,
+            "period_anchor_mode": p.period_anchor_mode,
             "token_limit": p.token_limit,
             "token_limit_display": plan_store::format_token_limit(p.token_limit),
             "overage_action": p.overage_action,
@@ -1023,17 +1070,26 @@ async fn my_notifications(
     user: super::console::ConsoleUser,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = user.user.id;
-    let rows: Vec<(i64, Option<i64>, String, i16, String, i64, i64, Value, chrono::DateTime<Utc>)> =
-        sqlx::query_as(
-            "SELECT id, plan_id, plan_name, level, period_key, used, limit_tokens, \
+    let rows: Vec<(
+        i64,
+        Option<i64>,
+        String,
+        i16,
+        String,
+        i64,
+        i64,
+        Value,
+        chrono::DateTime<Utc>,
+    )> = sqlx::query_as(
+        "SELECT id, plan_id, plan_name, level, period_key, used, limit_tokens, \
                     delivered, created_at \
              FROM plan_alerts WHERE user_id = $1 \
              ORDER BY id DESC LIMIT 50",
-        )
-        .bind(uid)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(AppError::internal)?;
+    )
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(AppError::internal)?;
     let notifications: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -1046,4 +1102,3 @@ async fn my_notifications(
         .collect();
     Ok(Json(json!({ "notifications": notifications })))
 }
-

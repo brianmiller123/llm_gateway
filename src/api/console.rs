@@ -2,8 +2,8 @@
 //! 所有端点均需 Bearer JWT；管理员端点额外校验 is_admin。
 
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
-use axum::http::request::Parts;
 use axum::http::header;
+use axum::http::request::Parts;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -53,10 +53,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
                 .put(put_user_access)
                 .layer(admin.clone()),
         )
-        .route(
-            "/api/admin/usage",
-            get(admin_usage).layer(admin.clone()),
-        )
+        .route("/api/admin/usage", get(admin_usage).layer(admin.clone()))
         .route(
             "/api/admin/usage/trend",
             get(admin_usage_trend).layer(admin.clone()),
@@ -102,7 +99,9 @@ impl FromRequestParts<AppState> for ConsoleUser {
             return Err(AppError::Forbidden("account disabled".into()));
         }
         if user.token_version != claims.tv {
-            return Err(AppError::Unauthorized("session revoked, please login again".into()));
+            return Err(AppError::Unauthorized(
+                "session revoked, please login again".into(),
+            ));
         }
         Ok(Self { user })
     }
@@ -133,7 +132,9 @@ pub(crate) async fn require_admin(
         return Err(AppError::Forbidden("account disabled".into()));
     }
     if user.token_version != claims.tv {
-        return Err(AppError::Unauthorized("session revoked, please login again".into()));
+        return Err(AppError::Unauthorized(
+            "session revoked, please login again".into(),
+        ));
     }
     if !user.is_admin {
         return Err(AppError::Forbidden("admin privileges required".into()));
@@ -233,13 +234,12 @@ async fn me(State(st): State<AppState>, user: ConsoleUser) -> Result<impl IntoRe
     .fetch_optional(&st.pool)
     .await
     .map_err(AppError::internal)?;
-    let key_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 1",
-    )
-    .bind(user.user.id)
-    .fetch_one(&st.pool)
-    .await
-    .map_err(AppError::internal)?;
+    let key_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 1")
+            .bind(user.user.id)
+            .fetch_one(&st.pool)
+            .await
+            .map_err(AppError::internal)?;
 
     Ok(Json(json!({
         "user": user_json(&user.user),
@@ -269,13 +269,12 @@ async fn create_key(
     if name.is_empty() || name.len() > 64 {
         return Err(AppError::BadRequest("key name must be 1-64 chars".into()));
     }
-    let active: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 1",
-    )
-    .bind(user.user.id)
-    .fetch_one(&st.pool)
-    .await
-    .map_err(AppError::internal)?;
+    let active: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 1")
+            .bind(user.user.id)
+            .fetch_one(&st.pool)
+            .await
+            .map_err(AppError::internal)?;
     if active.0 >= 10 {
         return Err(AppError::BadRequest("max 10 active keys per user".into()));
     }
@@ -335,7 +334,9 @@ async fn revoke_key(
         .await
         .map_err(AppError::internal)?
     {
-        return Err(AppError::BadRequest("key not found or not owned by you".into()));
+        return Err(AppError::BadRequest(
+            "key not found or not owned by you".into(),
+        ));
     }
     audit::log(
         &st.pool,
@@ -411,7 +412,10 @@ struct DailyStat {
 }
 
 /// 我的用量：当月按模型汇总 + 近 7 日每日汇总
-async fn usage(State(st): State<AppState>, user: ConsoleUser) -> Result<impl IntoResponse, AppError> {
+async fn usage(
+    State(st): State<AppState>,
+    user: ConsoleUser,
+) -> Result<impl IntoResponse, AppError> {
     let month = Utc::now().format("%Y-%m").to_string();
     let by_model: Vec<ModelStat> = sqlx::query_as(
         "SELECT model, COUNT(*)::bigint AS call_count, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, \
@@ -1042,7 +1046,11 @@ async fn usage_trend(
     user: ConsoleUser,
 ) -> Result<impl IntoResponse, AppError> {
     let days = params.days.unwrap_or(30).clamp(1, 90);
-    let model = params.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let model = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
     let models = fetch_models(&st.pool, Some(user.user.id)).await?;
     if params.granularity.as_deref() == Some("half_hour") {
         let daily = fetch_trend_half_hour(&st.pool, Some(user.user.id), model).await?;
@@ -1072,7 +1080,11 @@ async fn admin_usage_trend(
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
     let days = params.days.unwrap_or(30).clamp(1, 90);
-    let model = params.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let model = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
     let models = fetch_models(&st.pool, None).await?;
     if params.granularity.as_deref() == Some("half_hour") {
         let daily = fetch_trend_half_hour(&st.pool, None, model).await?;
@@ -1130,7 +1142,9 @@ async fn create_user(
         return Err(AppError::BadRequest("username must be 1-64 chars".into()));
     }
     if req.password.len() < 8 {
-        return Err(AppError::BadRequest("password must be at least 8 chars".into()));
+        return Err(AppError::BadRequest(
+            "password must be at least 8 chars".into(),
+        ));
     }
     let display_name = req
         .display_name
@@ -1138,11 +1152,10 @@ async fn create_user(
         .filter(|s| !s.is_empty());
     let password = req.password.clone();
     // argon2 为纯 CPU 同步计算，移出 tokio worker 线程
-    let hash = tokio::task::spawn_blocking(move || {
-        crate::service::session::hash_password(&password)
-    })
-    .await
-    .map_err(AppError::internal)?;
+    let hash =
+        tokio::task::spawn_blocking(move || crate::service::session::hash_password(&password))
+            .await
+            .map_err(AppError::internal)?;
     let created = match users::create_local_user(
         &st.pool,
         &username,
@@ -1154,7 +1167,7 @@ async fn create_user(
     {
         Ok(u) => u,
         Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-            return Err(AppError::BadRequest("username already exists".into()))
+            return Err(AppError::BadRequest("username already exists".into()));
         }
         Err(e) => return Err(AppError::internal(e)),
     };
@@ -1264,7 +1277,10 @@ async fn reset_password(
     Json(req): Json<ResetPasswordReq>,
 ) -> Result<impl IntoResponse, AppError> {
     let actor = admin.id;
-    let Some(target) = users::find_by_id(&st.pool, id).await.map_err(AppError::internal)? else {
+    let Some(target) = users::find_by_id(&st.pool, id)
+        .await
+        .map_err(AppError::internal)?
+    else {
         return Err(AppError::BadRequest("user not found".into()));
     };
     if target.source != "local" {
@@ -1273,15 +1289,16 @@ async fn reset_password(
         ));
     }
     if req.password.len() < 8 {
-        return Err(AppError::BadRequest("password must be at least 8 chars".into()));
+        return Err(AppError::BadRequest(
+            "password must be at least 8 chars".into(),
+        ));
     }
     let password = req.password.clone();
     // argon2 为纯 CPU 同步计算，移出 tokio worker 线程
-    let hash = tokio::task::spawn_blocking(move || {
-        crate::service::session::hash_password(&password)
-    })
-    .await
-    .map_err(AppError::internal)?;
+    let hash =
+        tokio::task::spawn_blocking(move || crate::service::session::hash_password(&password))
+            .await
+            .map_err(AppError::internal)?;
     users::set_password_hash(&st.pool, id, &hash)
         .await
         .map_err(AppError::internal)?;
@@ -1357,9 +1374,7 @@ async fn put_user_access(
                 .map_err(AppError::internal)?
                 .is_none()
             {
-                return Err(AppError::BadRequest(format!(
-                    "provider {pid} not found"
-                )));
+                return Err(AppError::BadRequest(format!("provider {pid} not found")));
             }
         }
         let pat = r

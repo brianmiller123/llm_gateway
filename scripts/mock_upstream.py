@@ -5,6 +5,7 @@
 """
 import gzip as _gzip
 import json
+import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -20,10 +21,50 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/1/status":
+            self._status()
+            return
         if self.path == "/v1/models":
             self._json(200, {"object": "list", "data": [{"id": "mock-1", "object": "model"}]})
         else:
             self._json(404, {"error": "not found"})
+
+    def _status(self):
+        """/1/status 健康探测端点：模式控制返回形态（状态页冒烟用）。
+        ok(默认)/degraded/down/html/shapeless/404/500/timeout。
+        模式来源：/tmp/mock_status_mode 文件 > MOCK_STATUS_MODE 环境变量（免重启切换）"""
+        try:
+            with open("/tmp/mock_status_mode") as f:
+                mode = f.read().strip()
+        except OSError:
+            mode = os.environ.get("MOCK_STATUS_MODE", "ok")
+        if mode == "timeout":
+            time.sleep(120)  # 探测方超时先行，本响应永不返回
+            return
+        if mode == "404":
+            self._json(404, {"error": "not found"})
+            return
+        if mode == "500":
+            self._json(500, {"error": "boom"})
+            return
+        if mode == "html":
+            body = b"<html><body>login page</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if mode == "shapeless":
+            self._json(200, {"foo": 1})
+            return
+        if mode == "degraded":
+            self._json(200, {"status": "degraded", "service": "mock-upstream"})
+            return
+        if mode == "down":
+            self._json(200, {"status": "down"})
+            return
+        self._json(200, {"status": "ok", "service": "mock-upstream", "version": "1.0.0"})
 
     def do_POST(self):
         if self.path == "/v1/responses":

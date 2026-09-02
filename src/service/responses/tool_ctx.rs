@@ -77,7 +77,8 @@ impl ToolContext {
     /// M6：chat 名是否为请求声明的 custom 工具（还原 custom_tool_call item）
     #[allow(dead_code)]
     pub fn is_custom(&self, chat_name: &str) -> bool {
-        self.lookup(chat_name).is_some_and(|s| s.kind == ToolKind::Custom)
+        self.lookup(chat_name)
+            .is_some_and(|s| s.kind == ToolKind::Custom)
     }
 
     /// 响应/历史侧：原始名（+可选 namespace）→ chat 名。
@@ -98,7 +99,8 @@ impl ToolContext {
             return;
         }
         if let Some(ns) = spec.namespace.clone() {
-            self.ns_lookup.insert((ns, spec.name.clone()), chat_name.clone());
+            self.ns_lookup
+                .insert((ns, spec.name.clone()), chat_name.clone());
         }
         self.specs.insert(chat_name, spec);
     }
@@ -113,7 +115,11 @@ impl ToolContext {
         self.add_chat_tool(
             chat_name,
             ToolSpec {
-                kind: if namespace.is_some() { ToolKind::Namespace } else { ToolKind::Function },
+                kind: if namespace.is_some() {
+                    ToolKind::Namespace
+                } else {
+                    ToolKind::Function
+                },
                 name: original_name,
                 namespace: namespace.map(str::to_string),
             },
@@ -123,7 +129,11 @@ impl ToolContext {
     fn add_custom_tool(&mut self, name: &str) {
         self.add_chat_tool(
             name.to_string(),
-            ToolSpec { kind: ToolKind::Custom, name: name.to_string(), namespace: None },
+            ToolSpec {
+                kind: ToolKind::Custom,
+                name: name.to_string(),
+                namespace: None,
+            },
         );
     }
 
@@ -262,15 +272,26 @@ mod tests {
                 {"type": "tool_search"}
             ]
         }));
-        let spec = ctx.lookup("mcp__server__query").expect("flattened name registered");
+        let spec = ctx
+            .lookup("mcp__server__query")
+            .expect("flattened name registered");
         assert_eq!(spec.kind, ToolKind::Namespace);
         assert_eq!(spec.name, "query");
         assert_eq!(spec.namespace.as_deref(), Some("mcp__server"));
-        assert!(ctx.lookup("plain").is_some_and(|s| s.kind == ToolKind::Function));
+        assert!(
+            ctx.lookup("plain")
+                .is_some_and(|s| s.kind == ToolKind::Function)
+        );
         assert!(ctx.is_custom("apply_patch"));
-        assert!(ctx.lookup("tool_search").is_some_and(|s| s.kind == ToolKind::ToolSearch));
+        assert!(
+            ctx.lookup("tool_search")
+                .is_some_and(|s| s.kind == ToolKind::ToolSearch)
+        );
         // 历史侧即时拍平与注册名一致
-        assert_eq!(ctx.chat_name_for("query", Some("mcp__server")), "mcp__server__query");
+        assert_eq!(
+            ctx.chat_name_for("query", Some("mcp__server")),
+            "mcp__server__query"
+        );
     }
 
     #[test]

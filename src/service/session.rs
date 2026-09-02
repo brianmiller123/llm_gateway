@@ -1,8 +1,8 @@
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, SaltString};
+use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordVerifier};
 use chrono::Utc;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use sha2::Digest;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 
 use crate::error::AppError;
 use crate::store::users::UserRow;
@@ -99,7 +99,8 @@ mod tests {
         let token = issue_access(&secret, &user, 900).unwrap();
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_required_spec_claims(&["exp", "sub"]);
-        let raw = jsonwebtoken::decode::<Claims>(&token, &DecodingKey::from_secret(&secret), &validation);
+        let raw =
+            jsonwebtoken::decode::<Claims>(&token, &DecodingKey::from_secret(&secret), &validation);
         if let Err(e) = &raw {
             println!("DECODE ERR: kind={:?}", e.kind());
         }

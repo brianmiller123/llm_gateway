@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::net::IpAddr;
 use uuid::Uuid;
@@ -29,12 +29,12 @@ pub struct UsageMeta {
 }
 
 /// Coding Plan 计量载荷：生效 Plan 存在时随请求携带（proxy 期解析自 PlanRuntime）。
-/// period_start 由 PlanRuntime.period_start(now) 按周期类型解析（UTC）；
-/// period_key 用于内存缓存周期翻转判定。
+/// period_start 由 PlanRuntime.period_start(now) 按周期类型解析（UTC 时刻，hourly
+/// 为小时桶起点）；period_key 用于内存缓存周期翻转判定。
 #[derive(Debug, Clone)]
 pub struct PlanBill {
     pub plan_id: i64,
-    pub period_start: NaiveDate,
+    pub period_start: DateTime<Utc>,
     pub period_key: String,
 }
 /// Responses API 用 input/output_tokens；缺失字段自动回退为 None（记账按 0 计）。
@@ -54,7 +54,11 @@ pub struct Usage {
     #[serde(default, alias = "cache_read_input_tokens")]
     pub cache_read_tokens: Option<i64>,
     /// 缓存写入 token（prompt_tokens 已包含）；Anthropic 名 cache_creation_input_tokens
-    #[serde(default, alias = "cache_creation_input_tokens", alias = "cache_write_input_tokens")]
+    #[serde(
+        default,
+        alias = "cache_creation_input_tokens",
+        alias = "cache_write_input_tokens"
+    )]
     pub cache_write_tokens: Option<i64>,
 }
 
@@ -167,11 +171,10 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
     // 串行化并发聚合器：后到者阻塞至此事务提交，读到新水位
-    let watermark: (i64,) = sqlx::query_as(
-        "SELECT watermark_id FROM aggregation_state WHERE id = 1 FOR UPDATE",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    let watermark: (i64,) =
+        sqlx::query_as("SELECT watermark_id FROM aggregation_state WHERE id = 1 FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await?;
 
     // 单语句完成聚合 + 水位推进：整条语句共享同一快照
     // 注意：不能用 `\` 续行拼接 SQL（会吞掉换行和缩进导致 token 粘连）

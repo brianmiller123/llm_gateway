@@ -14,7 +14,7 @@
 //! - tool_result 媒体走共享递归抽取器（tool_media::split_tool_output），
 //!   搬运媒体带 per-call 来源标注
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::service::canonical::canonical_json_string;
 
@@ -69,10 +69,18 @@ pub fn anthropic_request_to_chat(
     // Anthropic max_tokens 必填；缺失按上游兼容交给 Chat 端默认（不注入）。
     // o 系列模型（o1/o3/o4…）只认 max_completion_tokens（cc-switch T:58-64 同款；
     // H1：按映射后上游模型判定，避免 claude-* 映射到 o 系时输出上限静默丢失）
-    if let Some(max) = req.get("max_tokens").and_then(|m| m.as_u64()).filter(|m| *m > 0) {
+    if let Some(max) = req
+        .get("max_tokens")
+        .and_then(|m| m.as_u64())
+        .filter(|m| *m > 0)
+    {
         let bare = gating_model.rsplit('/').next().unwrap_or(gating_model);
         let is_o_series = crate::service::model_family::is_openai_o_series(bare);
-        let key = if is_o_series { "max_completion_tokens" } else { "max_tokens" };
+        let key = if is_o_series {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
         out.insert(key.into(), json!(max));
     }
     // L10：Anthropic 规范字段为 metadata.user_id（此前读 /metadata/user 永远取不到）
@@ -116,7 +124,11 @@ pub fn anthropic_request_to_chat(
             // 四-1：disable_parallel_tool_use → Chat parallel_tool_calls:false
             //（cc-switch transform_codex_anthropic.rs:427-435 反方向映射）
             if let Some(obj) = req.get("tool_choice").and_then(|t| t.as_object()) {
-                if obj.get("disable_parallel_tool_use").and_then(|v| v.as_bool()) == Some(true) {
+                if obj
+                    .get("disable_parallel_tool_use")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                {
                     out.insert("parallel_tool_calls".into(), json!(false));
                 }
             }
@@ -125,7 +137,6 @@ pub fn anthropic_request_to_chat(
 
     Ok(Value::Object(out))
 }
-
 
 /// Anthropic thinking / output_config.effort → OpenAI reasoning_effort
 /// （cc-switch transform.rs:94-124 同款）：
@@ -203,12 +214,13 @@ fn strip_billing_header(text: &str) -> String {
     }
 }
 
-
 /// 模型名或渠道 base_url 是否命中"要求 tool-call 消息带 reasoning_content"的厂商
 ///（cc-switch should_preserve_reasoning_content_for_openai_chat：模型名或
 /// base_url 任一命中 vendor hint，防模型映射改名后 quirk 失效）
 fn requires_reasoning_content(model: &str, base_url: &str) -> bool {
-    let model_hit = REASONING_VENDOR_HINTS.iter().any(|h| model.to_lowercase().contains(h));
+    let model_hit = REASONING_VENDOR_HINTS
+        .iter()
+        .any(|h| model.to_lowercase().contains(h));
     let url_hit = base_url
         .to_lowercase()
         .split('/')
@@ -236,7 +248,9 @@ fn convert_message_to_chat(
             messages.push(json!({"role": role, "content": s}));
             return Ok(());
         }
-        Some(Value::Array(blocks)) => convert_blocks_to_chat(&role, blocks, messages, vendor_requires_reasoning),
+        Some(Value::Array(blocks)) => {
+            convert_blocks_to_chat(&role, blocks, messages, vendor_requires_reasoning)
+        }
         // content 缺失：占位 null（Chat 端允许 content:null）
         None => {
             messages.push(json!({"role": role, "content": null}));
@@ -351,7 +365,10 @@ fn convert_blocks_to_chat(
         }
         let content: Value = if text_parts.is_empty() {
             Value::Null
-        } else if text_parts.iter().all(|p| p.get("type").and_then(|t| t.as_str()) == Some("text")) {
+        } else if text_parts
+            .iter()
+            .all(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        {
             // 全文本块 → 纯字符串（Chat 端最通用形态）
             Value::String(
                 text_parts
@@ -386,7 +403,9 @@ fn convert_blocks_to_chat(
     // user：媒体消息先冲刷（与 tool 消息相邻、先于本回合普通文本），
     // 再压入剩余文本/媒体块（tool_result 已独立成 tool 消息）
     if !pending_media.is_empty() {
-        messages.push(json!({"role": "user", "content": Value::Array(std::mem::take(&mut pending_media))}));
+        messages.push(
+            json!({"role": "user", "content": Value::Array(std::mem::take(&mut pending_media))}),
+        );
     }
     if !text_parts.is_empty() {
         let content: Value = if text_parts.len() == 1
@@ -452,9 +471,9 @@ fn convert_tool_choice(choice: Option<&Value>) -> Option<Value> {
                 let name = obj.get("name").and_then(|n| n.as_str())?;
                 Some(json!({"type": "function", "function": {"name": name}}))
             }
-            Some("auto" | "none" | "any") => map_tool_choice_mode(
-                obj.get("type").and_then(|t| t.as_str()).unwrap_or(""),
-            ),
+            Some("auto" | "none" | "any") => {
+                map_tool_choice_mode(obj.get("type").and_then(|t| t.as_str()).unwrap_or(""))
+            }
             // L12：未知 type 的对象整体透传（上游裁决）；无 type 亦透传
             _ => Some(choice.clone()),
         },
@@ -613,7 +632,10 @@ mod tests {
         // user 文本 + 图片
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"][0]["type"], "text");
-        assert_eq!(msgs[1]["content"][1]["image_url"]["url"], "data:image/png;base64,aGk=");
+        assert_eq!(
+            msgs[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGk="
+        );
         // assistant tool_calls + reasoning_content（deepseek vendor hint）
         assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[2]["content"], Value::Null);
@@ -621,7 +643,10 @@ mod tests {
         assert_eq!(tc["id"], "toolu_1");
         assert_eq!(tc["function"]["name"], "get_weather");
         // canonical args（键已排序）
-        assert_eq!(tc["function"]["arguments"], r#"{"city":"Paris","unit":"c"}"#);
+        assert_eq!(
+            tc["function"]["arguments"],
+            r#"{"city":"Paris","unit":"c"}"#
+        );
         assert_eq!(msgs[2]["reasoning_content"], "user wants weather");
         // tool_result → tool 消息先于 user 文本
         assert_eq!(msgs[3]["role"], "tool");
@@ -744,8 +769,14 @@ mod tests {
         let out = anthropic_request_to_chat(&req, req["model"].as_str().unwrap_or(""), "").unwrap();
         let params = &out["tools"][0]["function"]["parameters"];
         assert_eq!(params["type"], "object", "根 type 强制 object");
-        assert_eq!(params["properties"]["n"]["type"], "integer", "properties 保留");
-        assert!(params["properties"]["u"].get("format").is_none(), "format:uri 剥离");
+        assert_eq!(
+            params["properties"]["n"]["type"], "integer",
+            "properties 保留"
+        );
+        assert!(
+            params["properties"]["u"].get("format").is_none(),
+            "format:uri 剥离"
+        );
         assert_eq!(params["required"], json!(["u"]));
     }
 
@@ -791,7 +822,10 @@ mod tests {
 
     #[test]
     fn tool_choice_mapping() {
-        assert_eq!(convert_tool_choice(Some(&json!("any"))), Some(json!("required")));
+        assert_eq!(
+            convert_tool_choice(Some(&json!("any"))),
+            Some(json!("required"))
+        );
         assert_eq!(
             convert_tool_choice(Some(&json!({"type": "tool", "name": "f"}))),
             Some(json!({"type": "function", "function": {"name": "f"}}))
@@ -829,15 +863,24 @@ mod tests {
     /// L12：未知 tool_choice 原样透传（此前强制 auto）
     #[test]
     fn tool_choice_unknown_passthrough() {
-        assert_eq!(convert_tool_choice(Some(&json!("future_mode"))), Some(json!("future_mode")));
+        assert_eq!(
+            convert_tool_choice(Some(&json!("future_mode"))),
+            Some(json!("future_mode"))
+        );
         let obj = json!({"type": "future_mode", "extra": 1});
         assert_eq!(convert_tool_choice(Some(&obj)), Some(obj));
         // 无 type 的对象原样透传
         let no_type = json!({"name": "x"});
         assert_eq!(convert_tool_choice(Some(&no_type)), Some(no_type));
         // 已知形态不变
-        assert_eq!(convert_tool_choice(Some(&json!("auto"))), Some(json!("auto")));
-        assert_eq!(convert_tool_choice(Some(&json!("any"))), Some(json!("required")));
+        assert_eq!(
+            convert_tool_choice(Some(&json!("auto"))),
+            Some(json!("auto"))
+        );
+        assert_eq!(
+            convert_tool_choice(Some(&json!("any"))),
+            Some(json!("required"))
+        );
     }
 
     /// 四-1：disable_parallel_tool_use → parallel_tool_calls:false
@@ -858,7 +901,12 @@ mod tests {
             "tools": [{"name": "t", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "auto"}
         });
-        assert!(anthropic_request_to_chat(&req2, req2["model"].as_str().unwrap_or(""), "").unwrap().get("parallel_tool_calls").is_none());
+        assert!(
+            anthropic_request_to_chat(&req2, req2["model"].as_str().unwrap_or(""), "")
+                .unwrap()
+                .get("parallel_tool_calls")
+                .is_none()
+        );
     }
 
     /// L7：超长工具名拍平为 64 字符内前缀 + 16 位十六进制 SHA-256 后缀
@@ -884,7 +932,8 @@ mod tests {
             "model": "o3", "max_tokens": 4096,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let out = anthropic_request_to_chat(&o_req, o_req["model"].as_str().unwrap_or(""), "").unwrap();
+        let out =
+            anthropic_request_to_chat(&o_req, o_req["model"].as_str().unwrap_or(""), "").unwrap();
         assert_eq!(out["max_completion_tokens"], 4096);
         assert!(out.get("max_tokens").is_none());
 
@@ -892,7 +941,9 @@ mod tests {
             "model": "deepseek-chat", "max_tokens": 2048,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let out = anthropic_request_to_chat(&plain_req, plain_req["model"].as_str().unwrap_or(""), "").unwrap();
+        let out =
+            anthropic_request_to_chat(&plain_req, plain_req["model"].as_str().unwrap_or(""), "")
+                .unwrap();
         assert_eq!(out["max_tokens"], 2048);
         assert!(out.get("max_completion_tokens").is_none());
     }
@@ -933,8 +984,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let out = anthropic_request_to_chat(&req, "deepseek-chat", "").unwrap();
-        let names: Vec<&str> = out["tools"].as_array().unwrap().iter()
-            .map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names, vec!["keep"]);
     }
 
@@ -942,10 +997,13 @@ mod tests {
     #[test]
     fn tool_result_media_clamped_with_marker() {
         let huge_b64 = "Abc+/123=".repeat(2_000);
-        let (content, media) = tool_result_content_with_media(Some(&json!([
-            {"type": "text", "text": huge_b64},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
-        ])), "toolu_1");
+        let (content, media) = tool_result_content_with_media(
+            Some(&json!([
+                {"type": "text", "text": huge_b64},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+            ])),
+            "toolu_1",
+        );
         // L15：媒体带 per-call 来源标注
         assert_eq!(media.len(), 2, "标注 + 图片");
         assert_eq!(media[0]["type"], "text");
@@ -954,15 +1012,15 @@ mod tests {
             content.contains(crate::service::tool_media::MEDIA_MOVED_MARKER),
             "搬移标记存在: {content}"
         );
-        assert!(
-            content.contains("omitted"),
-            "残余 base64 被钳制: {content}"
-        );
+        assert!(content.contains("omitted"), "残余 base64 被钳制: {content}");
         assert!(!content.contains("Abc+/"), "原始 base64 不残留");
         // 无媒体时文本原样
-        let (content, media) = tool_result_content_with_media(Some(&json!([
-            {"type": "text", "text": "plain"}
-        ])), "toolu_1");
+        let (content, media) = tool_result_content_with_media(
+            Some(&json!([
+                {"type": "text", "text": "plain"}
+            ])),
+            "toolu_1",
+        );
         assert!(media.is_empty());
         assert_eq!(content, "plain");
     }

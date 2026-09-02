@@ -57,6 +57,7 @@ pub fn check_and_dispatch(st: &AppState, user_id: i64, plan: &PlanRuntime, used:
 
 pub fn period_label(period_type: &str) -> &'static str {
     match period_type {
+        crate::store::plans::PERIOD_HOURLY => "本时段",
         crate::store::plans::PERIOD_DAILY => "本日",
         crate::store::plans::PERIOD_MONTHLY => "本月",
         _ => "总量",
@@ -119,7 +120,6 @@ async fn dispatch(
     }
     let mut delivered = serde_json::Map::new();
     delivered.insert("in_site".into(), serde_json::json!("ok"));
-
 
     // 邮件：用户本人 + 全部启用管理员（有邮箱者）
     if plan.alert_channels.iter().any(|c| c == "email") {

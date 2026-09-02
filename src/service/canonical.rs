@@ -19,8 +19,9 @@ pub fn canonicalize_json_string_if_parseable(s: &str) -> String {
         return s.to_string();
     }
     match serde_json::from_str::<Value>(trimmed) {
-        Ok(v) if v.is_object() || v.is_array() => serde_json::to_string(&canonical_value(&v))
-            .unwrap_or_else(|_| s.to_string()),
+        Ok(v) if v.is_object() || v.is_array() => {
+            serde_json::to_string(&canonical_value(&v)).unwrap_or_else(|_| s.to_string())
+        }
         _ => s.to_string(),
     }
 }
@@ -71,7 +72,10 @@ mod tests {
     #[test]
     fn canonicalize_keeps_invalid_as_is() {
         assert_eq!(canonicalize_json_string_if_parseable(""), "");
-        assert_eq!(canonicalize_json_string_if_parseable("partial{"), "partial{");
+        assert_eq!(
+            canonicalize_json_string_if_parseable("partial{"),
+            "partial{"
+        );
         assert_eq!(canonicalize_json_string_if_parseable("42"), "42");
         // 纯字符串标量不重排（非对象/数组）
         assert_eq!(canonicalize_json_string_if_parseable("\"x\""), "\"x\"");

@@ -6,11 +6,16 @@ pub fn resolve_route<'a>(routes: &'a [ModelRoute], model: &str) -> Option<&'a Mo
     routes
         .iter()
         .find(|r| r.model_pattern == model)
-        .or_else(|| routes.iter().find(|r| matches_pattern(&r.model_pattern, model)))
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|r| matches_pattern(&r.model_pattern, model))
+        })
 }
 
 /// 通配匹配：仅支持尾缀 `*`（与路由规则同语义）；精确相等也命中
-pub fn matches_pattern(pattern: &str, model: &str) -> bool {    if let Some(prefix) = pattern.strip_suffix('*') {
+pub fn matches_pattern(pattern: &str, model: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
         model.starts_with(prefix)
     } else {
         pattern == model
@@ -59,11 +64,14 @@ pub fn compute_cost(
     };
     // 单价（每百万 token）→ 微美元整数（每百万 token 的价格 × 1e6）
     let micros = |p: f64| (p * 1_000_000.0).round() as i128;
-    let bucket = |tokens: i64, p_micros: i128| (tokens as i128).saturating_mul(p_micros) / 1_000_000;
+    let bucket =
+        |tokens: i64, p_micros: i128| (tokens as i128).saturating_mul(p_micros) / 1_000_000;
     let mut cost_micros: i128 = 0;
     if let Some(t) = input_tokens {
         let cache_read = cache_read_tokens.unwrap_or(0).min(t);
-        let cache_write = cache_write_tokens.unwrap_or(0).min(t.saturating_sub(cache_read));
+        let cache_write = cache_write_tokens
+            .unwrap_or(0)
+            .min(t.saturating_sub(cache_read));
         let fresh = t - cache_read - cache_write;
         if let Some(p) = price.input_price_per_m {
             cost_micros += bucket(fresh, micros(p));

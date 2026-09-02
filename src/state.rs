@@ -9,9 +9,9 @@ use sqlx::PgPool;
 use crate::config::AppConfig;
 use crate::service::ratelimit::RateLimiter;
 use crate::service::usage::UsageCache;
-use crate::store::access::{load_user_access, UserAccessRule};
-use crate::store::rules::{load_prices, load_quotas, load_rules, ModelPrice, RateRule, UserQuota};
-use crate::store::upstream::{load_providers, load_routes, ModelRoute, Provider};
+use crate::store::access::{UserAccessRule, load_user_access};
+use crate::store::rules::{ModelPrice, RateRule, UserQuota, load_prices, load_quotas, load_rules};
+use crate::store::upstream::{ModelRoute, Provider, load_providers, load_routes};
 
 /// 全局应用状态（全部 Clone 廉价）
 #[derive(Clone)]
@@ -47,12 +47,17 @@ pub struct AppState {
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
     pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,
     pub quota_alerts: Arc<Mutex<HashSet<(i64, String)>>>,
+    /// 状态页主动健康探测缓存：provider_id → 最近一次 /1/status 探测结果
+    /// （TTL 30s 内复用；api::status 刷新，见 service::health::snapshot）
+    pub provider_health: Arc<tokio::sync::Mutex<HashMap<i64, crate::service::health::ProbeResult>>>,
     /// Plan 阈值告警进程内去重：(user_id, plan_id, period_key, level)
     pub plan_alerts_seen: Arc<Mutex<HashSet<(i64, i64, String, i16)>>>,
 }
 
 impl AppState {
-    pub async fn init(cfg: Arc<AppConfig>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn init(
+        cfg: Arc<AppConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pool = crate::store::init(&cfg).await?;
         // L22：连接池调优（cc-switch http_client.rs:216-260 同款思想）——
         // 空闲连接 60s 回收、同 host 最多 10 个空闲连接、TCP keepalive 60s。
@@ -112,8 +117,9 @@ impl AppState {
             responses_history: Arc::new(
                 crate::service::responses::history::ResponseHistoryStore::new(),
             ),
-            plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             quota_alerts: Arc::new(Mutex::new(HashSet::new())),
+            plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
+            provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
         state.reload().await?;
         Ok(state)
@@ -213,5 +219,9 @@ impl AppState {
 /// 空串 → None（DB 空字段回退 env 用）
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }

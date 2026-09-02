@@ -8,7 +8,7 @@
 //! - usage 三桶恒等式：OpenAI prompt_tokens 含缓存命中，Anthropic input_tokens 不含
 //!   → input = prompt − cached − cache_creation（saturating）
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::super::responses::dto::Usage as ChatUsage;
 
@@ -82,7 +82,9 @@ pub fn chat_response_to_anthropic(resp: &Value, id: &str) -> Result<Value, Strin
     // content:[] + end_turn 的空成功（Claude Code 会静默收尾卡死 agent loop；
     // 与本模块流式路径 / responses 非流式路径的 #4341 护栏对齐）
     if dropped_tools > 0 && content.is_empty() {
-        return Err("upstream returned tool_calls without function name and no other output".into());
+        return Err(
+            "upstream returned tool_calls without function name and no other output".into(),
+        );
     }
     // finish_reason → stop_reason
     let finish_reason = resp
@@ -139,11 +141,17 @@ pub fn stop_reason_from_finish(finish_reason: &str, has_tool_use: bool) -> Strin
             }
         }
         "content_filter" => {
-            tracing::warn!(finish_reason, "content_filter has no Anthropic stop_reason; mapping to end_turn");
+            tracing::warn!(
+                finish_reason,
+                "content_filter has no Anthropic stop_reason; mapping to end_turn"
+            );
             "end_turn".into()
         }
         other if !other.is_empty() => {
-            tracing::warn!(finish_reason = other, "unknown finish_reason; mapping to end_turn");
+            tracing::warn!(
+                finish_reason = other,
+                "unknown finish_reason; mapping to end_turn"
+            );
             "end_turn".into()
         }
         // 无 finish_reason 但带 tool_use → tool_use（上游常见缺省）
@@ -221,7 +229,10 @@ fn extract_text_and_refusal(message: &Value) -> (String, Option<String>) {
         }
         _ => {}
     }
-    let msg_refusal = message.get("refusal").and_then(|r| r.as_str()).map(str::to_string);
+    let msg_refusal = message
+        .get("refusal")
+        .and_then(|r| r.as_str())
+        .map(str::to_string);
     let refusal = match (part_refusals.is_empty(), &msg_refusal) {
         (false, Some(m)) => Some(format!("{}\n{m}", part_refusals.join("\n"))),
         (false, None) => Some(part_refusals.join("\n")),
@@ -294,7 +305,9 @@ fn legacy_function_call_to_tool_use(fc: &Value, message_id: &str) -> Option<Valu
             .ok()
             .filter(|v| v.is_object())
             .unwrap_or_else(|| json!({})),
-        Some(Value::Object(_)) | Some(Value::Array(_)) => fc.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        Some(Value::Object(_)) | Some(Value::Array(_)) => {
+            fc.get("arguments").cloned().unwrap_or_else(|| json!({}))
+        }
         _ => json!({}),
     };
     let id = fc

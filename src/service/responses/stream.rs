@@ -9,24 +9,24 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use futures_util::stream::{once, Stream, StreamExt};
+use futures_util::stream::{Stream, StreamExt, once};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 use crate::store::usage::UsageMeta;
 
 use super::convert_resp::finish_reason_to_status;
 use super::dto::{
-    delta_content_text, empty_annotations, output_item, summary_part, sse_frame, ChatStreamChunk,
-    IncompleteDetailsOut, ResponsesOutputContentOut, ResponsesOutputOut, ResponsesResponseOut,
-    ResponsesStreamEventOut, ToolCallDelta, Usage as DtoUsage,
+    ChatStreamChunk, IncompleteDetailsOut, ResponsesOutputContentOut, ResponsesOutputOut,
+    ResponsesResponseOut, ResponsesStreamEventOut, ToolCallDelta, Usage as DtoUsage,
+    delta_content_text, empty_annotations, output_item, sse_frame, summary_part,
 };
 
 const EVENT_CREATED: &str = "response.created";
@@ -63,7 +63,6 @@ enum ToolDoneKind {
     ToolSearch,
 }
 
-
 /// 单个 Chat 工具调用（按 Chat choice.delta.tool_calls 的 index 关联）
 #[derive(Debug, Default)]
 struct ChatTool {
@@ -92,8 +91,6 @@ struct ChatTool {
     pending_args: String,
     done: bool,
 }
-
-
 
 /// Chat 流 → Responses 流 状态机
 pub struct ChatToResponsesStreamState {
@@ -162,7 +159,6 @@ impl ChatToResponsesStreamState {
             tool_ctx,
         }
     }
-
 
     /// 消费一个 Chat chunk，产出 0..n 个 Responses 事件。
     /// 上游错误帧（chunk.error）置 failed 状态并停止转换（终态由 finalize 发出）。
@@ -549,9 +545,7 @@ impl ChatToResponsesStreamState {
     /// 供 function_call item 附挂（cc-switch finalize_reasoning +
     /// current_reasoning_text，streaming_codex_chat.rs:161-167 同款）。
     /// 未开启或已关闭 → 空事件 + None（幂等）。
-    fn close_reasoning_for_tool_call(
-        &mut self,
-    ) -> (Vec<ResponsesStreamEventOut>, Option<String>) {
+    fn close_reasoning_for_tool_call(&mut self) -> (Vec<ResponsesStreamEventOut>, Option<String>) {
         if !self.reasoning_started || self.reasoning_done {
             return (Vec::new(), None);
         }
@@ -564,10 +558,7 @@ impl ChatToResponsesStreamState {
             self.reasoning_output("completed"),
         ));
         let text = self.reasoning.trim();
-        (
-            events,
-            (!text.is_empty()).then(|| text.to_string()),
-        )
+        (events, (!text.is_empty()).then(|| text.to_string()))
     }
     /// 工具调用增量：id+name 到齐前不发 output_item.added（cc-switch
     /// flush_ready_tool_calls 语义），参数增量先缓冲、启动后一次性冲刷 ——
@@ -597,7 +588,12 @@ impl ChatToResponsesStreamState {
                     });
                 let last_key = self.last_tool_key;
                 let max_key = self.tools_by_index.keys().copied().max();
-                super::dto::resolve_no_index_tool_key(tool_call.id.as_deref(), key_for_id, last_key, max_key)
+                super::dto::resolve_no_index_tool_key(
+                    tool_call.id.as_deref(),
+                    key_for_id,
+                    last_key,
+                    max_key,
+                )
             }
         };
         self.last_tool_key = Some(chat_index);
@@ -614,9 +610,17 @@ impl ChatToResponsesStreamState {
                 },
             );
         }
-        let tool = self.tools_by_index.get_mut(&chat_index).expect("tool exists");
+        let tool = self
+            .tools_by_index
+            .get_mut(&chat_index)
+            .expect("tool exists");
 
-        if let Some(id) = tool_call.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(id) = tool_call
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             tool.id = id.to_string();
         }
         if let Some(name) = tool_call.function.as_ref().and_then(|f| f.name.as_deref()) {
@@ -723,7 +727,10 @@ impl ChatToResponsesStreamState {
                 break;
             }
             let output_index = self.next_index(OutputRef::Tool(chat_index));
-            let tool = self.tools_by_index.get_mut(&chat_index).expect("tool exists");
+            let tool = self
+                .tools_by_index
+                .get_mut(&chat_index)
+                .expect("tool exists");
             tool.output_index = output_index;
             tool.released = true;
             events.push(ResponsesStreamEventOut {
@@ -766,7 +773,6 @@ impl ChatToResponsesStreamState {
         events
     }
 
-
     /// finish_reason → status（length/content_filter → incomplete）
     fn apply_finish_reason(&mut self, finish_reason: &str) {
         self.finish_reason_seen = true;
@@ -786,10 +792,9 @@ impl ChatToResponsesStreamState {
             self.text_done = true;
             events.push(self.text_done_event());
             events.push(self.content_part_done_event());
-            events.push(self.output_item_done_event(
-                self.text_output_index,
-                self.message_output(status),
-            ));
+            events.push(
+                self.output_item_done_event(self.text_output_index, self.message_output(status)),
+            );
         }
         if self.reasoning_started && !self.reasoning_done {
             self.reasoning_done = true;
@@ -804,7 +809,10 @@ impl ChatToResponsesStreamState {
         indexes.sort_unstable();
         for chat_index in indexes {
             let (output_index, item, kind) = {
-                let tool = self.tools_by_index.get_mut(&chat_index).expect("tool exists");
+                let tool = self
+                    .tools_by_index
+                    .get_mut(&chat_index)
+                    .expect("tool exists");
                 if tool.done {
                     continue;
                 }
@@ -812,7 +820,10 @@ impl ChatToResponsesStreamState {
                 // 缺函数名的调用无法执行：整只丢弃（#4341），不留空 name 的 item
                 if tool.name.is_empty() {
                     self.dropped_tools += 1;
-                    tracing::warn!(chat_index, "dropping streamed tool_call without function name");
+                    tracing::warn!(
+                        chat_index,
+                        "dropping streamed tool_call without function name"
+                    );
                     continue;
                 }
                 // id 缺失时兜底（cc-switch late-start 兜底同款），保持 call_id 可寻址
@@ -892,7 +903,8 @@ impl ChatToResponsesStreamState {
                     // P0-1：done 事件 item_id 用与 item.id 相同的 fc_ 前缀 id
                     let done_item_id = {
                         let tool = self.tools_by_index.get(&chat_index);
-                        tool.map(Self::tool_item_id).unwrap_or_else(|| item.id.clone())
+                        tool.map(Self::tool_item_id)
+                            .unwrap_or_else(|| item.id.clone())
                     };
                     events.push(ResponsesStreamEventOut {
                         r#type: EVENT_FUNCTION_ARGS_DONE.into(),
@@ -1006,7 +1018,11 @@ impl ChatToResponsesStreamState {
         }
     }
 
-    fn output_item_done_event(&self, output_index: i64, item: ResponsesOutputOut) -> ResponsesStreamEventOut {
+    fn output_item_done_event(
+        &self,
+        output_index: i64,
+        item: ResponsesOutputOut,
+    ) -> ResponsesStreamEventOut {
         ResponsesStreamEventOut {
             r#type: EVENT_OUTPUT_ITEM_DONE.into(),
             response: None,
@@ -1060,10 +1076,7 @@ impl ChatToResponsesStreamState {
             tools: None,
             top_p: None,
             truncation: None,
-            usage: self
-                .usage
-                .as_ref()
-                .map(super::dto::usage_from_chat),
+            usage: self.usage.as_ref().map(super::dto::usage_from_chat),
             user: None,
             metadata: None,
         }
@@ -1143,7 +1156,9 @@ impl ChatToResponsesStreamState {
                 arguments: None,
                 query: None,
                 reasoning_content,
-                input: Some(super::dto::custom_tool_input_from_chat_arguments(&canonical_args)),
+                input: Some(super::dto::custom_tool_input_from_chat_arguments(
+                    &canonical_args,
+                )),
                 execution: None,
             };
         }
@@ -1164,7 +1179,9 @@ impl ChatToResponsesStreamState {
                 call_id: Some(tool.id.clone()),
                 name: None,
                 namespace: None,
-                arguments: Some(super::convert_resp::parse_tool_arguments_object(&canonical_args)),
+                arguments: Some(super::convert_resp::parse_tool_arguments_object(
+                    &canonical_args,
+                )),
                 reasoning_content,
                 query: None,
                 input: None,
@@ -1183,11 +1200,7 @@ impl ChatToResponsesStreamState {
             size: String::new(),
             call_id: Some(tool.id.clone()),
             // P0-4：namespace 工具还原原始短名 + namespace 字段
-            name: Some(
-                tool.orig_name
-                    .clone()
-                    .unwrap_or_else(|| tool.name.clone()),
-            ),
+            name: Some(tool.orig_name.clone().unwrap_or_else(|| tool.name.clone())),
             namespace: tool.namespace.clone(),
             arguments: Some(Value::String(
                 crate::service::canonical::canonicalize_json_string_if_parseable(&tool.arguments),
@@ -1245,7 +1258,6 @@ fn parse_web_search_query(arguments: &str) -> Option<String> {
     v.get("query").and_then(|q| q.as_str()).map(str::to_string)
 }
 
-
 /// delta.content → 字符串提取已收敛至 dto::delta_content_text（宽松：兼容
 /// string 与 content-parts 数组两种上游形态）
 
@@ -1258,7 +1270,7 @@ fn extract_stream_error(err: &Value) -> Value {
             let message = err
                 .pointer("/error/message")
                 .and_then(|m| m.as_str())
- .or_else(|| err.get("message").and_then(|m| m.as_str()))
+                .or_else(|| err.get("message").and_then(|m| m.as_str()))
                 .or_else(|| err.get("detail").and_then(|m| m.as_str()))
                 .unwrap_or("upstream stream error")
                 .to_string();
@@ -1343,7 +1355,10 @@ impl ChatSseParser {
             if data == "[DONE]" {
                 done = true;
             } else {
-                out.push(SseEvent { event: event_name, data });
+                out.push(SseEvent {
+                    event: event_name,
+                    data,
+                });
             }
             if done {
                 break;
@@ -1361,11 +1376,7 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2)
         .position(|w| w == b"\n\n")
         .map(|i| i + 2)
-        .or_else(|| {
-            buf.windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|i| i + 4)
-        })
+        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,7 +1481,11 @@ pub fn wrap_chat_stream_to_responses(
                             };
                             if !recorded.swap(true, Ordering::SeqCst) {
                                 crate::service::usage::record(
-                                    &st, &meta, usage.as_ref(), record_status, latency,
+                                    &st,
+                                    &meta,
+                                    usage.as_ref(),
+                                    record_status,
+                                    latency,
                                 )
                                 .await;
                             }
@@ -1631,8 +1646,8 @@ pub fn synthesize_sse_from_chat_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::service::responses::dto::{ChatStreamChoice, ChatStreamDelta, FunctionDelta};
+    use serde_json::json;
 
     fn chunk(
         id: &str,
@@ -1664,9 +1679,17 @@ mod tests {
 
     #[test]
     fn emits_created_then_text_deltas_then_terminal() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "stream-model".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "stream-model".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         let events = state.process_chunk(&chunk("chatcmpl-1", "Hello", None, None, Vec::new()));
-        assert_eq!(events.len(), 5, "created + in_progress + item.added + part.added + text.delta");
+        assert_eq!(
+            events.len(),
+            5,
+            "created + in_progress + item.added + part.added + text.delta"
+        );
         assert_eq!(events[0].r#type, "response.created");
         assert_eq!(events[0].response.as_ref().unwrap().status, "in_progress");
         assert_eq!(events[1].r#type, "response.in_progress");
@@ -1695,7 +1718,10 @@ mod tests {
         assert_eq!(events[1].r#type, "response.content_part.done");
         assert_eq!(events[1].part.as_ref().unwrap().text, "Hello world");
         assert_eq!(events[2].r#type, "response.output_item.done");
-        assert_eq!(events[2].item.as_ref().unwrap().content[0].text, "Hello world");
+        assert_eq!(
+            events[2].item.as_ref().unwrap().content[0].text,
+            "Hello world"
+        );
 
         let events = state.finalize();
         assert_eq!(events.len(), 1);
@@ -1711,7 +1737,11 @@ mod tests {
 
     #[test]
     fn emits_reasoning_before_text() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         let mut c = chunk("id", "", Some("stop"), None, Vec::new());
         c.choices[0].delta.reasoning_content = Some("Deep thought.".into());
         let events = state.process_chunk(&c);
@@ -1735,7 +1765,11 @@ mod tests {
 
     #[test]
     fn correlates_multi_tool_calls_by_index() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         // 两个工具：index 1 先出现（带参数），index 0 后出现（仅名称）
         let events = state.process_chunk(&chunk(
             "id",
@@ -1754,7 +1788,10 @@ mod tests {
         ));
         assert_eq!(events[2].r#type, "response.output_item.added");
         assert_eq!(events[2].output_index, Some(0));
-        assert_eq!(events[2].item.as_ref().unwrap().name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            events[2].item.as_ref().unwrap().name.as_deref(),
+            Some("get_weather")
+        );
         assert_eq!(events[3].r#type, "response.function_call_arguments.delta");
 
         let events = state.process_chunk(&chunk(
@@ -1797,7 +1834,11 @@ mod tests {
 
     #[test]
     fn length_finish_reason_yields_incomplete_terminal() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         let _ = state.process_chunk(&chunk("id", "partial", Some("length"), None, Vec::new()));
         let events = state.finalize();
         assert_eq!(events[0].r#type, "response.incomplete");
@@ -1814,7 +1855,11 @@ mod tests {
     #[test]
     fn reasoning_alias_field_supported() {
         // 部分上游用 `reasoning` 而非 `reasoning_content`（Go GetReasoningContent 双字段语义）
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         let mut c = chunk("id", "", Some("stop"), None, Vec::new());
         c.choices[0].delta.reasoning = Some("Alias thought.".into());
         let events = state.process_chunk(&c);
@@ -1829,7 +1874,10 @@ mod tests {
     fn sse_parser_frames_events_and_done() {
         let mut parser = ChatSseParser::new();
         let mut out = Vec::new();
-        let done = parser.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n", &mut out);
+        let done = parser.push(
+            b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n",
+            &mut out,
+        );
         assert!(done);
         assert_eq!(
             out.iter().map(|e| e.data.as_str()).collect::<Vec<_>>(),
@@ -1854,7 +1902,6 @@ mod tests {
         assert_eq!(out[0].data, "{}");
         assert_eq!(out[0].event.as_deref(), Some("ping"));
     }
-
 
     #[test]
     fn sse_frame_format_matches_new_api() {
@@ -1882,7 +1929,11 @@ mod tests {
     fn content_parts_array_delta_emits_text() {
         // Bug 回归：部分上游（Gemini 兼容层等）流式 delta.content 为 parts 数组，
         // 旧实现仅取 string 形态 → 全部文本被丢弃 → completed 空输出
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
 
         fn text_deltas(events: &[ResponsesStreamEventOut]) -> Vec<&str> {
             events
@@ -1919,35 +1970,72 @@ mod tests {
                 arguments: Some(args.to_string()),
             }),
         };
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
-        let _ = state.process_chunk(&chunk("id", "", None, None, vec![
-            no_index("call_a", "read_file", "{\"path\":\"a\"}"),
-        ]));
-        let events = state.process_chunk(&chunk("id", "", Some("tool_calls"), None, vec![
-            no_index("call_b", "exec_command", "{\"cmd\":\"ls\"}"),
-        ]));
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
+        let _ = state.process_chunk(&chunk(
+            "id",
+            "",
+            None,
+            None,
+            vec![no_index("call_a", "read_file", "{\"path\":\"a\"}")],
+        ));
+        let events = state.process_chunk(&chunk(
+            "id",
+            "",
+            Some("tool_calls"),
+            None,
+            vec![no_index("call_b", "exec_command", "{\"cmd\":\"ls\"}")],
+        ));
         // 第二个调用独立 item.added（不覆盖 call_a）
         assert_eq!(events[0].r#type, "response.output_item.added");
-        assert_eq!(events[0].item.as_ref().unwrap().name.as_deref(), Some("exec_command"));
+        assert_eq!(
+            events[0].item.as_ref().unwrap().name.as_deref(),
+            Some("exec_command")
+        );
         let events = state.finalize();
         let resp = events[0].response.as_ref().unwrap();
         assert_eq!(resp.output.len(), 2, "两个独立工具输出");
         assert_eq!(resp.output[0].call_id.as_deref(), Some("call_a"));
-        assert_eq!(resp.output[0].arguments.as_ref().unwrap(), &Value::String("{\"path\":\"a\"}".into()));
+        assert_eq!(
+            resp.output[0].arguments.as_ref().unwrap(),
+            &Value::String("{\"path\":\"a\"}".into())
+        );
         assert_eq!(resp.output[1].call_id.as_deref(), Some("call_b"));
     }
 
     /// M4：content 里流首 <think> 块分离为 reasoning
     #[test]
     fn inline_think_separated_into_reasoning() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
-        let events = state.process_chunk(&chunk("id", "<think>hmm</think>Answer", Some("stop"), None, Vec::new()));
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
+        let events = state.process_chunk(&chunk(
+            "id",
+            "<think>hmm</think>Answer",
+            Some("stop"),
+            None,
+            Vec::new(),
+        ));
         let types: Vec<&str> = events.iter().map(|e| e.r#type.as_str()).collect();
-        assert!(types.contains(&"response.reasoning_summary_text.delta"), "{types:?}");
+        assert!(
+            types.contains(&"response.reasoning_summary_text.delta"),
+            "{types:?}"
+        );
         assert!(types.contains(&"response.output_text.delta"), "{types:?}");
-        let reasoning = events.iter().find(|e| e.r#type == EVENT_REASONING_SUMMARY_DELTA).unwrap();
+        let reasoning = events
+            .iter()
+            .find(|e| e.r#type == EVENT_REASONING_SUMMARY_DELTA)
+            .unwrap();
         assert_eq!(reasoning.delta.as_deref(), Some("hmm"));
-        let text = events.iter().find(|e| e.r#type == EVENT_OUTPUT_TEXT_DELTA).unwrap();
+        let text = events
+            .iter()
+            .find(|e| e.r#type == EVENT_OUTPUT_TEXT_DELTA)
+            .unwrap();
         assert_eq!(text.delta.as_deref(), Some("Answer"));
         let events = state.finalize();
         let resp = events[0].response.as_ref().unwrap();
@@ -1966,7 +2054,13 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let sse = synthesize_sse_from_chat_body(&body, "resp_s", "m", &crate::service::responses::tool_ctx::ToolContext::default()).expect("synthesizable");
+        let sse = synthesize_sse_from_chat_body(
+            &body,
+            "resp_s",
+            "m",
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .expect("synthesizable");
         assert!(sse.contains("event: response.created\n"));
         assert!(sse.contains("event: response.output_text.delta\n"));
         assert!(sse.contains("Hello world!"));
@@ -2022,7 +2116,11 @@ mod tests {
     /// 四-3：流式 refusal → output_text（此前被静默丢弃）
     #[test]
     fn refusal_delta_emits_text() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         let mut c = chunk("id", "", None, None, Vec::new());
         c.choices[0].delta.refusal = Some("I cannot help with that.".into());
         let events = state.process_chunk(&c);
@@ -2037,7 +2135,11 @@ mod tests {
     /// L6：工具帧前的思考关闭 reasoning item 并附挂到 function_call item
     #[test]
     fn reasoning_attaches_to_function_call_item() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::default());
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::default(),
+        );
         let mut c = chunk("id", "", None, None, Vec::new());
         c.choices[0].delta.reasoning_content = Some("need a tool".into());
         state.process_chunk(&c);
@@ -2056,20 +2158,33 @@ mod tests {
                 }),
             }],
         ));
-        let added = events
-            .iter()
-            .find(|e| e.r#type == "response.output_item.added" && e.item.as_ref().is_some_and(|i| i.r#type == "function_call"));
-        let item = added.and_then(|e| e.item.as_ref()).expect("function_call added");
+        let added = events.iter().find(|e| {
+            e.r#type == "response.output_item.added"
+                && e.item.as_ref().is_some_and(|i| i.r#type == "function_call")
+        });
+        let item = added
+            .and_then(|e| e.item.as_ref())
+            .expect("function_call added");
         assert_eq!(item.reasoning_content.as_deref(), Some("need a tool"));
         // reasoning item 已关闭（done 事件在场）
-        assert!(events.iter().any(|e| e.r#type == "response.output_item.done"
-            && e.item.as_ref().is_some_and(|i| i.r#type == "reasoning")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.r#type == "response.output_item.done"
+                    && e.item.as_ref().is_some_and(|i| i.r#type == "reasoning"))
+        );
     }
 
     /// 四-4：桥接工具发 web_search_call item、无参数增量事件、query 解析
     #[test]
     fn bridged_web_search_emits_web_search_call_item() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::from_request(&serde_json::json!({"tools": [{"type": "web_search"}]})));
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::from_request(
+                &serde_json::json!({"tools": [{"type": "web_search"}]}),
+            ),
+        );
         let events = state.process_chunk(&chunk(
             "id",
             "",
@@ -2119,7 +2234,13 @@ mod tests {
     /// M6：custom 工具流式还原 —— custom_tool_call item + input.delta/done 事件面
     #[test]
     fn custom_tool_stream_emits_input_events() {
-        let mut state = ChatToResponsesStreamState::new("resp_fixed".into(), "m".into(), crate::service::responses::tool_ctx::ToolContext::from_request(&serde_json::json!({"tools": [{"type": "custom", "name": "apply_patch"}]})));
+        let mut state = ChatToResponsesStreamState::new(
+            "resp_fixed".into(),
+            "m".into(),
+            crate::service::responses::tool_ctx::ToolContext::from_request(
+                &serde_json::json!({"tools": [{"type": "custom", "name": "apply_patch"}]}),
+            ),
+        );
         let events = state.process_chunk(&chunk(
             "id",
             "",
@@ -2140,8 +2261,14 @@ mod tests {
             !types.contains(&"response.function_call_arguments.delta"),
             "custom 工具不发 arguments delta: {types:?}"
         );
-        assert!(types.contains(&"response.custom_tool_call_input.delta"), "{types:?}");
-        assert!(types.contains(&"response.custom_tool_call_input.done"), "{types:?}");
+        assert!(
+            types.contains(&"response.custom_tool_call_input.delta"),
+            "{types:?}"
+        );
+        assert!(
+            types.contains(&"response.custom_tool_call_input.done"),
+            "{types:?}"
+        );
         let added = events
             .iter()
             .find(|e| e.r#type == "response.output_item.added")

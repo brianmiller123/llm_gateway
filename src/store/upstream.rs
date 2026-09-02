@@ -80,5 +80,3 @@ pub async fn load_routes(pool: &PgPool) -> Result<Vec<ModelRoute>, sqlx::Error> 
     .fetch_all(pool)
     .await
 }
-
-

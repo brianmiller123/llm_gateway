@@ -10,7 +10,7 @@
 //!    钳制为省略标记（防上游 413/上下文爆炸）；小图标（<8KiB data-URL）保留。
 //! 4. **来源标注**：搬运媒体带 per-call 标签文本 part，模型可归因多工具媒体。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// 整串 data-URL 视为媒体搬运的下限（小于此值保留为文本）
 pub const WHOLE_DATA_URL_MIN_BYTES: usize = 8 * 1024;
@@ -58,7 +58,10 @@ pub fn clamp_base64ish(text: &str) -> String {
             && trimmed.len() >= BASE64ISH_MIN_BYTES
             && trimmed.contains(";base64,"))
     {
-        format!("[gateway: {} bytes of base64 media payload omitted]", trimmed.len())
+        format!(
+            "[gateway: {} bytes of base64 media payload omitted]",
+            trimmed.len()
+        )
     } else {
         text.to_string()
     }
@@ -86,7 +89,11 @@ pub fn with_moved_marker(text: &str) -> String {
 /// 非媒体形态返回 None（由调用方按文本/未知块处理）。
 pub fn chat_media_part(block: &Value) -> Option<Value> {
     let obj = block.as_object()?;
-    let ty = obj.get("type").and_then(|t| t.as_str()).unwrap_or("").trim();
+    let ty = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim();
     match ty {
         "input_image" | "image_url" => image_like_part(obj, &["image_url", "url", "file_id"]),
         "image" => anthropic_image_part(obj),
@@ -331,7 +338,12 @@ pub fn split_tool_output(output: &Value) -> ToolMediaSplit {
 }
 
 /// 递归抽取；返回该值剥离媒体后的文本表示（无媒体时保持原始表示）
-fn strip_at_depth(v: &Value, depth: usize, media: &mut Vec<Value>, texts: &mut Vec<String>) -> String {
+fn strip_at_depth(
+    v: &Value,
+    depth: usize,
+    media: &mut Vec<Value>,
+    texts: &mut Vec<String>,
+) -> String {
     if depth > MAX_DEPTH {
         return String::new();
     }
@@ -392,7 +404,11 @@ fn strip_at_depth(v: &Value, depth: usize, media: &mut Vec<Value>, texts: &mut V
             if non_empty.is_empty() && media.is_empty() {
                 return String::new();
             }
-            non_empty.into_iter().cloned().collect::<Vec<_>>().join("\n")
+            non_empty
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         }
         Value::Object(_) => {
             if let Some(part) = chat_media_part(v) {
@@ -464,7 +480,12 @@ mod tests {
         });
         let part = chat_media_part(&block).unwrap();
         assert_eq!(part["type"], "image_url");
-        assert!(part["image_url"]["url"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+        assert!(
+            part["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
     }
 
     #[test]
@@ -482,7 +503,12 @@ mod tests {
             "type": "image", "source": {"type": "base64", "data": "QUJD"}
         });
         let part = chat_media_part(&block).unwrap();
-        assert!(part["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert!(
+            part["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     #[test]
@@ -562,7 +588,10 @@ mod tests {
 
     #[test]
     fn label_format() {
-        assert_eq!(media_label("call_1"), "[gateway: media output of tool call call_1]");
+        assert_eq!(
+            media_label("call_1"),
+            "[gateway: media output of tool call call_1]"
+        );
     }
 
     #[test]

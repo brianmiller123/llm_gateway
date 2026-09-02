@@ -25,6 +25,10 @@
         <div class="generated">近 30 天共 {{ incidentCount }} 起事故</div>
       </section>
 
+      <div v-if="loadError" class="neterr">
+        状态刷新失败（网络异常），正在展示上次数据，将自动重试
+      </div>
+
       <section class="card">
         <h3>系统组件</h3>
         <p v-if="!data" class="empty">加载中…</p>
@@ -35,6 +39,11 @@
               <div class="cline">
                 <span class="cname">{{ c.name }}</span>
                 <el-tag size="small" effect="plain">{{ c.kind === 'system' ? '系统' : '上游' }}</el-tag>
+                <el-tooltip v-if="c.probe" :content="probeTip(c.probe)" placement="top">
+                  <el-tag size="small" :type="probeTagType(c.probe.verdict)" effect="light">
+                    {{ probeText(c.probe.verdict) }}
+                  </el-tag>
+                </el-tooltip>
                 <span class="cstatus" :class="c.status">{{ statusText(c.status) }}</span>
               </div>
               <div class="cmeta">
@@ -98,7 +107,9 @@
         </template>
       </section>
 
-      <footer class="foot">数据基于最近 30 天真实调用记录统计 · 页面每 60 秒自动刷新</footer>
+      <footer class="foot">
+        上游每 30 秒主动探测 /1/status · 历史数据基于近 30 天真实调用记录 · 页面每 60 秒自动刷新
+      </footer>
     </main>
   </div>
 </template>
@@ -106,11 +117,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '@/api/client'
-import type { StatusDayPoint, StatusIncident, StatusResp, StatusUptimeSeries } from '@/api/types'
+import type {
+  StatusDayPoint,
+  StatusIncident,
+  StatusProbe,
+  StatusResp,
+  StatusUptimeSeries,
+} from '@/api/types'
 
 const data = ref<StatusResp | null>(null)
 const loading = ref(false)
 const countdown = ref(60)
+const loadError = ref(false)
 
 const REFRESH_MS = 60_000
 
@@ -122,8 +140,10 @@ async function load(force = false) {
   loading.value = true
   try {
     data.value = await api.status()
+    loadError.value = false
   } catch {
-    // 保持旧数据，下次轮询重试
+    // 网络异常：保留旧数据降级展示，页面提示并等下轮轮询自动重试
+    loadError.value = true
   } finally {
     loading.value = false
     countdown.value = 60
@@ -184,6 +204,27 @@ function statusText(s: string): string {
   return STATUS_TEXT[s] ?? s
 }
 
+const PROBE_TEXT: Record<StatusProbe['verdict'], string> = {
+  healthy: '探测正常',
+  degraded: '探测异常',
+  down: '探测失败',
+  inconclusive: '无法探测',
+}
+
+function probeText(v: StatusProbe['verdict']): string {
+  return PROBE_TEXT[v]
+}
+
+function probeTagType(v: StatusProbe['verdict']): 'success' | 'warning' | 'danger' | 'info' {
+  return v === 'healthy' ? 'success' : v === 'degraded' ? 'warning' : v === 'down' ? 'danger' : 'info'
+}
+
+function probeTip(p: StatusProbe): string {
+  const http = p.http_status != null ? `HTTP ${p.http_status}` : '无 HTTP 响应'
+  const latency = p.latency_ms != null ? ` · ${p.latency_ms}ms` : ''
+  return `GET ${p.endpoint} · ${http}${latency} · 探测于 ${fmtTime(p.checked_at)}`
+}
+
 function cellClass(d: StatusDayPoint): string {
   if (d.success_rate == null || d.calls === 0) return 'none'
   if (d.success_rate >= 0.99) return 'ok'
@@ -215,6 +256,15 @@ function fmtRange(inc: StatusIncident): string {
 </script>
 
 <style scoped>
+.neterr {
+  margin-bottom: 16px;
+  padding: 10px 16px;
+  border: 1px solid #fde2e2;
+  border-radius: 8px;
+  background: #fef0f0;
+  color: #c45656;
+  font-size: 13px;
+}
 .status-page {
   min-height: 100vh;
   background: #f5f7fa;

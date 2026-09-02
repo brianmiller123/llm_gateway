@@ -53,7 +53,9 @@ pub fn reshape_upstream_error_for_responses(
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => {
-            let text = String::from_utf8_lossy(&body[..body.len().min(1024)]).trim().to_string();
+            let text = String::from_utf8_lossy(&body[..body.len().min(1024)])
+                .trim()
+                .to_string();
             let message = if text.is_empty() {
                 format!("upstream returned HTTP {status} with non-JSON body")
             } else {
@@ -95,7 +97,9 @@ pub fn reshape_upstream_error_for_responses(
                 .or_else(|| v.get("error").and_then(|e| e.as_str()))
                 .or_else(|| v.get("detail").and_then(|d| d.as_str()))
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("upstream returned HTTP {status} with unconvertible body"))
+                .unwrap_or_else(|| {
+                    format!("upstream returned HTTP {status} with unconvertible body")
+                })
         });
     // 字符串 code 优先；数值 code 原样保留（`"code": 4001` 而非转字符串）
     let code: serde_json::Value = base
@@ -117,7 +121,10 @@ pub fn reshape_upstream_error_for_responses(
             MAX_MESSAGE_CHARS,
         )),
     );
-    err.insert("type".into(), serde_json::Value::String("upstream_error".into()));
+    err.insert(
+        "type".into(),
+        serde_json::Value::String("upstream_error".into()),
+    );
     err.insert("code".into(), code);
     // M3：结构化排障字段
     err.insert("upstream_status".into(), serde_json::json!(status));
@@ -182,54 +189,96 @@ mod tests {
             &tctx(),
         );
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert!(v.pointer("/error/message").and_then(|m| m.as_str()).unwrap().starts_with("boom requested"));
-        assert_eq!(v.pointer("/error/code").and_then(|c| c.as_str()), Some("mock_error"));
-        assert_eq!(v.pointer("/error/type").and_then(|t| t.as_str()), Some("upstream_error"));
+        assert!(
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap()
+                .starts_with("boom requested")
+        );
+        assert_eq!(
+            v.pointer("/error/code").and_then(|c| c.as_str()),
+            Some("mock_error")
+        );
+        assert_eq!(
+            v.pointer("/error/type").and_then(|t| t.as_str()),
+            Some("upstream_error")
+        );
         // M3：结构化排障字段
-        assert_eq!(v.pointer("/error/provider").and_then(|p| p.as_str()), Some("p"));
-        assert_eq!(v.pointer("/error/model").and_then(|m| m.as_str()), Some("m"));
-        assert_eq!(v.pointer("/error/upstream_status").and_then(|s| s.as_u64()), Some(200));
-        assert_eq!(v.pointer("/error/body_type").and_then(|b| b.as_str()), Some("json"));
+        assert_eq!(
+            v.pointer("/error/provider").and_then(|p| p.as_str()),
+            Some("p")
+        );
+        assert_eq!(
+            v.pointer("/error/model").and_then(|m| m.as_str()),
+            Some("m")
+        );
+        assert_eq!(
+            v.pointer("/error/upstream_status").and_then(|s| s.as_u64()),
+            Some(200)
+        );
+        assert_eq!(
+            v.pointer("/error/body_type").and_then(|b| b.as_str()),
+            Some("json")
+        );
     }
 
     #[test]
     fn reshape_error_plain_and_empty_bodies() {
         let out = reshape_upstream_error_for_responses(200, b"not json at all", &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert!(v
-            .pointer("/error/message")
-            .and_then(|m| m.as_str())
-            .unwrap()
-            .starts_with("not json at all"));
+        assert!(
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap()
+                .starts_with("not json at all")
+        );
         // M9：code 恒为字符串枚举（不再回退数值状态码）
         assert_eq!(
             v.pointer("/error/code").and_then(|c| c.as_str()),
             Some("upstream_http_200")
         );
-        assert_eq!(v.pointer("/error/body_type").and_then(|b| b.as_str()), Some("text"));
+        assert_eq!(
+            v.pointer("/error/body_type").and_then(|b| b.as_str()),
+            Some("text")
+        );
 
         let out = reshape_upstream_error_for_responses(200, b"", &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
-        let msg = v.pointer("/error/message").and_then(|m| m.as_str()).unwrap();
+        let msg = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap();
         assert!(msg.contains("200"));
-        assert_eq!(v.pointer("/error/body_type").and_then(|b| b.as_str()), Some("empty"));
+        assert_eq!(
+            v.pointer("/error/body_type").and_then(|b| b.as_str()),
+            Some("empty")
+        );
 
-        let out = reshape_upstream_error_for_responses(200, json!({"choices": []}).to_string().as_bytes(), &tctx());
+        let out = reshape_upstream_error_for_responses(
+            200,
+            json!({"choices": []}).to_string().as_bytes(),
+            &tctx(),
+        );
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert!(v.pointer("/error/message").and_then(|m| m.as_str()).unwrap().contains("unconvertible"));
+        assert!(
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap()
+                .contains("unconvertible")
+        );
     }
 
     /// M9：context 拼进 message；超长 message 截断
     #[test]
     fn reshape_error_context_and_truncation() {
         // 短 message：context 完整保留
-        let out = reshape_upstream_error_for_responses(
-            502,
-            br#"{"error":{"message":"boom"}}"#,
-            &tctx(),
-        );
+        let out =
+            reshape_upstream_error_for_responses(502, br#"{"error":{"message":"boom"}}"#, &tctx());
         let v: Value = serde_json::from_slice(&out).unwrap();
-        let msg = v.pointer("/error/message").and_then(|m| m.as_str()).unwrap();
+        let msg = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap();
         assert!(msg.contains("provider=p"), "{msg}");
         assert!(msg.contains("request_id=00000000"), "{msg}");
         // 超长 message：截断
@@ -240,7 +289,10 @@ mod tests {
             &tctx(),
         );
         let v: Value = serde_json::from_slice(&out).unwrap();
-        let msg = v.pointer("/error/message").and_then(|m| m.as_str()).unwrap();
+        let msg = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap();
         assert!(msg.chars().count() <= 1800, "len={}", msg.len());
     }
 }

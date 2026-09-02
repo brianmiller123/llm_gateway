@@ -9,11 +9,11 @@
 //! - tool_calls → function_call outputs（call_id 缺失时回退 `{id}_call_{i}`）
 //! - usage 双语义搬运（input/output + prompt/completion + details）
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::dto::{
-    empty_annotations, output_item, usage_from_chat, IncompleteDetailsOut, ResponsesOutputContentOut,
-    ResponsesOutputOut, ResponsesResponseOut, Usage,
+    IncompleteDetailsOut, ResponsesOutputContentOut, ResponsesOutputOut, ResponsesResponseOut,
+    Usage, empty_annotations, output_item, usage_from_chat,
 };
 
 const FINISH_REASON_LENGTH: &str = "length";
@@ -58,9 +58,7 @@ pub fn chat_response_to_responses(
     let (mut text, part_refusals) = message
         .map(extract_message_text_and_refusals)
         .unwrap_or_default();
-    let mut reasoning = message
-        .map(extract_message_reasoning)
-        .unwrap_or_default();
+    let mut reasoning = message.map(extract_message_reasoning).unwrap_or_default();
     // M1：非流式正文开头的 <think>…</think> 分离为 reasoning（与流式路径
     // InlineThinkState 行为对齐；此前思考污染 output_text 且计费口径失真）
     if let Some((think, rest)) = crate::service::inline_think::split_leading_think(&text) {
@@ -72,7 +70,11 @@ pub fn chat_response_to_responses(
         text = rest.trim().to_string();
     }
     let mut output: Vec<ResponsesOutputOut> = Vec::new();
-    let output_status = if status == "incomplete" { "incomplete" } else { "completed" };
+    let output_status = if status == "incomplete" {
+        "incomplete"
+    } else {
+        "completed"
+    };
 
     // L1：输出顺序 reasoning → message → tools（与真实生成序一致，
     // cc-switch transform_codex_chat.rs:1460-1470 reasoning_pos < message_pos）
@@ -131,7 +133,10 @@ pub fn chat_response_to_responses(
     // agent loop 拿到"零工具调用的 completed"而无声卡死 —— 丢弃并在全部被丢弃且
     // 无其他输出时报错（length 截断豁免：那是截断而非畸形数据）
     let mut dropped_tools = 0usize;
-    if let Some(tool_calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+    if let Some(tool_calls) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|t| t.as_array())
+    {
         for (i, tc) in tool_calls.iter().enumerate() {
             let name = tc
                 .pointer("/function/name")
@@ -161,7 +166,10 @@ pub fn chat_response_to_responses(
     }
     // L3：legacy `message.function_call` 兜底（无 tool_calls 时；与流式路径
     // lenient_tool_call 兼容对齐，老式上游工具调用不再静默丢失）
-    if output.iter().all(|o| o.r#type != "function_call" && o.r#type != "custom_tool_call") {
+    if output
+        .iter()
+        .all(|o| o.r#type != "function_call" && o.r#type != "custom_tool_call")
+    {
         if let Some(fc) = message.and_then(|m| m.get("function_call")) {
             let name = fc
                 .get("name")
@@ -231,7 +239,8 @@ pub fn chat_response_to_responses(
         user: None,
         metadata: None,
     };
-    serde_json::to_value(out.with_zero_usage()).map_err(|e| format!("serialize responses response: {e}"))
+    serde_json::to_value(out.with_zero_usage())
+        .map_err(|e| format!("serialize responses response: {e}"))
 }
 
 /// finish_reason → (status, incomplete_details)
@@ -363,7 +372,9 @@ fn chat_tool_call_to_responses_output(
         .map(super::dto::arguments_string)
         .map(|s| crate::service::canonical::canonicalize_json_string_if_parseable(&s))
         .unwrap_or_default();
-    let reasoning_content = reasoning.filter(|r| !r.trim().is_empty()).map(str::to_string);
+    let reasoning_content = reasoning
+        .filter(|r| !r.trim().is_empty())
+        .map(str::to_string);
 
     if let Some(spec) = tool_ctx.lookup(&name) {
         match spec.kind {
@@ -384,7 +395,9 @@ fn chat_tool_call_to_responses_output(
                     arguments: None,
                     reasoning_content,
                     query: None,
-                    input: Some(super::dto::custom_tool_input_from_chat_arguments(&arguments)),
+                    input: Some(super::dto::custom_tool_input_from_chat_arguments(
+                        &arguments,
+                    )),
                     execution: None,
                 };
             }
@@ -503,7 +516,13 @@ mod tests {
 
     #[test]
     fn converts_chat_response_to_responses() {
-        let out = chat_response_to_responses(&chat_resp(), "resp_fixed", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &chat_resp(),
+            "resp_fixed",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["id"], "resp_fixed");
         assert_eq!(out["object"], "response");
         assert_eq!(out["status"], "completed");
@@ -544,7 +563,13 @@ mod tests {
         let mut resp = chat_resp();
         resp["choices"][0]["finish_reason"] = json!("length");
         resp["choices"][0]["message"]["content"] = json!("partial");
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["status"], "incomplete");
         assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
         // incomplete 时输出 item 状态同步
@@ -554,9 +579,18 @@ mod tests {
     #[test]
     fn fallback_call_id_and_arguments() {
         let mut resp = chat_resp();
-        resp["choices"][0]["message"]["tool_calls"][0].as_object_mut().unwrap().remove("id");
+        resp["choices"][0]["message"]["tool_calls"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
         resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json!("");
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["output"][2]["id"], "fc_resp_x_call_0");
         assert_eq!(out["output"][2]["call_id"], "resp_x_call_0");
         assert_eq!(out["output"][2]["arguments"], json!(""));
@@ -566,7 +600,13 @@ mod tests {
     fn empty_choices_still_valid() {
         let resp = json!({"id": "x", "object": "chat.completion", "model": "m",
                           "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}});
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["status"], "completed");
         assert_eq!(out["output"], json!([]));
         assert_eq!(out["usage"]["input_tokens"], 1);
@@ -575,7 +615,13 @@ mod tests {
     #[test]
     fn tool_calls_finish_reason_not_overridden_by_stop() {
         // finish_reason=tool_calls → completed（Go 语义：仅 length/content_filter 映射 incomplete）
-        let out = chat_response_to_responses(&chat_resp(), "resp_fixed", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &chat_resp(),
+            "resp_fixed",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["status"], "completed");
     }
 
@@ -592,7 +638,13 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["status"], "failed");
         assert_eq!(out["error"]["code"], "upstream_tool_call_dropped");
         assert_eq!(out["output"], json!([]));
@@ -611,7 +663,13 @@ mod tests {
             }],
             "usage": null
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["status"], "completed");
         assert_eq!(out["output"].as_array().unwrap().len(), 1);
         assert_eq!(out["output"][0]["type"], "message");
@@ -626,7 +684,13 @@ mod tests {
             "usage": {"prompt_tokens": 100, "completion_tokens": 5,
                       "prompt_tokens_details": {"cached_tokens": 60}}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 60);
 
         // DeepSeek 风格 prompt_cache_hit_tokens（无 details）→ 合成 cached_tokens
@@ -635,7 +699,13 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 5, "prompt_cache_hit_tokens": 40}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 40);
 
         // Anthropic 风格直传 cache_read/cache_creation
@@ -645,9 +715,18 @@ mod tests {
             "usage": {"prompt_tokens": 100, "completion_tokens": 5,
                       "cache_read_input_tokens": 70, "cache_creation_input_tokens": 10}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 70);
-        assert_eq!(out["usage"]["input_tokens_details"]["cache_write_tokens"], 10);
+        assert_eq!(
+            out["usage"]["input_tokens_details"]["cache_write_tokens"],
+            10
+        );
     }
 
     #[test]
@@ -656,7 +735,13 @@ mod tests {
             "id": "c", "model": "m",
             "choices": [{"message": {"role": "assistant", "content": null, "refusal": "cannot help"}, "finish_reason": "stop"}]
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["output"][0]["content"][0]["text"], "cannot help");
     }
 
@@ -671,18 +756,37 @@ mod tests {
                 "finish_reason": "tool_calls"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::from_request(&serde_json::json!({"tools": [{"type": "custom", "name": "apply_patch"}]})))
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::from_request(
+                &serde_json::json!({"tools": [{"type": "custom", "name": "apply_patch"}]}),
+            ),
+        )
         .unwrap();
         assert_eq!(out["output"][0]["type"], "custom_tool_call");
         assert_eq!(out["output"][0]["id"], "ctc_call_9");
         assert_eq!(out["output"][0]["call_id"], "call_9");
         assert_eq!(out["output"][0]["name"], "apply_patch");
         assert_eq!(out["output"][0]["input"], "*** patch ***");
-        assert!(out["output"][0].get("arguments").is_none(), "custom item 无 arguments 字段");
+        assert!(
+            out["output"][0].get("arguments").is_none(),
+            "custom item 无 arguments 字段"
+        );
         // 未命中名单的同名调用保持 function_call
-        let out2 = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out2 = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out2["output"][0]["type"], "function_call");
-        assert_eq!(out2["output"][0]["arguments"], json!("{\"input\":\"*** patch ***\"}"));
+        assert_eq!(
+            out2["output"][0]["arguments"],
+            json!("{\"input\":\"*** patch ***\"}")
+        );
     }
 
     /// M1：非流式正文开头的 <think> 块分离为 reasoning，正文剥离
@@ -694,9 +798,19 @@ mod tests {
                 "content": "<think>step by step</think>The answer."}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
-        let types: Vec<&str> = out["output"].as_array().unwrap().iter()
-            .map(|i| i["type"].as_str().unwrap()).collect();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
+        let types: Vec<&str> = out["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
         assert_eq!(types, vec!["reasoning", "message"]);
         assert_eq!(out["output"][0]["summary"][0]["text"], "step by step");
         assert_eq!(out["output"][1]["content"][0]["text"], "The answer.");
@@ -712,7 +826,13 @@ mod tests {
                 "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         });
-        let out = chat_response_to_responses(&resp, "resp_x", 0, &crate::service::responses::tool_ctx::ToolContext::default()).unwrap();
+        let out = chat_response_to_responses(
+            &resp,
+            "resp_x",
+            0,
+            &crate::service::responses::tool_ctx::ToolContext::default(),
+        )
+        .unwrap();
         assert_eq!(out["output"][0]["type"], "reasoning");
         assert_eq!(out["output"][0]["summary"][0]["text"], "ponder");
     }
@@ -728,7 +848,8 @@ mod tests {
             ]}]
         });
         let ctx = crate::service::responses::tool_ctx::ToolContext::from_request(&req);
-        let chat = crate::service::responses::convert_req::responses_request_to_chat(&req, "m").unwrap();
+        let chat =
+            crate::service::responses::convert_req::responses_request_to_chat(&req, "m").unwrap();
         assert_eq!(chat["tools"][0]["function"]["name"], "mcp__s__q");
         let resp = json!({
             "model": "m",
@@ -772,8 +893,11 @@ mod tests {
             "tools": [{"type": "custom", "name": "apply_patch"}],
             "tool_choice": {"type": "custom", "name": "apply_patch"}
         });
-        let chat = crate::service::responses::convert_req::responses_request_to_chat(&req, "m").unwrap();
-        assert_eq!(chat["tool_choice"], json!({"type": "function", "function": {"name": "apply_patch"}}));
+        let chat =
+            crate::service::responses::convert_req::responses_request_to_chat(&req, "m").unwrap();
+        assert_eq!(
+            chat["tool_choice"],
+            json!({"type": "function", "function": {"name": "apply_patch"}})
+        );
     }
-
 }

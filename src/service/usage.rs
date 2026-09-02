@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 use crate::error::AppError;
 use crate::state::AppState;
-use crate::store::usage::{record_usage, Usage, UsageMeta};
+use crate::store::usage::{Usage, UsageMeta, record_usage};
 
 /// 月度用量计数缓存：key = (user_id, "YYYY-MM") → (tokens, cost)
 /// 记账事务提交后更新；配额预检查读取；启动/周期从 DB 重载兜底（防重启后配额清零）

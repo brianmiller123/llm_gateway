@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -42,7 +42,7 @@ pub enum AppError {
         inner: Box<AppError>,
         request_id: uuid::Uuid,
     },
- }
+}
 
 impl AppError {
     pub fn internal(e: impl std::fmt::Display) -> Self {
@@ -52,10 +52,7 @@ impl AppError {
     /// P1-6：包装请求关联 id（幂等——已包装的直接换 id）
     pub fn with_request_id(self, request_id: uuid::Uuid) -> Self {
         match self {
-            AppError::WithRequestId { inner, .. } => AppError::WithRequestId {
-                inner,
-                request_id,
-            },
+            AppError::WithRequestId { inner, .. } => AppError::WithRequestId { inner, request_id },
             other => AppError::WithRequestId {
                 inner: Box::new(other),
                 request_id,
@@ -68,9 +65,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // P1-6：解包关联 id，响应统一附 X-Request-Id 头（早期失败可关联日志）
         let (request_id, self_err) = match self {
-            AppError::WithRequestId { inner, request_id } => {
-                (Some(request_id), *inner)
-            }
+            AppError::WithRequestId { inner, request_id } => (Some(request_id), *inner),
             other => (None, other),
         };
         let (status, code, message, retry_after): (StatusCode, &str, String, Option<u64>) =
@@ -79,24 +74,9 @@ impl IntoResponse for AppError {
                 AppError::WithRequestId { inner, .. } => {
                     return IntoResponse::into_response(*inner);
                 }
-                AppError::Auth(m) => (
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_api_key",
-                    m,
-                    None,
-                ),
-                AppError::Unauthorized(m) => (
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    m,
-                    None,
-                ),
-                AppError::Forbidden(m) => (
-                    StatusCode::FORBIDDEN,
-                    "forbidden",
-                    m,
-                    None,
-                ),
+                AppError::Auth(m) => (StatusCode::UNAUTHORIZED, "invalid_api_key", m, None),
+                AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m, None),
+                AppError::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m, None),
                 AppError::RateLimited(secs) => {
                     // 上限 24h：rpm<=0 的规则会产生无限等待，不能让 u64 溢出/巨值直达客户端
                     let retry = secs.ceil().max(1.0).min(86400.0) as u64;
@@ -113,42 +93,22 @@ impl IntoResponse for AppError {
                     "Monthly quota exceeded, please contact administrator".to_string(),
                     None,
                 ),
-                AppError::PlanQuotaExceeded(m) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "insufficient_quota",
-                    m,
-                    None,
-                ),
-                AppError::BadRequest(m) => (
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    m,
-                    None,
-                ),
-                AppError::Internal(m) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    m,
-                    None,
-                ),
-                AppError::ServiceUnavailable(m) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_disabled",
-                    m,
-                    None,
-                ),
-                AppError::UpstreamTimeout(m) => (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "upstream_timeout",
-                    m,
-                    None,
-                ),
-                AppError::BadGateway(m) => (
-                    StatusCode::BAD_GATEWAY,
-                    "bad_gateway",
-                    m,
-                    None,
-                ),
+                AppError::PlanQuotaExceeded(m) => {
+                    (StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", m, None)
+                }
+                AppError::BadRequest(m) => {
+                    (StatusCode::BAD_REQUEST, "invalid_request_error", m, None)
+                }
+                AppError::Internal(m) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", m, None)
+                }
+                AppError::ServiceUnavailable(m) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "api_disabled", m, None)
+                }
+                AppError::UpstreamTimeout(m) => {
+                    (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", m, None)
+                }
+                AppError::BadGateway(m) => (StatusCode::BAD_GATEWAY, "bad_gateway", m, None),
                 AppError::UpstreamExhausted(m) => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "upstream_exhausted",
@@ -156,7 +116,6 @@ impl IntoResponse for AppError {
                     None,
                 ),
             };
-
 
         let body = json!({
             "error": { "message": message, "type": code, "code": code }

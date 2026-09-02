@@ -15,6 +15,7 @@
 - API Key 鉴权：Key 仅存 SHA-256 哈希 + 12 位前缀定位，明文只在创建时展示一次；可配置为不鉴权（仅本地开发）
 - 三层速率限制（API Key → 用户 → 全局，令牌桶，BOOTTIME 回填时钟），命中返回 429 + `Retry-After` + OpenAI 标准错误体；长时间空闲后恢复的首请求空闲豁免，避免 agent 暂停等待用户确认后恢复即 429（见「限流与长时间空闲恢复」）
 - 月度配额：按用户限制 Token/成本上限，记账事务内原子扣减，超限 429
+- Coding Plan 周期配额：分组绑定套餐（多分组取优先级最高生效），token 上限 + 统计周期（每日 / 每月 / 总量 / 小时级——每 N 小时（1..168）滚动重置，锚点可选 UTC 整点网格或按开通时间偏移），超额策略（拦截 429 / 降级指定模型 / 仅告警）；80/95/100% 阈值告警（站内 / 邮件 / webhook）。重置由周期键在读取路径推导，无清零定时任务（见「Coding Plan 周期用量限制与小时级重置」）
 - 模型路由：通配 pattern + priority 匹配，支持 `fallback_ids` 降级链（非流式对 429/5xx/超时自动重试；流式不重试避免重复生成）
 - Token 计量：优先解析上游 `usage`（流式自动注入 `include_usage`），usage 双形态（`prompt_tokens` / `input_tokens`）归一化
 - 高级请求配置（extra_body 透传）：渠道级（供应商）与模型级（路由规则）各一份 JSON 对象，请求转发前深合并进上游请求体（模型级覆盖渠道级同名叶键，配置覆盖客户端同名叶键、客户端独有字段保留）——解决 vLLM/SGLang 上 Qwen3 思考参数（`chat_template_kwargs.thinking` / `reasoning_effort`）无法透传的问题，兼容 `top_k`、`repetition_penalty` 等后端特有参数；全局开关可临时停用而不丢配置；`model`/`stream`/`stream_options` 由网关管理、配置被拒绝
@@ -24,15 +25,16 @@
 
 - LDAP 登录（AD / OpenLDAP 配置驱动，memberOf 组映射管理员）+ 本地账号；内置 break-glass 本地管理员
 - JWT 会话（access 15 分钟 / refresh 30 天，可配置），支持强制下线（token 版本吊销）
-- 仪表盘、API Key 自助管理、用量统计（时间段 × 模型维度 + 图表）、实时监控（5 分钟粒度轮询）
-- 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线）、供应商配置（Key AES-256-GCM 加密落库，永不回显；`api_type` 区分 openai / openai-responses / anthropic）、路由规则、模型库、限流规则、月度配额、模型价格、LDAP 设置（含连通性测试）、高级请求配置（extra_body JSON 编辑 + 校验 + 快捷预设 + 最终请求体实时预览）
+- 仪表盘、API Key 自助管理、用量统计（时间段 × 模型维度 + 图表）、实时监控（5 分钟粒度轮询）、我的套餐（当前生效 Coding Plan 的余量与用量）
+- 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线）、供应商配置（Key AES-256-GCM 加密落库，永不回显；`api_type` 区分 openai / openai-responses / anthropic）、路由规则、模型库、限流规则、月度配额、模型价格、Coding Plan 套餐管理、用户分组（批量添加 / LDAP 目录联动同步 / CSV 导出）、Plan 用量监控（趋势图 / 按用户按日期回溯 / 告警流）、LDAP 设置（含连通性测试）、SMTP 告警邮件设置、高级请求配置（extra_body JSON 编辑 + 校验 + 快捷预设 + 最终请求体实时预览）
 - 管理操作全部写入审计日志，可追溯
 
 **公开状态页（仿 status.openai.com）**
 
 - 无需登录的 `/status` 页面 + `GET /api/status`
 - 组件实时状态（网关 / PostgreSQL / 各上游供应商）+ 近 30 天按日可用率色块 + 事故历史（自动检测 + 相邻小时合并 + 严重度分级）
-- 完全基于真实调用记录被动监测，不发合成探测请求，零额外成本
+- 上游供应商双证据判定：每 30 秒主动探测 `{base_url}/1/status`（HTTP 状态码 + 响应体 status 字段 / 服务标识），融合 `usage_logs` 调用统计；端点未部署（404）或鉴权被拒时自动回退纯调用统计
+- 页面每 60 秒自动刷新，刷新失败保留旧数据并显示降级提示条
 
 ## 架构总览
 
@@ -144,19 +146,27 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `POST /v1/messages` | Bearer API Key | Anthropic Messages 调用面（Claude Code / Claude SDK；错误体为 Anthropic 形状） |
 | `GET /api/status` | 无 | 公开状态：组件状态 + 30 天可用率 + 事故 |
 | `POST /api/auth/login`、`/refresh`、`/logout` | — | 控制台会话（LDAP / 本地账号） |
-| `GET /api/me`、`/api/keys`、`/api/usage`、`/api/usage/trend` | JWT | 个人资料、Key 管理、用量查询 |
+| `GET /api/me`、`/api/me/plan`、`/api/keys`、`/api/usage`、`/api/usage/trend` | JWT | 个人资料、我的套餐、Key 管理、用量查询 |
 | `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/quotas`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
+| `GET/POST /api/admin/plans`、`/api/admin/groups`、`/api/admin/plan-alerts`、`/api/admin/smtp` 等 | JWT + 管理员 | Coding Plan 套餐 CRUD 与用量回溯、用户分组（成员管理 / LDAP 同步 / CSV 导出）、阈值告警流、SMTP 设置 |
 
 错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；限流 429 带 `Retry-After`；上游错误透明透传。
 
 ## 状态页监测语义
 
-`/status` 页面的所有结论都来自 `usage_logs` 真实调用记录（`status >= 400` 视为失败；鉴权/限流 4xx 在进入代理管线前返回，不写入日志，不污染错误率）：
+供应商状态 = **主动健康探测 × 调用统计** 双证据融合（`src/service/health.rs`）：
 
-- **组件实时状态**：按窗口错误率判定——优先近 10 分钟，样本不足（<5 次）依次回退 60 分钟、24 小时；≥50% 不可用（红）、≥10% 性能下降（黄）、否则正常（绿）、24 小时无流量显示未知（灰）
+- **主动探测**：网关对每个启用中的供应商 `GET {base_url}/1/status`（携带该渠道自己的鉴权头，超时 5s，网络错误重试 1 次，结果缓存 30s），按响应综合判定：
+  - 2xx + `status` 字段为 ok/healthy/up（及正常/降级/故障中英文词汇表）→ 正常 / 性能下降 / 不可用
+  - 2xx + 无 `status` 字段但含服务标识（service/server/version/success=true 等）→ 按连通性判正常
+  - 2xx + 非 JSON / 无法识别格式 → 性能下降（可达但无法确认服务身份，防劫持页误报）
+  - 连接失败 / 超时 / 5xx / `status` 自报故障 → 不可用
+  - 404（端点未部署）/ 401 / 403 / 429 → 非结论性，回退调用统计（服务可达，不武断判死）
+- **调用统计**（被动证据）：`usage_logs` 真实调用记录（`status >= 400` 视为失败；鉴权/限流 4xx 在进入代理管线前返回，不写入日志，不污染错误率）——窗口错误率判定，优先近 10 分钟，样本不足（<5 次）依次回退 60 分钟、24 小时；≥50% 不可用、≥10% 性能下降、否则正常、24 小时无流量未知
+- **融合规则**：探测不可用 → 直接不可用（结论性证据）；探测存活 → 在探测结论与「调用统计（至多性能下降）」中取更差者（探测正常 + 近期调用错误率高 → 性能下降并在详情中说明，常见为 Key 失效/配额等调用侧原因）；探测非结论性 → 完全采用调用统计
 - **30 天可用率**：按 UTC 日聚合成功率，绿/黄/红/深红分级
 - **事故**：单小时桶调用 ≥5 且错误率 ≥50% 判定事故小时，相邻小时自动合并为一次，峰值 ≥80% 标为重大，进行中（<1 小时）标注「进行中」
-- 系统组件（网关/PostgreSQL）只有实时状态，无历史可用率（被动监测无数据源，如实显示）
+- 系统组件（网关/PostgreSQL）只有实时状态，无历史可用率（如实显示）
 
 
 ## 限流与长时间空闲恢复
@@ -188,6 +198,31 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 - 上游 429 与网关自身 429 相互独立：非流式按降级链重试上游 429/5xx；流式不重试（防重复生成），上游 429 原样透传。
 - 流式请求在网关自身限流处被拒时同样返回 429 JSON（未建立上游连接，无计费）。
 
+## Coding Plan 周期用量限制与小时级重置
+
+按分组将用户绑定到套餐（Coding Plan）：token 上限 + 统计周期 + 超额策略（`block` 拦截 429 / `downgrade` 降级到指定模型并走出站重建路径 / `log` 仅告警）。用户命中多个分组时按 `priority` 最高者整体生效（同分取 `plan_id` 大），多套餐不叠加计量——需要「小时 + 月」双重限值应拆两个分组用 priority 表达。
+
+**统计周期**：`daily`（UTC 当日 00:00 起）/ `monthly`（UTC 自然月）/ `total`（不重置）/ `hourly`（小时级滚动重置）。
+
+### 小时级重置（hourly）语义
+
+滚动桶而非滑动窗口：时间轴按锚点切成连续的 N 小时桶，请求计入其开始时刻所在的桶；翻桶后旧桶封存、余量归零。
+
+- `period_hours`：窗口长度 1..=168（上限一周）
+- `period_anchor_mode`：
+  - `fixed`：UTC 整点网格，桶界 = `epoch + k·N·h`。仅当 N 整除 24 时桶界才与每日 00:00 对齐，N=5/7 等跨日相位漂移是有意行为（纯网格，全局均匀无重叠）
+  - `join`：按成员开通时间（`user_group_members.added_at`）偏移切桶；移除分组后重新加入视同重新开通（新桶、余量重置）
+- **重置是推导出来的，不是调度出来的**：无任何清零定时任务。预检查内存缓存按 `period_key`（hourly 为 `h:<桶起点 epoch 秒>`）翻转归零，`plan_usage_counters` 按新 `period_start` 自然落新行，阈值告警去重键含 period_key 故新周期自动重新武装；旧周期数据保留可回溯
+
+### 计量与一致性
+
+- `plan_usage_counters (user_id, plan_id, period_start TIMESTAMPTZ)` 与 `usage_logs` 同事务 UPSERT（`tokens` 饱和累加防 i64 回绕）；内存当期计数缓存承担热路径预检查，启动 / 30s 周期从 DB 快照重载兜底
+- 周期界全部按 UTC 计算（SQL 显式 `AT TIME ZONE 'UTC'`；hourly 当前桶判定用 `(now − N·h, now]` 开区间窗，与 N、锚点解耦），数据库会话时区不影响结果
+- 重启 / 宕机错过翻桶无需补偿：`period_start` 为纯时间函数，重启后首请求直接命中当前桶；时钟回拨或未来锚点钳位，不产生负槽位
+- 阈值告警 80/95/100%：站内通知 + 邮件（SMTP）+ webhook，进程内 seen 与 `plan_alerts UNIQUE(plan_id, user_id, period_key, level)` 双层去重
+
+管理端点：`/api/admin/plans`（CRUD + 用量回溯）、`/api/admin/plan-alerts`、`/api/me/plan`（我的套餐）；设计细节见 `docs/plans/hourly-reset-design.md`。
+
 ## 数据模型
 
 核心表（迁移见 `migrations/`，随二进制内嵌自动执行）：
@@ -198,7 +233,8 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 | `providers` / `model_routes` | 上游供应商（Key 加密存储、`api_type` 区分 Responses 原生/转换）；模型路由 + 降级链 |
 | `usage_logs` | 用量明细（`request_id` 唯一防重复记账，按用户/时间索引） |
 | `user_monthly_usage` / `usage_daily` | 配额计数（记账事务内 UPSERT）；仪表盘聚合（60s 后台任务） |
-| `model_prices` / `rate_limit_rules` / `user_quotas` | 单价、限流规则、用户配额 |
+| `coding_plans` / `user_groups` / `user_group_members` | 周期配额套餐（token 上限 / 统计周期 / 超额策略）与用户分组（LDAP 联动同步） |
+| `plan_usage_counters` / `plan_alerts` | Plan 当期计数（记账事务内 UPSERT，`period_start` TIMESTAMPTZ）与阈值告警（`period_key` 去重） |
 | `refresh_tokens` / `audit_logs` / `aggregation_state` | 会话、审计、聚合水位 |
 
 ## 本地开发
@@ -206,7 +242,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 ```bash
 # 后端：需要本地 PostgreSQL（或 docker compose up -d postgres）
 cargo run                      # 读取 .env，监听 8443/8080
-cargo test                     # 单元测试 70 项（Responses/Anthropic 转换 + SSE 状态机 + 限流回归）
+cargo test                     # 单元测试 235 项（健康探测判定/融合 + Responses/Anthropic 转换 + SSE 状态机 + 限流回归）
 
 # 前端（Vite dev server，/api 与 /v1 代理到 8443）
 cd web && npm install && npm run dev
@@ -214,7 +250,7 @@ npm run build                  # vue-tsc 类型检查 + 产物构建（提交前
 
 # 无真实上游时本地模拟
 python3 scripts/mock_upstream.py   # http://127.0.0.1:9001/v1，支持 chat（含 tools/reasoning/错误场景）/responses
-```
+                                   # 另暴露 GET /1/status：MOCK_STATUS_MODE 或 /tmp/mock_status_mode 可切 ok/degraded/down/html/shapeless/404/500/timeout
 
 其他脚本：`scripts/gen-cert.sh`（自签证书）、`scripts/deploy-local-binary.sh`（本机编译 release 后打运行时镜像）、`scripts/seed-ldap.sh`（演示用 OpenLDAP 种子数据，配合 `--profile ldap`）。
 
@@ -231,3 +267,4 @@ python3 scripts/mock_upstream.py   # http://127.0.0.1:9001/v1，支持 chat（�
 
 - `docs/plans/2026-08-08-llm-gateway-design.md` — 定稿设计（数据模型、安全设计、权衡清单）
 - `docs/plans/2026-08-10-responses-api-port.md` — Responses API 兼容层移植设计（转换规则、SSE 状态机、回归步骤）
+- `docs/plans/hourly-reset-design.md` — Coding Plan 小时级重置设计（滚动桶模型、边界场景、灰度发布与回滚）

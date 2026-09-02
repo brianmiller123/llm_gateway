@@ -38,9 +38,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/routes",
-            get(list_routes)
-                .post(create_route)
-                .layer(admin.clone()),
+            get(list_routes).post(create_route).layer(admin.clone()),
         )
         .route(
             "/api/admin/routes/{id}",
@@ -65,11 +63,12 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/prices",
-            get(list_prices)
-                .post(create_price)
-                .layer(admin.clone()),
+            get(list_prices).post(create_price).layer(admin.clone()),
         )
-        .route("/api/admin/prices/{id}", delete(delete_price).layer(admin.clone()))
+        .route(
+            "/api/admin/prices/{id}",
+            delete(delete_price).layer(admin.clone()),
+        )
         .route("/api/admin/models", get(list_models).layer(admin.clone()))
         .route(
             "/api/admin/models/refresh",
@@ -111,7 +110,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/api/admin/api-endpoints/results",
             get(list_api_test_results).layer(admin.clone()),
         )
-        .route("/api/admin/models/{id}", delete(delete_model).layer(admin.clone()))
+        .route(
+            "/api/admin/models/{id}",
+            delete(delete_model).layer(admin.clone()),
+        )
         .route(
             "/api/admin/settings/ldap/test",
             post(test_ldap_settings).layer(admin),
@@ -167,7 +169,9 @@ async fn fetch_upstream_models(
                     .and_then(|v| v.get("data").and_then(|d| d.as_array()).cloned())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                            .filter_map(|m| {
+                                m.get("id").and_then(|i| i.as_str()).map(str::to_string)
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -180,10 +184,7 @@ async fn fetch_upstream_models(
         }
     }
     // 失败时展开错误链（hyper 底层原因：dns / tcp / tls / timeout）
-    let mut detail = last_err
-        .as_ref()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    let mut detail = last_err.as_ref().map(|e| e.to_string()).unwrap_or_default();
     if let Some(e) = last_err.as_ref() {
         let mut src = e.source();
         let mut hops = 0;
@@ -213,17 +214,25 @@ async fn test_connection(
     // 1) 表单显式给了 Key → 用之（可测试新 Key）；
     // 2) 未给但指定了已保存的供应商 → 用库里加密 Key 解密（编辑时不改 Key 也能测）
     let key: Option<String> = match (
-        req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()),
+        req.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty()),
         req.provider_id,
     ) {
         (Some(k), _) => Some(k.to_string()),
-        (None, Some(pid)) => match config::find_provider(&st.pool, pid).await.map_err(AppError::internal)? {
+        (None, Some(pid)) => match config::find_provider(&st.pool, pid)
+            .await
+            .map_err(AppError::internal)?
+        {
             Some(p) => crate::crypto::decrypt(&p.api_key_encrypted, &st.cfg.master_key).ok(),
             None => None,
         },
         (None, None) => None,
     };
-    let models = fetch_upstream_models(&st.client, base, key.as_deref()).await.map_err(AppError::BadRequest)?;
+    let models = fetch_upstream_models(&st.client, base, key.as_deref())
+        .await
+        .map_err(AppError::BadRequest)?;
     // 测试的是已保存的供应商 → 把拉到的模型同步进模型库
     if let Some(pid) = req.provider_id {
         config::replace_provider_models(&st.pool, pid, &models)
@@ -249,7 +258,9 @@ async fn test_connection(
 // ---------- 模型库 ----------
 
 async fn list_models(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
-    let models = config::list_models(&st.pool).await.map_err(AppError::internal)?;
+    let models = config::list_models(&st.pool)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(json!({ "models": models })).into_response())
 }
 
@@ -258,7 +269,10 @@ async fn delete_model(
     admin: Admin,
     Path(id): Path<i64>,
 ) -> Result<Response, AppError> {
-    if !config::delete_model(&st.pool, id).await.map_err(AppError::internal)? {
+    if !config::delete_model(&st.pool, id)
+        .await
+        .map_err(AppError::internal)?
+    {
         return Err(AppError::BadRequest("model not found".into()));
     }
     audit::log(
@@ -353,7 +367,10 @@ async fn test_model_once(
     key: &str,
     model: &str,
 ) -> Result<i64, String> {
-    let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
     let body = serde_json::to_vec(&serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
@@ -417,20 +434,18 @@ async fn test_models(
         let sem = semaphore.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
-            let result = |ok: bool,
-                          latency_ms: Option<i64>,
-                          error: Option<String>|
-             -> ModelTestResult {
-                ModelTestResult {
-                    model_id: m.id,
-                    model: m.model_id.clone(),
-                    provider_id: m.provider_id,
-                    provider_name: m.provider_name.clone(),
-                    ok,
-                    latency_ms,
-                    error,
-                }
-            };
+            let result =
+                |ok: bool, latency_ms: Option<i64>, error: Option<String>| -> ModelTestResult {
+                    ModelTestResult {
+                        model_id: m.id,
+                        model: m.model_id.clone(),
+                        provider_id: m.provider_id,
+                        provider_name: m.provider_name.clone(),
+                        ok,
+                        latency_ms,
+                        error,
+                    }
+                };
             let Some(provider) = providers.iter().find(|p| p.id == m.provider_id) else {
                 return result(false, None, Some("provider not found".into()));
             };
@@ -440,13 +455,7 @@ async fn test_models(
             let key = match crate::crypto::decrypt(&provider.api_key_encrypted, &st.cfg.master_key)
             {
                 Ok(k) => k,
-                Err(e) => {
-                    return result(
-                        false,
-                        None,
-                        Some(format!("key decrypt failed: {e}")),
-                    )
-                }
+                Err(e) => return result(false, None, Some(format!("key decrypt failed: {e}"))),
             };
             match test_model_once(&st.client, provider, &key, &m.model_id).await {
                 Ok(latency) => result(true, Some(latency), None),
@@ -527,7 +536,9 @@ fn empty_object() -> serde_json::Value {
 /// extra_body 配置校验：必须是 JSON 对象、不含网关管理的顶层字段、≤ 8KB
 fn validate_extra_body(v: &serde_json::Value) -> Result<(), AppError> {
     let Some(obj) = v.as_object() else {
-        return Err(AppError::BadRequest("extra_body must be a JSON object".into()));
+        return Err(AppError::BadRequest(
+            "extra_body must be a JSON object".into(),
+        ));
     };
     for k in obj.keys() {
         if matches!(k.as_str(), "model" | "stream" | "stream_options") {
@@ -537,7 +548,9 @@ fn validate_extra_body(v: &serde_json::Value) -> Result<(), AppError> {
         }
     }
     if serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX) > 8 * 1024 {
-        return Err(AppError::BadRequest("extra_body too large (max 8KB)".into()));
+        return Err(AppError::BadRequest(
+            "extra_body too large (max 8KB)".into(),
+        ));
     }
     Ok(())
 }
@@ -552,14 +565,21 @@ fn validate_extra_headers(scheme: &str, headers: &serde_json::Value) -> Result<(
         ));
     }
     let Some(obj) = headers.as_object() else {
-        return Err(AppError::BadRequest("extra_headers must be a JSON object".into()));
+        return Err(AppError::BadRequest(
+            "extra_headers must be a JSON object".into(),
+        ));
     };
     for (k, v) in obj {
         // 网关自管头：认证/内容类型/请求追踪不允许被渠道配置覆盖
         let lower = k.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "authorization" | "x-api-key" | "content-type" | "x-request-id" | "content-length" | "host"
+            "authorization"
+                | "x-api-key"
+                | "content-type"
+                | "x-request-id"
+                | "content-length"
+                | "host"
         ) {
             return Err(AppError::BadRequest(format!(
                 "extra_headers field '{k}' is managed by the gateway and cannot be set"
@@ -571,8 +591,14 @@ fn validate_extra_headers(scheme: &str, headers: &serde_json::Value) -> Result<(
             )));
         }
     }
-    if serde_json::to_vec(headers).map(|b| b.len()).unwrap_or(usize::MAX) > 4 * 1024 {
-        return Err(AppError::BadRequest("extra_headers too large (max 4KB)".into()));
+    if serde_json::to_vec(headers)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX)
+        > 4 * 1024
+    {
+        return Err(AppError::BadRequest(
+            "extra_headers too large (max 4KB)".into(),
+        ));
     }
     Ok(())
 }
@@ -605,7 +631,9 @@ async fn create_provider(
 ) -> Result<Response, AppError> {
     let name = req.name.trim();
     if name.is_empty() || name.len() > 64 {
-        return Err(AppError::BadRequest("provider name must be 1-64 chars".into()));
+        return Err(AppError::BadRequest(
+            "provider name must be 1-64 chars".into(),
+        ));
     }
     validate_extra_body(&req.extra_body)?;
     validate_extra_headers(&req.auth_scheme, &req.extra_headers)?;
@@ -676,14 +704,19 @@ async fn update_provider(
 ) -> Result<Response, AppError> {
     if let Some(name) = req.name.as_deref() {
         if name.trim().is_empty() || name.trim().len() > 64 {
-            return Err(AppError::BadRequest("provider name must be 1-64 chars".into()));
+            return Err(AppError::BadRequest(
+                "provider name must be 1-64 chars".into(),
+            ));
         }
     }
     if let Some(v) = req.extra_body.as_ref() {
         validate_extra_body(v)?;
     }
     if let Some(scheme) = req.auth_scheme.as_deref() {
-        validate_extra_headers(scheme, req.extra_headers.as_ref().unwrap_or(&serde_json::json!({})))?;
+        validate_extra_headers(
+            scheme,
+            req.extra_headers.as_ref().unwrap_or(&serde_json::json!({})),
+        )?;
     } else if let Some(v) = req.extra_headers.as_ref() {
         validate_extra_headers("bearer", v)?;
     }
@@ -815,7 +848,10 @@ fn normalize_passthrough_fields(raw: Option<&str>) -> Result<Option<String>, App
         if f.is_empty() {
             continue;
         }
-        if !matches!(f, "store" | "safety_identifier" | "prompt_cache_retention" | "prompt_cache_key") {
+        if !matches!(
+            f,
+            "store" | "safety_identifier" | "prompt_cache_retention" | "prompt_cache_key"
+        ) {
             return Err(AppError::BadRequest(format!(
                 "responses_passthrough_fields contains unsupported field '{f}' \
                  (allowed: store, safety_identifier, prompt_cache_retention, prompt_cache_key)"
@@ -832,7 +868,9 @@ fn normalize_passthrough_fields(raw: Option<&str>) -> Result<Option<String>, App
     }
 }
 async fn list_routes(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
-    let routes = config::list_routes(&st.pool).await.map_err(AppError::internal)?;
+    let routes = config::list_routes(&st.pool)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(json!({"routes": routes})).into_response())
 }
 
@@ -843,7 +881,9 @@ async fn create_route(
 ) -> Result<Response, AppError> {
     let pattern = req.model_pattern.trim();
     if pattern.is_empty() || pattern.len() > 128 {
-        return Err(AppError::BadRequest("model_pattern must be 1-128 chars".into()));
+        return Err(AppError::BadRequest(
+            "model_pattern must be 1-128 chars".into(),
+        ));
     }
     validate_extra_body(&req.extra_body)?;
     // 主供应商与 fallback 必须存在（此前缺口：FK 违例直接 500）
@@ -1195,7 +1235,9 @@ async fn delete_rate_limit(
 // ---------- 用户配额 ----------
 
 async fn list_quotas(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
-    let quotas = config::list_quotas(&st.pool).await.map_err(AppError::internal)?;
+    let quotas = config::list_quotas(&st.pool)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(json!({"quotas": quotas})).into_response())
 }
 
@@ -1276,7 +1318,9 @@ fn default_currency() -> String {
 }
 
 async fn list_prices(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
-    let prices = config::list_prices(&st.pool).await.map_err(AppError::internal)?;
+    let prices = config::list_prices(&st.pool)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(json!({"prices": prices})).into_response())
 }
 
@@ -1295,7 +1339,8 @@ async fn create_price(
         req.input_price_per_m,
         req.output_price_per_m,
         req.currency.trim(),
-        req.effective_from.unwrap_or_else(|| chrono::Local::now().date_naive()),
+        req.effective_from
+            .unwrap_or_else(|| chrono::Local::now().date_naive()),
     )
     .await
     .map_err(AppError::internal)?;
@@ -1370,9 +1415,7 @@ struct LdapSettingsReq {
 /// 校验并整理 LDAP 配置；返回 (settings, 是否需要写入新密码)
 fn validate_ldap_req(req: &LdapSettingsReq) -> Result<(LdapSettings, bool), AppError> {
     let url = req.url.trim().to_string();
-    if !url.is_empty()
-        && !(url.starts_with("ldap://") || url.starts_with("ldaps://"))
-    {
+    if !url.is_empty() && !(url.starts_with("ldap://") || url.starts_with("ldaps://")) {
         return Err(AppError::BadRequest(
             "LDAP URL 必须以 ldap:// 或 ldaps:// 开头".into(),
         ));
@@ -1406,8 +1449,7 @@ fn validate_ldap_req(req: &LdapSettingsReq) -> Result<(LdapSettings, bool), AppE
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(String::from),
-            bind_password: (!req.bind_password.is_empty())
-                .then(|| req.bind_password.clone()),
+            bind_password: (!req.bind_password.is_empty()).then(|| req.bind_password.clone()),
             base_dn: req.base_dn.trim().to_string(),
             user_filter,
             admin_groups,
@@ -1582,7 +1624,9 @@ fn validate_header_map(
     label: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
     let Some(map) = v.as_object() else {
-        return Err(AppError::BadRequest(format!("{label} must be a JSON object")));
+        return Err(AppError::BadRequest(format!(
+            "{label} must be a JSON object"
+        )));
     };
     if map.len() > HEADER_SETTINGS_MAX_ENTRIES {
         return Err(AppError::BadRequest(format!(
@@ -1600,16 +1644,12 @@ fn validate_header_map(
                 "{label}['{k}'] 的值必须是字符串"
             )));
         };
-        if blocklist
-            .iter()
-            .any(|b| name.eq_ignore_ascii_case(b))
-        {
+        if blocklist.iter().any(|b| name.eq_ignore_ascii_case(b)) {
             return Err(AppError::BadRequest(format!(
                 "header '{name}' 由网关管理，不能在 {label} 中设置"
             )));
         }
-        name
-            .parse::<axum::http::HeaderName>()
+        name.parse::<axum::http::HeaderName>()
             .map_err(|e| AppError::BadRequest(format!("header 名 '{name}' 不合法：{e}")))?;
         axum::http::HeaderValue::from_str(value.trim())
             .map_err(|e| AppError::BadRequest(format!("header '{name}' 的值不合法：{e}")))?;
@@ -1650,21 +1690,19 @@ async fn put_header_settings(
 ) -> Result<Response, AppError> {
     // null/缺省字段 = 清空该组（非对象值仍 400）
     let upstream_v = serde_json::Value::Object(
-        req.upstream_headers.as_object().cloned().unwrap_or_default(),
+        req.upstream_headers
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
     );
     let response_v = serde_json::Value::Object(
-        req.response_headers.as_object().cloned().unwrap_or_default(),
+        req.response_headers
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
     );
-    let upstream = validate_header_map(
-        &upstream_v,
-        UPSTREAM_HEADER_BLOCKLIST,
-        "upstream_headers",
-    )?;
-    let response = validate_header_map(
-        &response_v,
-        RESPONSE_HEADER_BLOCKLIST,
-        "response_headers",
-    )?;
+    let upstream = validate_header_map(&upstream_v, UPSTREAM_HEADER_BLOCKLIST, "upstream_headers")?;
+    let response = validate_header_map(&response_v, RESPONSE_HEADER_BLOCKLIST, "response_headers")?;
     let settings = config::HeaderSettings {
         upstream: upstream.clone(),
         response: response.clone(),
@@ -1840,7 +1878,7 @@ async fn test_api_endpoint(
         other => {
             return Err(AppError::BadRequest(format!(
                 "unknown api '{other}' (expect 'responses' or 'messages')"
-            )))
+            )));
         }
     };
     let mut body = req.body;

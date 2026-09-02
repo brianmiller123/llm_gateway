@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use crate::state::AppState;
 use crate::service::plans;
+use crate::state::AppState;
 
 /// 同步周期：LDAP 变更最大传播延迟 ≈ 10 分钟（管理员可随时手动触发立即同步）
 const SYNC_INTERVAL: Duration = Duration::from_secs(600);

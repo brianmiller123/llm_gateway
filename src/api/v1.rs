@@ -13,7 +13,10 @@ use crate::state::AppState;
 
 /// 客户端 IP：X-Forwarded-For 首值可解析时用之（假定经可信反代部署），
 /// 否则取对端地址。仅用于用量统计，非安全边界（直连场景可伪造 XFF）。
-pub(crate) fn resolve_client_ip(peer: SocketAddr, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
+pub(crate) fn resolve_client_ip(
+    peer: SocketAddr,
+    headers: &axum::http::HeaderMap,
+) -> std::net::IpAddr {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -189,12 +192,10 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
     let is_admin = uid
         .map(|u| st.admin_ids.read().contains(&u))
         .unwrap_or(true);
-    let can_use = |provider_id: i64, model: &str| {
-        match uid {
-            None => true,
-            Some(_) if is_admin => true,
-            Some(u) => crate::service::routing::user_can_use(&st, u, provider_id, model),
-        }
+    let can_use = |provider_id: i64, model: &str| match uid {
+        None => true,
+        Some(_) if is_admin => true,
+        Some(u) => crate::service::routing::user_can_use(&st, u, provider_id, model),
     };
 
     let mut seen: Vec<String> = Vec::new();
@@ -245,5 +246,9 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             push(r.model_pattern.clone());
         }
     }
-    (StatusCode::OK, Json(json!({"object": "list", "data": data}))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({"object": "list", "data": data})),
+    )
+        .into_response()
 }

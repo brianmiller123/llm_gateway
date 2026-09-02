@@ -13,9 +13,13 @@ const daily = ref<MyPlanResp['daily']>([])
 const notifications = ref<MyNotificationsResp['notifications']>([])
 
 const PERIOD_LABELS: Record<string, string> = {
+  hourly: '小时级重置',
   daily: '按自然日重置',
   monthly: '按自然月重置',
   total: '总量（不重置）',
+}
+function periodLabel(pt: string, hours?: number): string {
+  return pt === 'hourly' ? `每 ${hours ?? 1} 小时重置` : PERIOD_LABELS[pt] ?? pt
 }
 const OVERAGE_LABELS: Record<string, string> = {
   block: '超额后暂停请求',
@@ -93,11 +97,11 @@ onBeforeUnmount(() => {
         <div>
           <div class="plan-name">{{ plan.name }}</div>
           <div class="plan-meta">
-            所属分组：{{ plan.group }} · {{ PERIOD_LABELS[plan.period_type] }} ·
+            所属分组：{{ plan.group }} · {{ periodLabel(plan.period_type, plan.period_hours) }} ·
             {{ OVERAGE_LABELS[plan.overage_action] }}
             <template v-if="plan.downgrade_model">（{{ plan.downgrade_model }}）</template>
           </div>
-        </div>
+          </div>
         <div class="limit-chip">配额 {{ plan.token_limit_display }} tokens</div>
       </div>
       <el-progress
