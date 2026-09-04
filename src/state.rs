@@ -26,8 +26,9 @@ pub struct AppState {
     pub prices: Arc<RwLock<HashMap<String, ModelPrice>>>,
     /// 用户访问授权白名单：user_id → 规则列表（空/缺省 = 默认放行）
     pub user_access: Arc<RwLock<HashMap<i64, Vec<UserAccessRule>>>>,
-    /// Coding Plan 运行时：user_id → 生效 Plan（多分组按 priority 择优；reload 刷新）
-    pub plans: Arc<RwLock<HashMap<i64, crate::store::plans::PlanRuntime>>>,
+    /// Coding Plan 运行时：user_id → 候选 Plan 列表（双通道全集，reload 刷新；
+    /// 请求期用 store::plans::resolve_plan 按「当前生效时段 + priority 择优」解析）
+    pub plans: Arc<RwLock<HashMap<i64, Vec<crate::store::plans::PlanRuntime>>>>,
     /// 管理员用户 id 集合（授权检查时跳过）
     pub admin_ids: Arc<RwLock<HashSet<i64>>>,
     /// M3：进程内每渠道熔断器（连续可重试失败 → 短窗跳过；仅内存态）
@@ -47,8 +48,8 @@ pub struct AppState {
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
     pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,
     pub quota_alerts: Arc<Mutex<HashSet<(i64, String)>>>,
-    /// 状态页主动健康探测缓存：provider_id → 最近一次 /1/status 探测结果
-    /// （TTL 30s 内复用；api::status 刷新，见 service::health::snapshot）
+    /// 状态页主动健康探测缓存：provider_id → 最近一次探测结果（/1/status，
+    /// 非结论性时回退 /v1/models；TTL 30s 内复用；api::status 刷新，见 service::health::snapshot）
     pub provider_health: Arc<tokio::sync::Mutex<HashMap<i64, crate::service::health::ProbeResult>>>,
     /// Plan 阈值告警进程内去重：(user_id, plan_id, period_key, level)
     pub plan_alerts_seen: Arc<Mutex<HashSet<(i64, i64, String, i16)>>>,

@@ -1,9 +1,10 @@
 //! Coding Plan 与用户分组管理 API：
-//! - 管理员（require_admin）：Plan CRUD + 用量看板/回溯、分组 CRUD + 成员管理
-//!   （手动/批量/一键全部/LDAP 同步/CSV 导出）、成员选择器分页检索、阈值告警查询、
-//!   SMTP 告警邮箱配置
+//! - 管理员（require_admin）：Plan CRUD + 用量看板/回溯 + 成员管理（直连用户 /
+//!   加入分组：列表、候选分页检索、批量添加/移除）；分组 CRUD + 成员管理
+//!   （手动/批量/一键全部/LDAP 同步/CSV 导出）；阈值告警查询；SMTP 告警邮箱配置
 //! - 普通用户（ConsoleUser）：本人生效 Plan 额度与消耗明细、站内通知
 //!
+//! Plan 成员添加为全有或全无：重复加入返回 409（带成员名列表），参数错误返回 400。
 //! 全部配置变更写审计日志（变更前后快照）；写入后 `AppState::reload()` 即时生效。
 
 use axum::body::Body;
@@ -36,6 +37,38 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/admin/plans/{id}/usage",
             get(plan_usage).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/users",
+            get(plan_users_list).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/users/add",
+            post(plan_users_add).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/users/remove",
+            post(plan_users_remove).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/user-candidates",
+            get(plan_user_candidates).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/groups",
+            get(plan_groups_list).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/groups/add",
+            post(plan_groups_add).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/groups/remove",
+            post(plan_groups_remove).layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/plans/{id}/group-candidates",
+            get(plan_group_candidates).layer(admin.clone()),
         )
         .route(
             "/api/admin/plan-alerts",
@@ -184,6 +217,34 @@ async fn list_plans(
     Ok(Json(json!({ "plans": plans })))
 }
 
+/// 生效时段入参：start/end 双空 = 全天；成对出现 = 设置（支持跨零点）
+#[derive(Deserialize)]
+struct PlanActiveWindow {
+    start: Option<String>,
+    end: Option<String>,
+}
+
+/// active_window 入参 → 存储三态：None=保留（仅 PATCH）/ Some(None)=全天 /
+/// Some(Some((s, e)))=设置。缺一或相等均 400。
+fn parse_active_window(
+    w: Option<PlanActiveWindow>,
+) -> Result<Option<Option<(chrono::NaiveTime, chrono::NaiveTime)>>, AppError> {
+    let Some(w) = w else { return Ok(None) };
+    let parse = |v: &Option<String>| -> Result<Option<chrono::NaiveTime>, AppError> {
+        v.as_deref()
+            .map(plan_store::parse_active_time)
+            .transpose()
+            .map_err(AppError::BadRequest)
+    };
+    let s = parse(&w.start)?;
+    let e = parse(&w.end)?;
+    plan_store::validate_active_window(s, e).map_err(AppError::BadRequest)?;
+    Ok(Some(match (s, e) {
+        (Some(s), Some(e)) => Some((s, e)),
+        _ => None,
+    }))
+}
+
 #[derive(Deserialize)]
 struct PlanCreateReq {
     name: String,
@@ -208,6 +269,9 @@ struct PlanCreateReq {
     alert_channels: Option<Vec<String>>,
     #[serde(default)]
     webhook_url: String,
+    /// 生效时段（None = 全天）
+    #[serde(default)]
+    active_window: Option<PlanActiveWindow>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -253,6 +317,11 @@ async fn create_plan(
             "downgrade_action requires downgrade_model".into(),
         ));
     }
+    let active_window = parse_active_window(req.active_window)?;
+    let (active_start, active_end) = match active_window.flatten() {
+        Some((s, e)) => (Some(s), Some(e)),
+        None => (None, None),
+    };
     let created = plan_store::create_plan(
         &st.pool,
         name,
@@ -266,6 +335,8 @@ async fn create_plan(
         req.downgrade_model.as_deref(),
         &json!(channels),
         req.webhook_url.trim(),
+        active_start,
+        active_end,
         req.enabled,
     )
     .await
@@ -300,7 +371,10 @@ struct PlanUpdateReq {
     /// Some(None) = 清空；Some(Some(m)) = 设置
     downgrade_model: Option<Option<String>>,
     alert_channels: Option<Vec<String>>,
+    #[serde(default)]
     webhook_url: Option<String>,
+    /// 生效时段（成对原子更新：absent=保留 / 双 null=全天 / "HH:MM" 对=设置）
+    active_window: Option<PlanActiveWindow>,
     enabled: Option<bool>,
 }
 
@@ -343,6 +417,7 @@ async fn update_plan(
             "downgrade_action requires downgrade_model".into(),
         ));
     }
+    let active_window = parse_active_window(req.active_window)?;
     let updated = plan_store::update_plan(
         &st.pool,
         id,
@@ -359,6 +434,7 @@ async fn update_plan(
             .map(|o| o.as_deref().map(str::trim)),
         channels_json.as_ref(),
         req.webhook_url.as_deref().map(str::trim),
+        active_window,
         req.enabled,
     )
     .await
@@ -390,17 +466,17 @@ async fn delete_plan(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::BadRequest("plan not found".into()))?;
-    let affected = plan_store::delete_plan(&st.pool, id)
+    let impact = plan_store::delete_plan(&st.pool, id)
         .await
         .map_err(AppError::internal)?
-        .unwrap_or(0);
+        .ok_or_else(|| AppError::BadRequest("plan not found".into()))?;
     st.reload().await.map_err(AppError::internal)?;
-    // 兜底通知：绑定的分组失去 Plan，成员回退次优先级分组或暂不限额
+    // 兜底通知：加入的分组与直连用户失去 Plan，成员回退次优先级分组或暂不限额
     crate::service::notify::system_notice(
         &st,
         &format!(
-            "Coding Plan「{}」已被管理员 {} 删除，{} 个绑定分组失去配额（成员回退其他分组 Plan 或暂不限额）",
-            before.name, admin.0.username, affected
+            "Coding Plan「{}」已被管理员 {} 删除，{} 个加入分组、{} 个直连用户失去配额（成员回退其他分组 Plan 或暂不限额）",
+            before.name, admin.0.username, impact.groups, impact.direct_users
         ),
     )
     .await;
@@ -410,11 +486,13 @@ async fn delete_plan(
         "plan.delete",
         Some("coding_plan"),
         Some(id),
-        Some(json!({"before": plan_row_to_value(&before), "affected_groups": affected})),
+        Some(json!({"before": plan_row_to_value(&before), "affected_groups": impact.groups, "affected_direct_users": impact.direct_users})),
     )
     .await
     .map_err(AppError::internal)?;
-    Ok(Json(json!({"ok": true, "affected_groups": affected})))
+    Ok(Json(
+        json!({"ok": true, "affected_groups": impact.groups, "affected_direct_users": impact.direct_users}),
+    ))
 }
 
 /// 名称唯一冲突 → 400 可读提示（其余 DB 错误照常 internal）
@@ -428,6 +506,320 @@ fn map_plan_conflict(e: sqlx::Error) -> AppError {
         }
     }
     AppError::internal(e)
+}
+
+// ---------- Plan 成员管理（直连用户 / 加入分组） ----------
+
+#[derive(Deserialize)]
+struct PlanMemberListParams {
+    q: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+/// (page, page_size, offset)
+fn member_page(p: &PlanMemberListParams) -> (i64, i64, i64) {
+    let page_size = p.page_size.unwrap_or(20).clamp(1, 200);
+    let page = p.page.unwrap_or(1).max(1);
+    (page, page_size, (page - 1) * page_size)
+}
+
+/// 去重并排序：重复 id 会让 rows_affected < 请求数，误报并发冲突
+fn dedup_ids(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn ids_csv(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn names_cn(pairs: &[(i64, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(id, n)| format!("{n}(#{id})"))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+#[derive(Clone, Copy)]
+enum MemberKind {
+    User,
+    Group,
+}
+
+impl MemberKind {
+    /// 审计动作 / 空参报错 / 冲突报错里的中文标签
+    fn label(self) -> &'static str {
+        match self {
+            MemberKind::User => "用户",
+            MemberKind::Group => "分组",
+        }
+    }
+    fn empty_msg(self) -> String {
+        match self {
+            MemberKind::User => "user_ids 不能为空".into(),
+            MemberKind::Group => "group_ids 不能为空".into(),
+        }
+    }
+}
+
+/// 重复加入 → 409（带可读的成员名列表）
+async fn plan_member_conflict(st: &AppState, kind: MemberKind, dup: &[i64]) -> AppError {
+    let names = match kind {
+        MemberKind::User => plan_store::user_names(&st.pool, dup).await,
+        MemberKind::Group => plan_store::group_names(&st.pool, dup).await,
+    };
+    match names {
+        Ok(names) => AppError::Conflict(format!(
+            "以下{}已加入该 Plan: {}",
+            kind.label(),
+            names_cn(&names)
+        )),
+        Err(e) => AppError::internal(e),
+    }
+}
+
+/// 添加成员公共实现：参数校验(400) → 事务内重复预检(409，全量回滚) → reload + 审计
+async fn add_plan_members(
+    st: &AppState,
+    plan_id: i64,
+    admin_id: i64,
+    kind: MemberKind,
+    raw_ids: Vec<i64>,
+) -> Result<axum::Json<Value>, AppError> {
+    let ids = dedup_ids(raw_ids);
+    if ids.is_empty() {
+        return Err(AppError::BadRequest(kind.empty_msg()));
+    }
+    ensure_plan_exists(st, plan_id).await?;
+    let missing = match kind {
+        MemberKind::User => plan_store::missing_user_ids(&st.pool, &ids)
+            .await
+            .map_err(AppError::internal)?,
+        MemberKind::Group => plan_store::missing_group_ids(&st.pool, &ids)
+            .await
+            .map_err(AppError::internal)?,
+    };
+    if !missing.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "以下{}不存在: {}",
+            kind.label(),
+            ids_csv(&missing)
+        )));
+    }
+    // 重复预检与插入同事务；PK 唯一约束兜底并发窗口（后到者新增 0 行 → 回滚报 409）
+    let mut tx = st.pool.begin().await.map_err(AppError::internal)?;
+    let dup = match kind {
+        MemberKind::User => plan_store::existing_plan_user_ids(&mut *tx, plan_id, &ids)
+            .await
+            .map_err(AppError::internal)?,
+        MemberKind::Group => plan_store::existing_plan_group_ids(&mut *tx, plan_id, &ids)
+            .await
+            .map_err(AppError::internal)?,
+    };
+    if !dup.is_empty() {
+        return Err(plan_member_conflict(st, kind, &dup).await);
+    }
+    let added = match kind {
+        MemberKind::User => plan_store::add_plan_users(&mut *tx, plan_id, &ids)
+            .await
+            .map_err(AppError::internal)?,
+        MemberKind::Group => plan_store::add_plan_groups(&mut *tx, plan_id, &ids)
+            .await
+            .map_err(AppError::internal)?,
+    };
+    if added != ids.len() as u64 {
+        // 预检后有并发写入抢注：回滚本次全量，按当前状态报冲突
+        let dup = match kind {
+            MemberKind::User => plan_store::existing_plan_user_ids(&mut *tx, plan_id, &ids)
+                .await
+                .map_err(AppError::internal)?,
+            MemberKind::Group => plan_store::existing_plan_group_ids(&mut *tx, plan_id, &ids)
+                .await
+                .map_err(AppError::internal)?,
+        };
+        return Err(plan_member_conflict(st, kind, &dup).await);
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    // 成员关系变更影响生效 Plan → 运行时热重载
+    st.reload().await.map_err(AppError::internal)?;
+    let action = match kind {
+        MemberKind::User => "plan.members.add_users",
+        MemberKind::Group => "plan.members.add_groups",
+    };
+    audit::log(
+        &st.pool,
+        Some(admin_id),
+        action,
+        Some("coding_plan"),
+        Some(plan_id),
+        Some(json!({"ids": ids, "added": added})),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(axum::Json(json!({"added": added})))
+}
+
+/// 移除成员公共实现（移除不存在的 id 静默跳过，与分组成员语义一致）
+async fn remove_plan_members(
+    st: &AppState,
+    plan_id: i64,
+    admin_id: i64,
+    kind: MemberKind,
+    raw_ids: Vec<i64>,
+) -> Result<axum::Json<Value>, AppError> {
+    let ids = dedup_ids(raw_ids);
+    if ids.is_empty() {
+        return Err(AppError::BadRequest(kind.empty_msg()));
+    }
+    ensure_plan_exists(st, plan_id).await?;
+    let removed = match kind {
+        MemberKind::User => plan_store::remove_plan_users(&st.pool, plan_id, &ids)
+            .await
+            .map_err(AppError::internal)?,
+        MemberKind::Group => plan_store::remove_plan_groups(&st.pool, plan_id, &ids)
+            .await
+            .map_err(AppError::internal)?,
+    };
+    st.reload().await.map_err(AppError::internal)?;
+    let action = match kind {
+        MemberKind::User => "plan.members.remove_users",
+        MemberKind::Group => "plan.members.remove_groups",
+    };
+    audit::log(
+        &st.pool,
+        Some(admin_id),
+        action,
+        Some("coding_plan"),
+        Some(plan_id),
+        Some(json!({"ids": ids, "removed": removed})),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(axum::Json(json!({"removed": removed})))
+}
+
+#[derive(Deserialize)]
+struct PlanUsersAddReq {
+    user_ids: Vec<i64>,
+}
+
+async fn plan_users_list(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Query(p): Query<PlanMemberListParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let _ = admin;
+    ensure_plan_exists(&st, id).await?;
+    let (page, page_size, offset) = member_page(&p);
+    let (rows, total) =
+        plan_store::list_plan_users(&st.pool, id, non_empty(&p.q), page_size, offset)
+            .await
+            .map_err(AppError::internal)?;
+    Ok(Json(
+        json!({"members": rows, "total": total, "page": page, "page_size": page_size}),
+    ))
+}
+
+async fn plan_users_add(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Json(req): Json<PlanUsersAddReq>,
+) -> Result<impl IntoResponse, AppError> {
+    add_plan_members(&st, id, admin.0.id, MemberKind::User, req.user_ids).await
+}
+
+async fn plan_users_remove(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Json(req): Json<PlanUsersAddReq>,
+) -> Result<impl IntoResponse, AppError> {
+    remove_plan_members(&st, id, admin.0.id, MemberKind::User, req.user_ids).await
+}
+
+async fn plan_user_candidates(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Query(p): Query<PlanMemberListParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let _ = admin;
+    ensure_plan_exists(&st, id).await?;
+    let (page, page_size, offset) = member_page(&p);
+    let (rows, total) =
+        plan_store::search_users_for_plan(&st.pool, id, non_empty(&p.q), page_size, offset)
+            .await
+            .map_err(AppError::internal)?;
+    Ok(Json(
+        json!({"users": rows, "total": total, "page": page, "page_size": page_size}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PlanGroupsAddReq {
+    group_ids: Vec<i64>,
+}
+
+async fn plan_groups_list(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Query(p): Query<PlanMemberListParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let _ = admin;
+    ensure_plan_exists(&st, id).await?;
+    let (page, page_size, offset) = member_page(&p);
+    let (rows, total) =
+        plan_store::list_plan_groups(&st.pool, id, non_empty(&p.q), page_size, offset)
+            .await
+            .map_err(AppError::internal)?;
+    Ok(Json(
+        json!({"groups": rows, "total": total, "page": page, "page_size": page_size}),
+    ))
+}
+
+async fn plan_groups_add(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Json(req): Json<PlanGroupsAddReq>,
+) -> Result<impl IntoResponse, AppError> {
+    add_plan_members(&st, id, admin.0.id, MemberKind::Group, req.group_ids).await
+}
+
+async fn plan_groups_remove(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Json(req): Json<PlanGroupsAddReq>,
+) -> Result<impl IntoResponse, AppError> {
+    remove_plan_members(&st, id, admin.0.id, MemberKind::Group, req.group_ids).await
+}
+
+async fn plan_group_candidates(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    admin: axum::extract::Extension<users::UserRow>,
+    Query(p): Query<PlanMemberListParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let _ = admin;
+    ensure_plan_exists(&st, id).await?;
+    let (page, page_size, offset) = member_page(&p);
+    let (rows, total) =
+        plan_store::search_groups_for_plan(&st.pool, id, non_empty(&p.q), page_size, offset)
+            .await
+            .map_err(AppError::internal)?;
+    Ok(Json(
+        json!({"groups": rows, "total": total, "page": page, "page_size": page_size}),
+    ))
 }
 
 // ---------- Plan 用量看板/回溯 ----------
@@ -554,7 +946,6 @@ struct GroupCreateReq {
     name: String,
     #[serde(default)]
     description: String,
-    plan_id: Option<i64>,
     #[serde(default)]
     ldap_sync: bool,
 }
@@ -568,18 +959,9 @@ async fn create_group(
     if name.is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
-    if let Some(pid) = req.plan_id {
-        ensure_plan_exists(&st, pid).await?;
-    }
-    let group = groups::create_group(
-        &st.pool,
-        name,
-        req.description.trim(),
-        req.plan_id,
-        req.ldap_sync,
-    )
-    .await
-    .map_err(map_group_conflict)?;
+    let group = groups::create_group(&st.pool, name, req.description.trim(), req.ldap_sync)
+        .await
+        .map_err(map_group_conflict)?;
     st.reload().await.map_err(AppError::internal)?;
     audit::log(
         &st.pool,
@@ -598,10 +980,6 @@ async fn create_group(
 struct GroupUpdateReq {
     name: Option<String>,
     description: Option<String>,
-    /// 绑定到指定 Plan
-    plan_id: Option<i64>,
-    /// 解绑 Plan（plan_id 与 clear_plan 同时出现时以 clear_plan 优先）
-    clear_plan: Option<bool>,
     ldap_sync: Option<bool>,
 }
 
@@ -615,28 +993,16 @@ async fn update_group(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::BadRequest("group not found".into()))?;
-    if let Some(pid) = req.plan_id {
-        ensure_plan_exists(&st, pid).await?;
-    }
-    // 三态：clear_plan=true → 解绑；否则 plan_id Some → 换绑；都缺省 → 不修改
-    let plan_tri: Option<Option<i64>> = if req.clear_plan == Some(true) {
-        Some(None)
-    } else {
-        req.plan_id.map(Some)
-    };
     let updated = groups::update_group(
         &st.pool,
         id,
         req.name.as_deref().map(str::trim),
         req.description.as_deref().map(str::trim),
-        plan_tri,
         req.ldap_sync,
     )
     .await
     .map_err(|e| map_group_conflict(e))?
     .ok_or_else(|| AppError::BadRequest("group not found".into()))?;
-    // 绑定调整即时生效（运行时 Plan 表重载）
-    st.reload().await.map_err(AppError::internal)?;
     audit::log(
         &st.pool,
         Some(admin.0.id),
@@ -1013,7 +1379,8 @@ async fn my_plan(
     user: super::console::ConsoleUser,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = user.user.id;
-    let rt = st.plans.read().get(&uid).cloned();
+    // 生效时段按服务器本地墙钟；配额周期口径仍 UTC
+    let rt = plan_store::resolve_plan(&st.plans.read(), uid, chrono::Local::now().time());
     let now = chrono::Utc::now();
     let period = match &rt {
         Some(p) => {
@@ -1045,6 +1412,8 @@ async fn my_plan(
             "token_limit_display": plan_store::format_token_limit(p.token_limit),
             "overage_action": p.overage_action,
             "downgrade_model": p.downgrade_model,
+            "active_start": p.active_start.map(|t| t.format("%H:%M").to_string()),
+            "active_end": p.active_end.map(|t| t.format("%H:%M").to_string()),
         })
     });
     // 本人近 30 日逐日消耗（明细）

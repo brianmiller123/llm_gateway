@@ -105,6 +105,7 @@ pub fn error_response(err: &AppError) -> Response {
             "quota exceeded, please contact administrator".into(),
         ),
         AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "invalid_request_error", m.clone()),
+        AppError::Conflict(m) => (StatusCode::CONFLICT, "invalid_request_error", m.clone()),
         AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error", m.clone()),
         AppError::ServiceUnavailable(m) => (
             StatusCode::SERVICE_UNAVAILABLE,

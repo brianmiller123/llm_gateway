@@ -888,7 +888,8 @@ async fn proxy_authed(
 
     // Coding Plan 计量载荷：生效 Plan → (plan_id, period_start, period_key)
     let plan_bill = user_id.and_then(|uid| {
-        let rt = st.plans.read().get(&uid).cloned()?;
+        let rt =
+            crate::store::plans::resolve_plan(&st.plans.read(), uid, chrono::Local::now().time())?;
         let now = chrono::Utc::now();
         Some(crate::store::usage::PlanBill {
             plan_id: rt.plan_id,

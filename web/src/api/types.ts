@@ -551,6 +551,9 @@ export interface CodingPlan {
   downgrade_model: string | null
   alert_channels: string[]
   webhook_url: string
+  /** 生效时段 "HH:MM"（null = 全天）；start > end = 跨零点 */
+  active_start: string | null
+  active_end: string | null
   enabled: boolean
   updated_at: string
 }
@@ -618,13 +621,18 @@ export interface PlanAlertsResp {
   alerts: PlanAlert[]
 }
 
+export interface GroupPlanRef {
+  id: number
+  name: string
+  enabled: boolean
+}
+
 export interface UserGroup {
   id: number
   name: string
   description: string
-  plan_id: number | null
-  plan_name: string | null
-  plan_enabled: boolean | null
+  /** 已加入的 Plan（plan_groups 关联；一组可加入多个 Plan） */
+  plans: GroupPlanRef[]
   ldap_sync: boolean
   member_count: number
   last_sync_at: string | null
@@ -666,6 +674,57 @@ export interface UserPick {
 
 export interface UserPickResp {
   users: UserPick[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** Plan 直连用户成员 */
+export interface PlanMemberUser {
+  user_id: number
+  username: string
+  display_name: string | null
+  email: string | null
+  status: number
+  added_at: string
+}
+
+export interface PlanUsersResp {
+  members: PlanMemberUser[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** Plan 已加入分组 */
+export interface PlanMemberGroup {
+  group_id: number
+  name: string
+  description: string
+  ldap_sync: boolean
+  member_count: number
+  added_at: string
+}
+
+export interface PlanGroupsResp {
+  groups: PlanMemberGroup[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** Plan 分组选择器行 */
+export interface PlanGroupPick {
+  id: number
+  name: string
+  description: string
+  ldap_sync: boolean
+  member_count: number
+  is_member: boolean
+}
+
+export interface PlanGroupPickResp {
+  groups: PlanGroupPick[]
   total: number
   page: number
   page_size: number

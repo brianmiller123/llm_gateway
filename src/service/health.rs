@@ -1,17 +1,26 @@
-//! 上游供应商主动健康探测：GET `{base_url}/1/status`。
+//! 上游供应商主动健康探测：先 GET `{base_url}/1/status`，非结论性时回退
+//! GET `{base_url}/models`（OpenAI 兼容事实标准探针）。
 //!
 //! 状态页此前仅依赖 usage_logs 窗口错误率（被动证据）：无流量或流量陈旧时
-//! 无法判断服务是否真正可用。本模块向各渠道 base_url 下的 `/1/status` 发起
-//! 探测，按「HTTP 状态码 + 响应体内容（status 字段 / 服务标识）」综合判定：
+//! 无法判断服务是否真正可用。本模块按「HTTP 状态码 + 响应体内容」综合判定：
 //!
+//! 第一跳 `/1/status`（Algolia Status API 式公开惯例；主流 LLM 上游普遍未部署，
+//! 实测 OpenAI/Anthropic/Moonshot/SiliconFlow 等均为 404）：
 //! - 2xx + `status` 字段识别词汇表（ok/degraded/down 族）→ 结论性判定
 //! - 2xx + 无 status 字段但含服务标识（service/server/version/success=true 等）
 //!   → 按连通性判 operational（正向证据）
 //! - 2xx + 非 JSON / 无法识别的格式 → degraded（可达但无法确认服务身份，
 //!   防劫持/错误页误报为正常）
-//! - 404 / 401 / 403 / 429 / 其他 4xx → inconclusive（端点不可用作判定依据，
-//!   回退调用统计；服务本身可达，不武断判死）
 //! - 5xx → down；网络层失败（DNS/TCP/TLS/超时，重试 1 次后仍失败）→ down
+//!
+//! 第一跳返回 404/401/403/429/其他 4xx（非结论性）时回退第二跳
+//! `{base_url}/models`（免费不计费，拼接方式与代理转发一致）：
+//! - 2xx + OpenAI 兼容模型列表（object="list" / data 数组）→ operational
+//! - 401/403 → degraded（端点存活但渠道 Key 无效/无权限，调用预期失败）
+//! - 404/429/其他 4xx / 网络失败（第一跳刚拿到过 HTTP 应答，多为抖动）→
+//!   仍非结论性，回退调用统计判定
+//!
+//! 两跳均非结论性时，组件状态完全采用调用统计（原机制）。
 //!
 //! 探测结果缓存于 AppState（TTL 30s）：状态页是公开端点，多观察者 × 60s 轮询
 //! 不能每次都打满上游；TTL 小于页面轮询周期，保证每次轮询都拿到新鲜探测。
@@ -77,33 +86,95 @@ pub struct ProbeResult {
     pub checked_at: DateTime<Utc>,
 }
 
-/// 探测 URL：与 proxy::send_upstream 同款 base_url 清洗（去尾 `/`、剥 query/fragment）。
-/// base_url 约定以 /v1 结尾的渠道会得到 `{base}/v1/1/status`——若端点未部署将
-/// 404 → inconclusive 回退调用统计，不会误报。
-pub fn health_url(base_url: &str) -> String {
-    let base = base_url
+/// base_url 清洗（与 proxy::send_upstream 同款）：去首尾空白、去尾 `/`、剥 query/fragment。
+fn clean_base(base_url: &str) -> &str {
+    base_url
         .trim()
         .trim_end_matches('/')
         .split(['?', '#'])
         .next()
-        .unwrap_or("");
-    format!("{base}{HEALTH_PATH}")
+        .unwrap_or("")
 }
 
-/// 探测单个供应商：网络层失败重试 1 次；HTTP 层响应不重试（服务已应答，结果即证据）
+/// 第一跳探测 URL：`{base}/1/status`。base_url 约定以 /v1 结尾的渠道得到
+/// `{base}/v1/1/status`；主流上游未部署时 404 → 触发 models 回退探测。
+pub fn health_url(base_url: &str) -> String {
+    format!("{}{}", clean_base(base_url), HEALTH_PATH)
+}
+
+/// 第二跳回退探测 URL：`{base}/models`——拼接方式与代理转发一致，
+/// base_url 含 /v1 时即 OpenAI 兼容标准端点 `/v1/models`。
+fn models_url(base_url: &str) -> String {
+    format!("{}/models", clean_base(base_url))
+}
+
+/// 探测单个供应商：第一跳 `/1/status`；非结论性时回退第二跳 `/models`。
+/// 网络层失败重试 1 次；HTTP 层响应不重试（服务已应答，结果即证据）。
 pub async fn probe_provider(
     client: &reqwest::Client,
     provider: &Provider,
     api_key: Option<&str>,
 ) -> ProbeResult {
-    let url = health_url(&provider.base_url);
+    let first = request_probe(
+        client,
+        provider,
+        api_key,
+        &health_url(&provider.base_url),
+        classify_success_body,
+        Verdict::Down,
+    )
+    .await;
+    if first.verdict != Verdict::Inconclusive {
+        return first;
+    }
+    // 回退第二跳：models 列表是 OpenAI 兼容生态的事实标准连通性探针（免费不计费）。
+    // 401/403 说明端点存活但渠道 Key 无效/无 models 权限 → 结论性 degraded；
+    // 网络失败视为抖动（第一跳刚拿到过 HTTP 应答）→ 非结论性交还调用统计。
+    let mut second = request_probe(
+        client,
+        provider,
+        api_key,
+        &models_url(&provider.base_url),
+        classify_models_body,
+        Verdict::Inconclusive,
+    )
+    .await;
+    if second.verdict == Verdict::Inconclusive
+        && matches!(second.http_status, Some(401) | Some(403))
+    {
+        second.verdict = Verdict::Degraded;
+        second.detail = Some(format!(
+            "models 端点存活但鉴权被拒（HTTP {}）：渠道 Key 可能失效或无 models 权限，调用预期失败",
+            second.http_status.unwrap()
+        ));
+    }
+    // 状态页详情拼接两跳叙事：保留第一跳 404/401/429 的原始原因
+    second.detail = Some(match second.detail.take() {
+        Some(d) => format!(
+            "{}；回退 models 探测：{d}",
+            first.detail.unwrap_or_default()
+        ),
+        None => first.detail.unwrap_or_default(),
+    });
+    second
+}
+
+/// 单次探测请求（两跳共用）：重试 1 次后仍网络失败 → 按 `network_verdict` 收场。
+async fn request_probe(
+    client: &reqwest::Client,
+    provider: &Provider,
+    api_key: Option<&str>,
+    url: &str,
+    success: fn(&str) -> (Verdict, String),
+    network_verdict: Verdict,
+) -> ProbeResult {
     let started = std::time::Instant::now();
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 0..2 {
         if attempt > 0 {
             tokio::time::sleep(PROBE_RETRY_DELAY).await;
         }
-        let mut rb = client.get(&url).timeout(PROBE_TIMEOUT);
+        let mut rb = client.get(url).timeout(PROBE_TIMEOUT);
         // 认证形态与代理转发一致（send_upstream 同款）：x-api-key 或 Bearer。
         // Key 只发往该渠道自身的 base_url，与真实调用暴露面一致，无额外泄露。
         if let Some(k) = api_key {
@@ -120,7 +191,7 @@ pub async fn probe_provider(
         match rb.send().await {
             Ok(resp) => {
                 let latency = started.elapsed();
-                return classify_response(resp, url, latency).await;
+                return classify_response(resp, url.to_string(), latency, success).await;
             }
             Err(e) => last_err = Some(e),
         }
@@ -135,26 +206,31 @@ pub async fn probe_provider(
         "请求失败"
     };
     ProbeResult {
-        verdict: Verdict::Down,
+        verdict: network_verdict,
         detail: Some(format!(
             "健康检查{kind}（{url}，重试后仍失败）：{}",
             error_chain(&e)
         )),
         latency_ms: Some(elapsed),
         http_status: None,
-        endpoint: url,
+        endpoint: url.to_string(),
         checked_at: Utc::now(),
     }
 }
 
-/// HTTP 响应 → 判定：状态码分诊 + 2xx 响应体解析
-async fn classify_response(resp: reqwest::Response, url: String, latency: Duration) -> ProbeResult {
+/// HTTP 响应 → 判定：状态码分诊 + 2xx 响应体解析（`success` 判定器由探测跳别提供）
+async fn classify_response(
+    resp: reqwest::Response,
+    url: String,
+    latency: Duration,
+    success: fn(&str) -> (Verdict, String),
+) -> ProbeResult {
     let code = resp.status();
     let body = read_body_limited(resp, PROBE_BODY_LIMIT).await;
     let checked_at = Utc::now();
     let latency_ms = Some(latency.as_millis() as i64);
     let (verdict, detail) = if code.is_success() {
-        classify_success_body(&String::from_utf8_lossy(&body))
+        success(&String::from_utf8_lossy(&body))
     } else if code.as_u16() == 404 {
         (
             Verdict::Inconclusive,
@@ -286,6 +362,29 @@ fn classify_success_body(body: &str) -> (Verdict, String) {
     )
 }
 
+/// 第二跳 models 回退探测的 2xx 响应体判定：
+/// OpenAI 兼容模型列表（object="list" 或含 data 数组，空列表也算——列出能力
+/// 本身就是连通性证明）→ 正常；其余沿用通用判定（status 词汇表 / 服务标识 / 降级）。
+fn classify_models_body(body: &str) -> (Verdict, String) {
+    let trimmed = body.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        let is_list = v.get("object").and_then(Value::as_str) == Some("list")
+            || v.get("data").map(Value::is_array).unwrap_or(false);
+        if is_list {
+            let count = v
+                .get("data")
+                .and_then(Value::as_array)
+                .map(|a| a.len().to_string())
+                .unwrap_or_else(|| "?".into());
+            return (
+                Verdict::Healthy,
+                format!("models 端点 HTTP 200，返回模型列表（{count} 个模型）"),
+            );
+        }
+    }
+    classify_success_body(body)
+}
+
 /// 限量读取响应体；读一半失败时保留已读部分（够做判定/截断展示）
 async fn read_body_limited(mut resp: reqwest::Response, max: usize) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
@@ -371,6 +470,15 @@ mod tests {
             "https://a.com/v1/1/status"
         );
     }
+    #[test]
+    fn models_url_appends_models_path() {
+        assert_eq!(models_url("https://a.com/v1"), "https://a.com/v1/models");
+        assert_eq!(models_url("https://a.com"), "https://a.com/models");
+        assert_eq!(
+            models_url(" https://a.com/v1?x=1#f "),
+            "https://a.com/v1/models"
+        );
+    }
 
     #[test]
     fn status_field_vocabulary() {
@@ -449,5 +557,147 @@ mod tests {
     fn detail_messages_are_chinese_and_specific() {
         assert!(classify("{\"status\":\"degraded\"}").1.contains("自报降级"));
         assert!(classify("<html>").1.contains("非 JSON"));
+    }
+    #[test]
+    fn models_list_bodies_are_healthy() {
+        assert_eq!(
+            classify_models_body("{\"object\":\"list\",\"data\":[{\"id\":\"m1\"}]}").0,
+            Verdict::Healthy
+        );
+        let (v, d) = classify_models_body("{\"data\":[]}");
+        assert_eq!(v, Verdict::Healthy);
+        assert!(d.contains("0 个模型"));
+        assert_eq!(
+            classify_models_body("{\"object\":\"list\"}").0,
+            Verdict::Healthy
+        );
+        // 带 status 字段的模型列表同样按列表判定（先于通用词汇表）
+        assert_eq!(
+            classify_models_body("{\"status\":\"weird\",\"data\":[]}").0,
+            Verdict::Healthy
+        );
+    }
+
+    #[test]
+    fn non_list_models_bodies_fall_through_to_generic() {
+        // 200 + 错误对象 / 形状不符 / 非 JSON → 沿用通用规则降级
+        assert_eq!(
+            classify_models_body("{\"error\":{\"message\":\"nope\"}}").0,
+            Verdict::Degraded
+        );
+        assert_eq!(
+            classify_models_body("<html>login</html>").0,
+            Verdict::Degraded
+        );
+        assert_eq!(classify_models_body("").0, Verdict::Degraded);
+    }
+
+    // ---- 全链路：本地假上游验证两跳回退（/1/status → /models） ----
+
+    fn test_provider(base: String) -> Provider {
+        Provider {
+            id: 1,
+            name: "t".into(),
+            api_type: "openai".into(),
+            base_url: base,
+            api_key_encrypted: String::new(),
+            timeout_ms: 5000,
+            extra_body: serde_json::json!({}),
+            auth_scheme: "bearer".into(),
+            extra_headers: serde_json::json!({}),
+            supports_images: false,
+        }
+    }
+
+    /// 假上游：按预置 (命中路径子串, 状态码, 响应体) 顺序应答，答完即退出。
+    fn serve_fake_upstream(responses: Vec<(&'static str, u16, &'static str)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut queue = std::collections::VecDeque::from(responses);
+            while let Some((path, code, body)) = queue.pop_front() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    // GET 无请求体：读到头部终止符即可
+                    let n = match std::io::Read::read(&mut stream, &mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let hit = head
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|p| p.contains(path));
+                let (code, body) = if hit { (code, body) } else { (404, "{}") };
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn status_ok_short_circuits_without_models_fallback() {
+        let base = serve_fake_upstream(vec![("/1/status", 200, "{\"status\":\"ok\"}")]);
+        let client = reqwest::Client::new();
+        let r = probe_provider(&client, &test_provider(base), Some("sk-test")).await;
+        assert_eq!(r.verdict, Verdict::Healthy);
+        assert!(r.endpoint.ends_with("/v1/1/status"), "{}", r.endpoint);
+    }
+
+    #[tokio::test]
+    async fn status_404_falls_back_to_models_list() {
+        let base = serve_fake_upstream(vec![
+            ("/1/status", 404, "{\"error\":\"not found\"}"),
+            (
+                "/models",
+                200,
+                "{\"object\":\"list\",\"data\":[{\"id\":\"m1\"}]}",
+            ),
+        ]);
+        let client = reqwest::Client::new();
+        let r = probe_provider(&client, &test_provider(base), Some("sk-test")).await;
+        assert_eq!(r.verdict, Verdict::Healthy);
+        assert!(r.endpoint.ends_with("/v1/models"), "{}", r.endpoint);
+        let d = r.detail.unwrap_or_default();
+        assert!(d.contains("404"), "{d}");
+        assert!(d.contains("回退 models 探测"), "{d}");
+        assert!(d.contains("模型列表"), "{d}");
+    }
+
+    #[tokio::test]
+    async fn models_auth_rejected_is_degraded() {
+        let base = serve_fake_upstream(vec![
+            ("/1/status", 404, "nf"),
+            ("/models", 401, "{\"error\":{\"message\":\"bad key\"}}"),
+        ]);
+        let client = reqwest::Client::new();
+        let r = probe_provider(&client, &test_provider(base), Some("sk-bad")).await;
+        assert_eq!(r.verdict, Verdict::Degraded);
+        let d = r.detail.unwrap_or_default();
+        assert!(d.contains("鉴权被拒"), "{d}");
+        assert!(r.endpoint.ends_with("/v1/models"), "{}", r.endpoint);
+    }
+
+    #[tokio::test]
+    async fn both_hops_missing_is_inconclusive() {
+        let base = serve_fake_upstream(vec![("/1/status", 404, "nf"), ("/models", 404, "nf")]);
+        let client = reqwest::Client::new();
+        let r = probe_provider(&client, &test_provider(base), Some("sk-test")).await;
+        assert_eq!(r.verdict, Verdict::Inconclusive);
+        let d = r.detail.unwrap_or_default();
+        assert!(d.contains("回退 models 探测"), "{d}");
     }
 }

@@ -2,7 +2,7 @@
 .git
 target
 !target/release/llm_gateway
-certs
+certs*
 .env
 docs
 scripts

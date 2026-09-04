@@ -29,6 +29,9 @@
           <el-menu-item index="/users">
             <el-icon><UserFilled /></el-icon><span>用户管理</span>
           </el-menu-item>
+          <el-menu-item index="/groups">
+            <el-icon><Collection /></el-icon><span>用户分组</span>
+          </el-menu-item>
           <el-menu-item index="/plans">
             <el-icon><Medal /></el-icon><span>Coding Plan</span>
           </el-menu-item>

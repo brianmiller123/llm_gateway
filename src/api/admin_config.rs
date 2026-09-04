@@ -1851,6 +1851,7 @@ fn app_error_status(e: &AppError) -> u16 {
         AppError::Forbidden(_) => 403,
         AppError::RateLimited(_) | AppError::QuotaExceeded | AppError::PlanQuotaExceeded(_) => 429,
         AppError::BadRequest(_) => 400,
+        AppError::Conflict(_) => 409,
         AppError::Internal(_) => 500,
         AppError::ServiceUnavailable(_) | AppError::UpstreamExhausted(_) => 503,
         AppError::BadGateway(_) => 502,

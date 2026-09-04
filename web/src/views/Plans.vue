@@ -3,6 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { request } from '@/api/client'
 import type { CodingPlan, PlansResp, PeriodType, OverageAction } from '@/api/types'
+import PlanMembersDialog from '@/components/PlanMembersDialog.vue'
 
 const loading = ref(false)
 const plans = ref<PlansResp['plans']>([])
@@ -27,6 +28,10 @@ const CHANNEL_LABELS: Record<string, string> = {
   webhook: 'Webhook',
 }
 
+function windowText(p: CodingPlan): string {
+  if (!p.active_start || !p.active_end) return '全天'
+  return `${p.active_start.slice(0, 5)} - ${p.active_end.slice(0, 5)}`
+}
 function percent(used: number, limit: number): number {
   if (limit <= 0) return 0
   return Math.round((used * 10000) / limit) / 100
@@ -50,6 +55,15 @@ async function loadPlans() {
   }
 }
 
+// —— 成员管理（直连用户 / 加入分组）——
+const membersVisible = ref(false)
+const membersPlan = ref<CodingPlan | null>(null)
+
+function openMembers(p: CodingPlan) {
+  membersPlan.value = p
+  membersVisible.value = true
+}
+
 // —— 新建/编辑（token 上限 = 数字 + 单位，如 1.5G）——
 const dialogVisible = ref(false)
 const editing = ref<CodingPlan | null>(null)
@@ -66,6 +80,9 @@ const form = reactive({
   overage_action: 'block' as OverageAction,
   downgrade_model: '',
   alert_channels: ['in_site'] as string[],
+  active_enabled: false,
+  active_start: '',
+  active_end: '',
   webhook_url: '',
   enabled: true,
 })
@@ -90,6 +107,9 @@ function openCreate() {
   form.alert_channels = ['in_site']
   form.webhook_url = ''
   form.enabled = true
+  form.active_enabled = false
+  form.active_start = ''
+  form.active_end = ''
   dialogVisible.value = true
 }
 
@@ -111,6 +131,10 @@ function openEdit(p: CodingPlan) {
   form.alert_channels = p.alert_channels.length ? p.alert_channels : ['in_site']
   form.webhook_url = p.webhook_url
   form.enabled = p.enabled
+  const hasWindow = !!(p.active_start && p.active_end)
+  form.active_enabled = hasWindow
+  form.active_start = p.active_start?.slice(0, 5) ?? ''
+  form.active_end = p.active_end?.slice(0, 5) ?? ''
   dialogVisible.value = true
 }
 
@@ -127,6 +151,14 @@ async function doSave() {
     ElMessage.warning('降级策略需要指定降级目标模型')
     return
   }
+  if (form.active_enabled && (!form.active_start || !form.active_end)) {
+    ElMessage.warning('请选择生效时段的起止时间')
+    return
+  }
+  if (form.active_enabled && form.active_start === form.active_end) {
+    ElMessage.warning('起止时间相同；全天启用请关闭「自定义生效时段」')
+    return
+  }
   saving.value = true
   const body = {
     name: form.name.trim(),
@@ -140,6 +172,9 @@ async function doSave() {
     downgrade_model: form.overage_action === 'downgrade' ? form.downgrade_model.trim() : null,
     alert_channels: form.alert_channels,
     webhook_url: form.webhook_url.trim(),
+    active_window: form.active_enabled
+      ? { start: form.active_start, end: form.active_end }
+      : { start: null, end: null },
     enabled: form.enabled,
   }
   try {
@@ -203,10 +238,13 @@ async function doDelete(p: CodingPlan) {
     return
   }
   try {
-    const resp = await request<{ affected_groups: number }>(`/api/admin/plans/${p.id}`, {
-      method: 'DELETE',
-    })
-    ElMessage.success(`已删除（解绑 ${resp.affected_groups} 个分组）`)
+    const resp = await request<{ affected_groups: number; affected_direct_users: number }>(
+      `/api/admin/plans/${p.id}`,
+      { method: 'DELETE' },
+    )
+    ElMessage.success(
+      `已删除（解绑 ${resp.affected_groups} 个分组，移除 ${resp.affected_direct_users} 个直连用户）`,
+    )
     await loadPlans()
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '删除失败')
@@ -240,6 +278,9 @@ onMounted(loadPlans)
         </el-table-column>
         <el-table-column label="统计周期" width="130">
           <template #default="{ row }">{{ periodText(row.period_type, row.period_hours) }}</template>
+        </el-table-column>
+        <el-table-column label="生效时段" width="120">
+          <template #default="{ row }">{{ windowText(row) }}</template>
         </el-table-column>
         <el-table-column label="超额策略" min-width="150">
           <template #default="{ row }">
@@ -276,13 +317,13 @@ onMounted(loadPlans)
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button link :type="row.enabled ? 'warning' : 'success'" @click="toggleEnabled(row)">
               {{ row.enabled ? '停用' : '启用' }}
             </el-button>
-            <el-button link type="danger" @click="doDelete(row)">删除</el-button>
+            <el-button link type="primary" @click="openMembers(row)">成员</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -336,6 +377,29 @@ onMounted(loadPlans)
             固定整点：从 UTC 1970-01-01 起每 N 小时切窗；开通时间：以成员加入分组时刻为锚点
           </div>
         </el-form-item>
+        <el-form-item label="生效时段">
+          <div>
+            <el-switch v-model="form.active_enabled" active-text="自定义时段" />
+            <div v-if="form.active_enabled" class="limit-row" style="margin-top: 8px">
+              <el-time-picker
+                v-model="form.active_start"
+                value-format="HH:mm"
+                format="HH:mm"
+                placeholder="开始（如 09:00）"
+              />
+              <span class="hint">至</span>
+              <el-time-picker
+                v-model="form.active_end"
+                value-format="HH:mm"
+                format="HH:mm"
+                placeholder="结束（如 18:00）"
+              />
+            </div>
+            <div class="hint" style="margin-top: 4px">
+              仅该时段内本 Plan 参与生效（按服务器时区；支持跨零点，如 22:00 - 06:00）
+            </div>
+          </div>
+        </el-form-item>
         <el-form-item label="超额策略">
           <el-radio-group v-model="form.overage_action">
             <el-radio-button value="block">拦截请求</el-radio-button>
@@ -365,6 +429,8 @@ onMounted(loadPlans)
         <el-button type="primary" :loading="saving" @click="doSave">保存</el-button>
       </template>
     </el-dialog>
+
+    <PlanMembersDialog v-model="membersVisible" :plan="membersPlan" @changed="loadPlans" />
   </div>
 </template>
 

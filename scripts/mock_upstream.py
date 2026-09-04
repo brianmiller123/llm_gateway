@@ -21,7 +21,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/1/status":
+        if self.path in ("/1/status", "/v1/1/status"):
             self._status()
             return
         if self.path == "/v1/models":
@@ -30,7 +30,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def _status(self):
-        """/1/status 健康探测端点：模式控制返回形态（状态页冒烟用）。
+        """/1/status 与 /v1/1/status 健康探测端点：模式控制返回形态（状态页冒烟用）。
         ok(默认)/degraded/down/html/shapeless/404/500/timeout。
         模式来源：/tmp/mock_status_mode 文件 > MOCK_STATUS_MODE 环境变量（免重启切换）"""
         try:

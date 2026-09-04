@@ -1,11 +1,12 @@
-//! Coding Plan 存储：CRUD、用户→生效 Plan 运行时解析、周期计数器、用量查询。
+//! Coding Plan 存储：CRUD、用户→生效 Plan 运行时解析、周期计数器、用量查询、
+//! 直连用户/加入分组成员管理。
 //!
 //! token 上限以精确 BIGINT 存储；API 层接受 "1.5G"/"500M"/"2T" 等单位串
 //! （[`parse_token_limit`]）或纯数字。周期一律 UTC，与 usage_daily 聚合口径一致。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 
@@ -47,6 +48,30 @@ pub fn validate_period_config(
         return Err(format!(
             "period_hours must be within 1..={MAX_PERIOD_HOURS} for hourly plans"
         ));
+    }
+    Ok(())
+}
+
+/// "HH:MM"（或 "HH:MM:SS"）→ NaiveTime；API 层入参校验用
+pub fn parse_active_time(raw: &str) -> Result<NaiveTime, String> {
+    let t = raw.trim();
+    NaiveTime::parse_from_str(t, "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M:%S"))
+        .map_err(|_| format!("invalid time '{raw}' (expected HH:MM)"))
+}
+
+/// 生效时段成对校验：必须成对出现；相等 = 零长度窗口无意义（全天请双空）
+pub fn validate_active_window(
+    start: Option<NaiveTime>,
+    end: Option<NaiveTime>,
+) -> Result<(), String> {
+    if start.is_some() != end.is_some() {
+        return Err("active window requires both start and end".into());
+    }
+    if let (Some(s), Some(e)) = (start, end) {
+        if s == e {
+            return Err("active window start == end (leave empty for full-day)".into());
+        }
     }
     Ok(())
 }
@@ -117,6 +142,9 @@ pub struct CodingPlan {
     pub alert_channels: Value,
     pub webhook_url: String,
     pub enabled: bool,
+    /// 生效时段（服务器本地墙钟）；双 None = 全天；start > end = 跨零点
+    pub active_start: Option<NaiveTime>,
+    pub active_end: Option<NaiveTime>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -136,6 +164,8 @@ pub struct PlanSummary {
     pub downgrade_model: Option<String>,
     pub alert_channels: Value,
     pub webhook_url: String,
+    pub active_start: Option<NaiveTime>,
+    pub active_end: Option<NaiveTime>,
     pub enabled: bool,
     pub updated_at: DateTime<Utc>,
     pub used_tokens: i64,
@@ -162,6 +192,11 @@ pub struct PlanRuntime {
     pub downgrade_model: Option<String>,
     pub alert_channels: Vec<String>,
     pub webhook_url: String,
+    /// 择优优先级（请求期 [`resolve_plan`] 用）
+    pub priority: i32,
+    /// 生效时段（服务器本地墙钟）；双 None = 全天；start > end = 跨零点
+    pub active_start: Option<NaiveTime>,
+    pub active_end: Option<NaiveTime>,
 }
 
 impl PlanRuntime {
@@ -206,6 +241,16 @@ impl PlanRuntime {
             _ => "t".to_string(),
         }
     }
+
+    /// 生效时段判定：双 None = 全天；[start, end) 半开区间；start > end 视为
+    /// 跨零点隔夜窗。`local_now` 传服务器本地墙钟（纯函数可单测）。
+    pub fn active_at(&self, local_now: NaiveTime) -> bool {
+        match (self.active_start, self.active_end) {
+            (Some(s), Some(e)) if s < e => local_now >= s && local_now < e,
+            (Some(s), Some(e)) if s > e => local_now >= s || local_now < e, // 跨零点
+            _ => true,
+        }
+    }
 }
 
 #[derive(FromRow)]
@@ -224,27 +269,65 @@ struct RuntimeRow {
     alert_channels: Value,
     webhook_url: String,
     priority: i32,
+    active_start: Option<NaiveTime>,
+    active_end: Option<NaiveTime>,
 }
 
-/// 全量用户 → 生效 Plan（enabled 限定；多分组取 priority 最高、同分取 plan_id 大）
-pub async fn load_plan_runtimes(pool: &PgPool) -> Result<HashMap<i64, PlanRuntime>, sqlx::Error> {
+/// 请求期解析用户生效 Plan：过滤掉当前不在生效时段的候选，取 (priority, plan_id)
+/// 最大（多分组「优先级最高、同分 plan_id 大」语义的时段感知版）。
+/// 全部候选都不在时段内 → None（该用户此刻不受该批 Plan 限额）。
+pub fn resolve_plan(
+    plans: &HashMap<i64, Vec<PlanRuntime>>,
+    user_id: i64,
+    local_now: NaiveTime,
+) -> Option<PlanRuntime> {
+    plans
+        .get(&user_id)?
+        .iter()
+        .filter(|p| p.active_at(local_now))
+        .max_by_key(|p| (p.priority, p.plan_id))
+        .cloned()
+}
+
+/// 全量用户 → 候选 Plan 列表（enabled 限定）。双通道入口：分组加入（plan_groups）∪
+/// 直连加入（plan_users），每用户保留全部候选行——生效时段随时刻变化，
+/// 请求期用 [`resolve_plan`] 按「当前处于生效时段 + priority 择优」解析。
+pub async fn load_plan_runtimes(
+    pool: &PgPool,
+) -> Result<HashMap<i64, Vec<PlanRuntime>>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RuntimeRow>(
-        "SELECT m.user_id, p.id AS plan_id, p.name AS plan_name, g.name AS group_name, \
-                p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
-                m.added_at AS member_since, p.overage_action, p.downgrade_model, \
-                p.alert_channels, p.webhook_url, p.priority \
-         FROM user_group_members m \
-         JOIN user_groups g ON g.id = m.group_id \
-         JOIN coding_plans p ON p.id = g.plan_id AND p.enabled = TRUE",
+        "SELECT user_id, plan_id, plan_name, group_name, token_limit, period_type, \
+                period_hours, period_anchor_mode, member_since, overage_action, \
+                downgrade_model, alert_channels, webhook_url, priority, \
+                active_start, active_end \
+         FROM ( \
+           SELECT m.user_id, p.id AS plan_id, p.name AS plan_name, g.name AS group_name, \
+                  p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
+                  m.added_at AS member_since, p.overage_action, p.downgrade_model, \
+                  p.alert_channels, p.webhook_url, p.priority, \
+                  p.active_start, p.active_end \
+           FROM user_group_members m \
+           JOIN user_groups g ON g.id = m.group_id \
+           JOIN plan_groups pg ON pg.group_id = g.id \
+           JOIN coding_plans p ON p.id = pg.plan_id AND p.enabled = TRUE \
+           UNION ALL \
+           SELECT pu.user_id, p.id, p.name, '' AS group_name, \
+                  p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
+                  pu.added_at AS member_since, p.overage_action, p.downgrade_model, \
+                  p.alert_channels, p.webhook_url, p.priority, \
+                  p.active_start, p.active_end \
+           FROM plan_users pu \
+           JOIN coding_plans p ON p.id = pu.plan_id AND p.enabled = TRUE \
+         ) r",
     )
     .fetch_all(pool)
     .await?;
-    let mut map: HashMap<i64, (i32, i64, PlanRuntime)> = HashMap::new();
+    let mut map: HashMap<i64, Vec<PlanRuntime>> = HashMap::new();
     for r in rows {
         let chan: Vec<String> = serde_json::from_value(r.alert_channels.clone())
             .ok()
             .unwrap_or_else(|| vec!["in_site".into()]);
-        let rt = PlanRuntime {
+        map.entry(r.user_id).or_default().push(PlanRuntime {
             plan_id: r.plan_id,
             plan_name: r.plan_name,
             group_name: r.group_name,
@@ -257,18 +340,12 @@ pub async fn load_plan_runtimes(pool: &PgPool) -> Result<HashMap<i64, PlanRuntim
             downgrade_model: r.downgrade_model,
             alert_channels: chan,
             webhook_url: r.webhook_url,
-        };
-        // 入口优先级更高的覆盖；相同 (priority, plan_id) 后到者覆盖等价
-        let key = (r.priority, r.plan_id);
-        match map.get_mut(&r.user_id) {
-            Some(entry) if entry.0 > key.0 => {}
-            Some(entry) if entry.0 == key.0 && entry.1 > key.1 => {}
-            _ => {
-                map.insert(r.user_id, (key.0, key.1, rt));
-            }
-        }
+            priority: r.priority,
+            active_start: r.active_start,
+            active_end: r.active_end,
+        });
     }
-    Ok(map.into_iter().map(|(k, (_, _, v))| (k, v)).collect())
+    Ok(map)
 }
 
 // ---------- CRUD ----------
@@ -278,12 +355,16 @@ pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx
         "SELECT p.id, p.name, p.description, p.priority, p.token_limit, p.period_type, \
                 p.period_hours, p.period_anchor_mode, \
                 p.overage_action, p.downgrade_model, p.alert_channels, p.webhook_url, \
-                p.enabled, p.updated_at, \
+                p.enabled, p.active_start, p.active_end, p.updated_at, \
                 COALESCE(u.used_tokens, 0)::bigint AS used_tokens, \
                 COALESCE(u.active_users, 0)::bigint AS active_users, \
-                (SELECT COUNT(*) FROM user_groups g WHERE g.plan_id = p.id) AS group_count, \
-                (SELECT COUNT(*) FROM user_group_members m \
-                  JOIN user_groups g ON g.id = m.group_id WHERE g.plan_id = p.id) AS member_count \
+                (SELECT COUNT(*) FROM plan_groups pg WHERE pg.plan_id = p.id) AS group_count, \
+                (SELECT COUNT(*) FROM ( \
+                   SELECT m.user_id FROM user_group_members m \
+                     JOIN plan_groups pg ON pg.group_id = m.group_id AND pg.plan_id = p.id \
+                   UNION \
+                   SELECT pu.user_id FROM plan_users pu WHERE pu.plan_id = p.id \
+                 ) mm) AS member_count \
          FROM coding_plans p \
          LEFT JOIN ( \
              SELECT pc.plan_id, SUM(pc.tokens) AS used_tokens, COUNT(DISTINCT pc.user_id) AS active_users \
@@ -309,7 +390,7 @@ pub async fn find_plan(pool: &PgPool, id: i64) -> Result<Option<CodingPlan>, sql
     sqlx::query_as::<_, CodingPlan>(
         "SELECT id, name, description, priority, token_limit, period_type, period_hours, \
                 period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-                webhook_url, enabled, created_at, updated_at \
+                webhook_url, enabled, active_start, active_end, created_at, updated_at \
          FROM coding_plans WHERE id = $1",
     )
     .bind(id)
@@ -331,17 +412,19 @@ pub async fn create_plan(
     downgrade_model: Option<&str>,
     alert_channels: &Value,
     webhook_url: &str,
+    active_start: Option<NaiveTime>,
+    active_end: Option<NaiveTime>,
     enabled: bool,
 ) -> Result<CodingPlan, sqlx::Error> {
     sqlx::query_as::<_, CodingPlan>(
         "INSERT INTO coding_plans \
            (name, description, priority, token_limit, period_type, period_hours, \
             period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-            webhook_url, enabled) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+            webhook_url, enabled, active_start, active_end) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
          RETURNING id, name, description, priority, token_limit, period_type, period_hours, \
                    period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-                   webhook_url, enabled, created_at, updated_at",
+                   webhook_url, enabled, active_start, active_end, created_at, updated_at",
     )
     .bind(name)
     .bind(description)
@@ -355,11 +438,16 @@ pub async fn create_plan(
     .bind(alert_channels)
     .bind(webhook_url)
     .bind(enabled)
+    .bind(active_start)
+    .bind(active_end)
     .fetch_one(pool)
     .await
 }
 
-/// 部分更新（None = 保留）。downgrade_model 支持显式清空 Some(None)。
+/// 部分更新（字段未提供 = 保留现值）。
+/// - downgrade_model 三态：absent=保留 / Some(None)=清空 / Some(Some(v))=设置
+/// - active_window 三态（成对原子）：absent=保留 / Some(None)=全天 / Some(Some((s,e)))=设置
+#[allow(clippy::too_many_arguments)]
 pub async fn update_plan(
     pool: &PgPool,
     id: i64,
@@ -374,8 +462,17 @@ pub async fn update_plan(
     downgrade_model: Option<Option<&str>>,
     alert_channels: Option<&Value>,
     webhook_url: Option<&str>,
+    active_window: Option<Option<(NaiveTime, NaiveTime)>>,
     enabled: Option<bool>,
 ) -> Result<Option<CodingPlan>, sqlx::Error> {
+    // 三态展开：present 标志区分「未提供」（保留现值）与「提供 NULL」（清空）——
+    // 直接绑 Option<Option<T>> 会被编码成同一 NULL，无法表达保留语义
+    let (dm_present, dm_value) = (downgrade_model.is_some(), downgrade_model.and_then(|o| o));
+    let (win_present, win_start, win_end) = match active_window {
+        None => (false, None, None),
+        Some(None) => (true, None, None),
+        Some(Some((s, e))) => (true, Some(s), Some(e)),
+    };
     sqlx::query_as::<_, CodingPlan>(
         "UPDATE coding_plans SET \
            name = COALESCE($2, name), \
@@ -386,17 +483,18 @@ pub async fn update_plan(
            period_hours = COALESCE($7, period_hours), \
            period_anchor_mode = COALESCE($8, period_anchor_mode), \
            overage_action = COALESCE($9, overage_action), \
-           downgrade_model = $10, \
-           alert_channels = COALESCE($11, alert_channels), \
-           webhook_url = COALESCE($12, webhook_url), \
-           enabled = COALESCE($13, enabled), \
+           downgrade_model = CASE WHEN $10 THEN $11 ELSE downgrade_model END, \
+           alert_channels = COALESCE($12, alert_channels), \
+           webhook_url = COALESCE($13, webhook_url), \
+           enabled = COALESCE($14, enabled), \
+           active_start = CASE WHEN $15 THEN $16 ELSE active_start END, \
+           active_end = CASE WHEN $15 THEN $17 ELSE active_end END, \
            updated_at = now() \
          WHERE id = $1 \
          RETURNING id, name, description, priority, token_limit, period_type, period_hours, \
                    period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-                   webhook_url, enabled, created_at, updated_at",
+                   webhook_url, enabled, active_start, active_end, created_at, updated_at",
     )
-    // $10 三态：None=不修改 / Some(None)=清空 / Some(Some(v))=设置
     .bind(id)
     .bind(name)
     .bind(description)
@@ -406,17 +504,27 @@ pub async fn update_plan(
     .bind(period_hours)
     .bind(period_anchor_mode)
     .bind(overage_action)
-    .bind(downgrade_model.map(|o| o.map(str::to_string)))
+    .bind(dm_present)
+    .bind(dm_value)
     .bind(alert_channels)
     .bind(webhook_url)
     .bind(enabled)
+    .bind(win_present)
+    .bind(win_start)
+    .bind(win_end)
     .fetch_optional(pool)
     .await
 }
 
-/// 删除计划；返回解绑的分组数（plan_id FK ON DELETE SET NULL 自动解绑）。
-/// 计数器/告警行无 FK，历史用量与告警保留可回溯。
-pub async fn delete_plan(pool: &PgPool, id: i64) -> Result<Option<i64>, sqlx::Error> {
+/// 删除影响面：被解绑的分组数与直连用户数（plan_groups/plan_users 随 FK CASCADE 清除；
+/// 计数器/告警行无 FK，历史用量与告警保留可回溯）
+#[derive(Debug, serde::Serialize)]
+pub struct PlanDeleteImpact {
+    pub groups: i64,
+    pub direct_users: i64,
+}
+
+pub async fn delete_plan(pool: &PgPool, id: i64) -> Result<Option<PlanDeleteImpact>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM coding_plans WHERE id = $1")
         .bind(id)
@@ -425,16 +533,386 @@ pub async fn delete_plan(pool: &PgPool, id: i64) -> Result<Option<i64>, sqlx::Er
     if exists.is_none() {
         return Ok(None);
     }
-    let (groups,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_groups WHERE plan_id = $1")
+    let (groups,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plan_groups WHERE plan_id = $1")
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
+    let (direct_users,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM plan_users WHERE plan_id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
     sqlx::query("DELETE FROM coding_plans WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Some(groups))
+    Ok(Some(PlanDeleteImpact {
+        groups,
+        direct_users,
+    }))
+}
+
+// ---------- Plan 成员（直连用户 / 加入分组） ----------
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PlanMemberUser {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub status: i16,
+    pub added_at: DateTime<Utc>,
+}
+
+/// 直连用户成员分页列表（q 模糊匹配用户名/显示名/邮箱）
+pub async fn list_plan_users(
+    pool: &PgPool,
+    plan_id: i64,
+    q: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<PlanMemberUser>, i64), sqlx::Error> {
+    let rows = sqlx::query_as::<_, PlanMemberUser>(
+        "SELECT u.id AS user_id, u.username, u.display_name, u.email, u.status, pu.added_at \
+         FROM plan_users pu JOIN users u ON u.id = pu.user_id \
+         WHERE pu.plan_id = $1 \
+           AND ($2::text IS NULL OR u.username ILIKE '%' || $2 || '%' \
+                OR u.display_name ILIKE '%' || $2 || '%' \
+                OR u.email ILIKE '%' || $2 || '%') \
+         ORDER BY u.id LIMIT $3 OFFSET $4",
+    )
+    .bind(plan_id)
+    .bind(q)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM plan_users pu JOIN users u ON u.id = pu.user_id \
+         WHERE pu.plan_id = $1 \
+           AND ($2::text IS NULL OR u.username ILIKE '%' || $2 || '%' \
+                OR u.display_name ILIKE '%' || $2 || '%' \
+                OR u.email ILIKE '%' || $2 || '%')",
+    )
+    .bind(plan_id)
+    .bind(q)
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total))
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PlanMemberGroup {
+    pub group_id: i64,
+    pub name: String,
+    pub description: String,
+    pub ldap_sync: bool,
+    pub member_count: i64,
+    pub added_at: DateTime<Utc>,
+}
+
+/// 已加入分组的分页列表（q 模糊匹配组名/描述）
+pub async fn list_plan_groups(
+    pool: &PgPool,
+    plan_id: i64,
+    q: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<PlanMemberGroup>, i64), sqlx::Error> {
+    let rows = sqlx::query_as::<_, PlanMemberGroup>(
+        "SELECT g.id AS group_id, g.name, g.description, g.ldap_sync, \
+                (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count, \
+                pg.added_at \
+         FROM plan_groups pg JOIN user_groups g ON g.id = pg.group_id \
+         WHERE pg.plan_id = $1 \
+           AND ($2::text IS NULL OR g.name ILIKE '%' || $2 || '%' \
+                OR g.description ILIKE '%' || $2 || '%') \
+         ORDER BY g.id LIMIT $3 OFFSET $4",
+    )
+    .bind(plan_id)
+    .bind(q)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM plan_groups pg JOIN user_groups g ON g.id = pg.group_id \
+         WHERE pg.plan_id = $1 \
+           AND ($2::text IS NULL OR g.name ILIKE '%' || $2 || '%' \
+                OR g.description ILIKE '%' || $2 || '%')",
+    )
+    .bind(plan_id)
+    .bind(q)
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total))
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PlanUserPick {
+    pub id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub source: String,
+    pub status: i16,
+    pub is_member: bool,
+}
+
+/// 用户选择器：全用户分页检索 + Plan 直连标记（单查询渲染勾选态）
+pub async fn search_users_for_plan(
+    pool: &PgPool,
+    plan_id: i64,
+    q: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<PlanUserPick>, i64), sqlx::Error> {
+    let rows = sqlx::query_as::<_, PlanUserPick>(
+        "SELECT u.id, u.username, u.display_name, u.email, u.source, u.status, \
+                (pu.user_id IS NOT NULL) AS is_member \
+         FROM users u \
+         LEFT JOIN plan_users pu ON pu.plan_id = $1 AND pu.user_id = u.id \
+         WHERE ($2::text IS NULL OR u.username ILIKE '%' || $2 || '%' \
+                OR u.display_name ILIKE '%' || $2 || '%' \
+                OR u.email ILIKE '%' || $2 || '%') \
+         ORDER BY u.id LIMIT $3 OFFSET $4",
+    )
+    .bind(plan_id)
+    .bind(q)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM users u \
+         WHERE ($1::text IS NULL OR u.username ILIKE '%' || $1 || '%' \
+                OR u.display_name ILIKE '%' || $1 || '%' \
+                OR u.email ILIKE '%' || $1 || '%')",
+    )
+    .bind(q)
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total))
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PlanGroupPick {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub ldap_sync: bool,
+    pub member_count: i64,
+    pub is_member: bool,
+}
+
+/// 分组选择器：全分组分页检索 + Plan 加入标记（单查询渲染勾选态）
+pub async fn search_groups_for_plan(
+    pool: &PgPool,
+    plan_id: i64,
+    q: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<PlanGroupPick>, i64), sqlx::Error> {
+    let rows = sqlx::query_as::<_, PlanGroupPick>(
+        "SELECT g.id, g.name, g.description, g.ldap_sync, \
+                (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count, \
+                (pg.group_id IS NOT NULL) AS is_member \
+         FROM user_groups g \
+         LEFT JOIN plan_groups pg ON pg.plan_id = $1 AND pg.group_id = g.id \
+         WHERE ($2::text IS NULL OR g.name ILIKE '%' || $2 || '%' \
+                OR g.description ILIKE '%' || $2 || '%') \
+         ORDER BY g.id LIMIT $3 OFFSET $4",
+    )
+    .bind(plan_id)
+    .bind(q)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM user_groups g \
+         WHERE ($1::text IS NULL OR g.name ILIKE '%' || $1 || '%' \
+                OR g.description ILIKE '%' || $1 || '%')",
+    )
+    .bind(q)
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total))
+}
+
+/// 批量添加直连用户（幂等守卫 ON CONFLICT）。调用方先做重复预检以给出精确 409。
+/// 事务内执行：与重复预检同事务，冲突窗口内后到者新增 0 行 → 上层回滚并报冲突。
+pub async fn add_plan_users(
+    conn: &mut sqlx::PgConnection,
+    plan_id: i64,
+    user_ids: &[i64],
+) -> Result<u64, sqlx::Error> {
+    if user_ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(sqlx::query(
+        "INSERT INTO plan_users (plan_id, user_id) \
+         SELECT $1, x FROM unnest($2::bigint[]) AS x \
+         ON CONFLICT (plan_id, user_id) DO NOTHING",
+    )
+    .bind(plan_id)
+    .bind(user_ids)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+/// 批量加入分组（幂等守卫 ON CONFLICT）；事务语义同 [`add_plan_users`]。
+pub async fn add_plan_groups(
+    conn: &mut sqlx::PgConnection,
+    plan_id: i64,
+    group_ids: &[i64],
+) -> Result<u64, sqlx::Error> {
+    if group_ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(sqlx::query(
+        "INSERT INTO plan_groups (plan_id, group_id) \
+         SELECT $1, x FROM unnest($2::bigint[]) AS x \
+         ON CONFLICT (plan_id, group_id) DO NOTHING",
+    )
+    .bind(plan_id)
+    .bind(group_ids)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+pub async fn remove_plan_users(
+    pool: &PgPool,
+    plan_id: i64,
+    user_ids: &[i64],
+) -> Result<u64, sqlx::Error> {
+    if user_ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(
+        sqlx::query("DELETE FROM plan_users WHERE plan_id = $1 AND user_id = ANY($2::bigint[])")
+            .bind(plan_id)
+            .bind(user_ids)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
+pub async fn remove_plan_groups(
+    pool: &PgPool,
+    plan_id: i64,
+    group_ids: &[i64],
+) -> Result<u64, sqlx::Error> {
+    if group_ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(
+        sqlx::query("DELETE FROM plan_groups WHERE plan_id = $1 AND group_id = ANY($2::bigint[])")
+            .bind(plan_id)
+            .bind(group_ids)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// 参数校验：请求 id 中不存在于 users 的部分（保持入参顺序）
+pub async fn missing_user_ids(pool: &PgPool, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE id = ANY($1::bigint[])")
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+    let found: HashSet<i64> = rows.into_iter().map(|(id,)| id).collect();
+    Ok(ids
+        .iter()
+        .copied()
+        .filter(|id| !found.contains(id))
+        .collect())
+}
+
+/// 参数校验：请求 id 中不存在于 user_groups 的部分（保持入参顺序）
+pub async fn missing_group_ids(pool: &PgPool, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
+    let rows: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM user_groups WHERE id = ANY($1::bigint[])")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    let found: HashSet<i64> = rows.into_iter().map(|(id,)| id).collect();
+    Ok(ids
+        .iter()
+        .copied()
+        .filter(|id| !found.contains(id))
+        .collect())
+}
+
+/// 重复预检：这些用户中已直连该 Plan 的 id
+pub async fn existing_plan_user_ids(
+    conn: &mut sqlx::PgConnection,
+    plan_id: i64,
+    ids: &[i64],
+) -> Result<Vec<i64>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT user_id FROM plan_users WHERE plan_id = $1 AND user_id = ANY($2::bigint[])",
+    )
+    .bind(plan_id)
+    .bind(ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 重复预检：这些分组中已加入该 Plan 的 id
+pub async fn existing_plan_group_ids(
+    conn: &mut sqlx::PgConnection,
+    plan_id: i64,
+    ids: &[i64],
+) -> Result<Vec<i64>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT group_id FROM plan_groups WHERE plan_id = $1 AND group_id = ANY($2::bigint[])",
+    )
+    .bind(plan_id)
+    .bind(ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 冲突提示用：id → username（保持入参顺序）
+pub async fn user_names(pool: &PgPool, ids: &[i64]) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, username FROM users WHERE id = ANY($1::bigint[])")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    let by_id: HashMap<i64, String> = rows.into_iter().collect();
+    Ok(ids
+        .iter()
+        .filter_map(|id| by_id.get(id).map(|n| (*id, n.clone())))
+        .collect())
+}
+
+/// 冲突提示用：id → group name（保持入参顺序）
+pub async fn group_names(pool: &PgPool, ids: &[i64]) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, name FROM user_groups WHERE id = ANY($1::bigint[])")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    let by_id: HashMap<i64, String> = rows.into_iter().collect();
+    Ok(ids
+        .iter()
+        .filter_map(|id| by_id.get(id).map(|n| (*id, n.clone())))
+        .collect())
 }
 
 /// 用量缓存引导行：(user, plan, period_key, 当期已用)
@@ -496,7 +974,9 @@ pub async fn plan_daily_trend(
          FROM usage_daily d \
          WHERE d.user_id IN ( \
              SELECT m.user_id FROM user_group_members m \
-             JOIN user_groups g ON g.id = m.group_id WHERE g.plan_id = $1) \
+             JOIN plan_groups pg ON pg.group_id = m.group_id WHERE pg.plan_id = $1 \
+             UNION \
+             SELECT pu.user_id FROM plan_users pu WHERE pu.plan_id = $1) \
            AND d.stat_date >= CURRENT_DATE - $2::int \
          GROUP BY d.stat_date ORDER BY d.stat_date",
     )
@@ -557,7 +1037,9 @@ pub async fn plan_user_usage(
          JOIN usage_daily d ON d.user_id = u.id AND d.stat_date BETWEEN $2 AND $3 \
          WHERE u.id IN ( \
              SELECT m.user_id FROM user_group_members m \
-             JOIN user_groups g ON g.id = m.group_id WHERE g.plan_id = $1) \
+             JOIN plan_groups pg ON pg.group_id = m.group_id WHERE pg.plan_id = $1 \
+             UNION \
+             SELECT pu.user_id FROM plan_users pu WHERE pu.plan_id = $1) \
          GROUP BY u.id, u.username, u.display_name \
          ORDER BY tokens DESC \
          LIMIT $4 OFFSET $5",
@@ -575,7 +1057,9 @@ pub async fn plan_user_usage(
          WHERE d.stat_date BETWEEN $2 AND $3 \
            AND d.user_id IN ( \
              SELECT m.user_id FROM user_group_members m \
-             JOIN user_groups g ON g.id = m.group_id WHERE g.plan_id = $1)",
+             JOIN plan_groups pg ON pg.group_id = m.group_id WHERE pg.plan_id = $1 \
+             UNION \
+             SELECT pu.user_id FROM plan_users pu WHERE pu.plan_id = $1)",
     )
     .bind(plan_id)
     .bind(from)
@@ -635,11 +1119,86 @@ mod tests {
             downgrade_model: None,
             alert_channels: vec![],
             webhook_url: String::new(),
+            priority: 0,
+            active_start: None,
+            active_end: None,
         }
     }
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    /// 全天候选下的解析（DB 测试断言用；12:00 落在任何非跨零点窗内则视窗而定）
+    fn resolve(map: &HashMap<i64, Vec<PlanRuntime>>, uid: i64) -> Option<PlanRuntime> {
+        resolve_plan(map, uid, NaiveTime::from_hms_opt(12, 0, 0).unwrap())
+    }
+
+    #[test]
+    fn active_window_semantics() {
+        let t = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        let mut p = rt("daily");
+        assert!(p.active_at(t(9, 0))); // 双 None = 全天
+        p.active_start = Some(t(9, 0));
+        p.active_end = Some(t(18, 0));
+        assert!(p.active_at(t(9, 0))); // [start, end) 半开
+        assert!(p.active_at(t(17, 59)));
+        assert!(!p.active_at(t(18, 0)));
+        assert!(!p.active_at(t(8, 59)));
+        p.active_start = Some(t(22, 0));
+        p.active_end = Some(t(6, 0));
+        assert!(p.active_at(t(22, 0))); // 跨零点 22:00-06:00
+        assert!(p.active_at(t(5, 59)));
+        assert!(!p.active_at(t(6, 0)));
+        assert!(!p.active_at(t(12, 0)));
+    }
+
+    #[test]
+    fn resolve_plan_prefers_active_by_priority() {
+        let t = |h: u32| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        // 高优先级仅在 9-18 生效；低优先级全天；第三候选仅在深夜
+        let mut hi = rt("daily");
+        hi.plan_id = 2;
+        hi.priority = 10;
+        hi.active_start = Some(t(9));
+        hi.active_end = Some(t(18));
+        let mut lo = rt("daily");
+        lo.plan_id = 1;
+        lo.priority = 1;
+        let mut night = rt("daily");
+        night.plan_id = 3;
+        night.priority = 5;
+        night.active_start = Some(t(23));
+        night.active_end = Some(t(4));
+        let map = [(7i64, vec![night.clone(), lo, hi.clone()])].into();
+        assert_eq!(resolve_plan(&map, 7, t(12)).unwrap().plan_id, 2); // 时段内取高优
+        assert_eq!(resolve_plan(&map, 7, t(20)).unwrap().plan_id, 1); // 时段外回退全天
+        assert_eq!(resolve_plan(&map, 7, t(23)).unwrap().plan_id, 3); // 23:00 hi 窗外 → night(5) 胜 lo(1)
+        hi.active_start = Some(t(22));
+        let map2 = [(7i64, vec![night.clone(), hi])].into();
+        assert_eq!(resolve_plan(&map2, 7, t(23)).unwrap().plan_id, 2); // 同分取 plan_id 大
+        let map3 = [(7i64, vec![night])].into();
+        assert!(resolve_plan(&map3, 7, t(12)).is_none()); // 全部不在时段 → None
+    }
+
+    #[test]
+    fn parses_active_time() {
+        assert_eq!(
+            parse_active_time("09:00").unwrap(),
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parse_active_time(" 18:30:00 ").unwrap(),
+            NaiveTime::from_hms_opt(18, 30, 0).unwrap()
+        );
+        assert!(parse_active_time("24:00").is_err());
+        assert!(parse_active_time("9点").is_err());
+        let t = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        let t9 = t(9, 0);
+        assert!(validate_active_window(Some(t9), None).is_err());
+        assert!(validate_active_window(Some(t9), Some(t9)).is_err());
+        assert!(validate_active_window(None, None).is_ok());
+        assert!(validate_active_window(Some(t9), Some(t(18, 0))).is_ok());
     }
 
     #[test]
@@ -779,5 +1338,208 @@ mod tests {
         let in_window = |t: DateTime<Utc>| t > now - chrono::Duration::hours(2) && t <= now;
         assert!(in_window(cur));
         assert!(!in_window(prev));
+    }
+    // ---------- DB 集成测试（#[sqlx::test] 每测独立临时库，自动应用迁移） ----------
+
+    use serde_json::json;
+
+    async fn seed_plan(pool: &PgPool, name: &str, priority: i32, enabled: bool) -> CodingPlan {
+        create_plan(
+            pool,
+            name,
+            "",
+            priority,
+            1_000_000,
+            PERIOD_MONTHLY,
+            1,
+            ANCHOR_FIXED,
+            OVERAGE_BLOCK,
+            None,
+            &json!(["in_site"]),
+            "",
+            None,
+            None,
+            enabled,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn seed_user(pool: &PgPool, username: &str) -> i64 {
+        crate::store::users::create_local_user(pool, username, username, "x", false)
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn seed_group_with_member(pool: &PgPool, name: &str, user_id: i64) -> i64 {
+        let g = crate::store::groups::create_group(pool, name, "", false)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_group_members (group_id, user_id) VALUES ($1, $2)")
+            .bind(g.id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        g.id
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn plan_member_crud_unique_guard_and_search(pool: sqlx::PgPool) {
+        let plan = seed_plan(&pool, "pro", 0, true).await;
+        let u1 = seed_user(&pool, "alice").await;
+        let u2 = seed_user(&pool, "bob").await;
+        let g1 = crate::store::groups::create_group(&pool, "dev", "研发", false)
+            .await
+            .unwrap()
+            .id;
+
+        // 正常添加（事务内插入，与 API 路径一致）
+        let mut tx = pool.begin().await.unwrap();
+        let added = add_plan_users(&mut *tx, plan.id, &[u1, u2]).await.unwrap();
+        assert_eq!(added, 2);
+        let added_g = add_plan_groups(&mut *tx, plan.id, &[g1]).await.unwrap();
+        assert_eq!(added_g, 1);
+        tx.commit().await.unwrap();
+
+        // 列表 + 总数
+        let (members, total) = list_plan_users(&pool, plan.id, None, 20, 0).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(members.len(), 2);
+
+        // 模糊搜索：用户名命中；无命中返回空（搜索为空场景）
+        let (_, hits) = list_plan_users(&pool, plan.id, Some("ali"), 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(hits, 1);
+        let (rows, hits) = list_plan_users(&pool, plan.id, Some("不存在的名字"), 20, 0)
+            .await
+            .unwrap();
+        assert!(rows.is_empty() && hits == 0);
+
+        // 选择器：is_member 标记 + 搜索为空
+        let (picks, _) = search_users_for_plan(&pool, plan.id, None, 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(picks.iter().filter(|p| p.is_member).count(), 2);
+        let (empty, total_all) = search_users_for_plan(&pool, plan.id, Some("zzz"), 20, 0)
+            .await
+            .unwrap();
+        assert!(empty.is_empty() && total_all == 0);
+        let (gpicks, _) = search_groups_for_plan(&pool, plan.id, None, 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(gpicks.iter().filter(|p| p.is_member).count(), 1);
+
+        // 重复预检命中 + 重复插入幂等（ON CONFLICT → rows_affected = 0）
+        let mut tx = pool.begin().await.unwrap();
+        let dup = existing_plan_user_ids(&mut *tx, plan.id, &[u1, u2])
+            .await
+            .unwrap();
+        assert_eq!(dup, vec![u1, u2]);
+        let added = add_plan_users(&mut *tx, plan.id, &[u2]).await.unwrap();
+        assert_eq!(added, 0);
+        let dup_g = existing_plan_group_ids(&mut *tx, plan.id, &[g1])
+            .await
+            .unwrap();
+        assert_eq!(dup_g, vec![g1]);
+        tx.commit().await.unwrap();
+
+        // 参数校验：不存在的 id（保持入参顺序）
+        let missing = missing_user_ids(&pool, &[u1, 424242]).await.unwrap();
+        assert_eq!(missing, vec![424242]);
+        let missing = missing_group_ids(&pool, &[g1, 424242]).await.unwrap();
+        assert_eq!(missing, vec![424242]);
+
+        // 移除
+        let removed = remove_plan_users(&pool, plan.id, &[u1, u2]).await.unwrap();
+        assert_eq!(removed, 2);
+        let removed = remove_plan_groups(&pool, plan.id, &[g1]).await.unwrap();
+        assert_eq!(removed, 1);
+        let (_, total) = list_plan_users(&pool, plan.id, None, 20, 0).await.unwrap();
+        assert_eq!(total, 0);
+        let (_, total_g) = list_plan_groups(&pool, plan.id, None, 20, 0).await.unwrap();
+        assert_eq!(total_g, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn plan_membership_runtime_dual_channel_priority(pool: sqlx::PgPool) {
+        // 分组通道：alice 经分组进 low；直连通道：bob 直连 high；
+        // carol 双通道并存 → priority 高者生效
+        let low = seed_plan(&pool, "low", 1, true).await;
+        let high = seed_plan(&pool, "high", 10, true).await;
+        let alice = seed_user(&pool, "alice").await;
+        let bob = seed_user(&pool, "bob").await;
+        let carol = seed_user(&pool, "carol").await;
+        let g = seed_group_with_member(&pool, "dev", alice).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        add_plan_groups(&mut *tx, low.id, &[g]).await.unwrap();
+        add_plan_users(&mut *tx, high.id, &[bob, carol])
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_group_members (group_id, user_id) VALUES ($1, $2)")
+            .bind(g)
+            .bind(carol)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let rt = load_plan_runtimes(&pool).await.unwrap();
+        assert_eq!(resolve(&rt, alice).unwrap().plan_id, low.id);
+        assert_eq!(resolve(&rt, alice).unwrap().group_name, "dev");
+        assert_eq!(resolve(&rt, bob).unwrap().plan_id, high.id);
+        assert_eq!(resolve(&rt, bob).unwrap().group_name, ""); // 直连无分组名
+        assert_eq!(resolve(&rt, carol).unwrap().plan_id, high.id); // priority 10 > 1
+
+        // 停用 Plan 退出运行时：carol 回退分组通道，bob 无入口 → 不限额
+        sqlx::query("UPDATE coding_plans SET enabled = FALSE WHERE id = $1")
+            .bind(high.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rt = load_plan_runtimes(&pool).await.unwrap();
+        assert_eq!(resolve(&rt, carol).unwrap().plan_id, low.id);
+        assert!(resolve(&rt, bob).is_none());
+
+        // 汇总计数：分组数 = plan_groups 行数；成员数 = 双通道用户去重并集
+        let summaries = list_plan_summaries(&pool).await.unwrap();
+        let low_row = summaries.iter().find(|p| p.id == low.id).unwrap();
+        assert_eq!(low_row.group_count, 1);
+        assert_eq!(low_row.member_count, 2); // alice + carol
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_plan_reports_impact_and_cascades(pool: sqlx::PgPool) {
+        let plan = seed_plan(&pool, "gone", 0, true).await;
+        let u = seed_user(&pool, "dave").await;
+        let g = seed_group_with_member(&pool, "ops", u).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        add_plan_groups(&mut *tx, plan.id, &[g]).await.unwrap();
+        add_plan_users(&mut *tx, plan.id, &[u]).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let impact = delete_plan(&pool, plan.id).await.unwrap().unwrap();
+        assert_eq!(impact.groups, 1);
+        assert_eq!(impact.direct_users, 1);
+        // 再删 → None（幂等）
+        assert!(delete_plan(&pool, plan.id).await.unwrap().is_none());
+
+        // 关联行随 FK CASCADE 清除，运行时为空
+        let rt = load_plan_runtimes(&pool).await.unwrap();
+        assert!(rt.is_empty());
+        let (groups_left,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plan_groups")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(groups_left, 0);
+        let (users_left,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plan_users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users_left, 0);
     }
 }

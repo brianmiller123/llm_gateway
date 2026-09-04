@@ -14,7 +14,10 @@ use crate::store::{groups, plans as plan_store};
 /// - `Ok(None)` — 放行（含 `log` 策略超额：仅告警不拦截）
 /// - `Err` — 超额拦截（429 insufficient_quota）
 pub fn check_plan(st: &AppState, user_id: i64, model: &str) -> Result<Option<String>, AppError> {
-    let Some(plan) = st.plans.read().get(&user_id).cloned() else {
+    // 生效时段按服务器本地墙钟判定；配额统计周期仍一律 UTC
+    let Some(plan) =
+        plan_store::resolve_plan(&st.plans.read(), user_id, chrono::Local::now().time())
+    else {
         return Ok(None);
     };
     let now = chrono::Utc::now();
@@ -52,7 +55,9 @@ fn blocked(plan: &plan_store::PlanRuntime, used: i64) -> AppError {
 
 /// 记账事务提交后调用：用量推进可能跨过 80/95/100% 阈值 → 触发告警检查
 pub fn after_usage_record(st: &AppState, user_id: i64) {
-    let Some(plan) = st.plans.read().get(&user_id).cloned() else {
+    let Some(plan) =
+        plan_store::resolve_plan(&st.plans.read(), user_id, chrono::Local::now().time())
+    else {
         return;
     };
     let used = st

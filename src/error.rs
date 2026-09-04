@@ -21,6 +21,9 @@ pub enum AppError {
     /// Coding Plan 周期配额耗尽且策略为拦截（429 insufficient_quota）
     #[error("{0}")]
     PlanQuotaExceeded(String),
+    /// 状态冲突（如重复加入同一 Coding Plan）
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("internal error: {0}")]
@@ -96,6 +99,7 @@ impl IntoResponse for AppError {
                 AppError::PlanQuotaExceeded(m) => {
                     (StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", m, None)
                 }
+                AppError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m, None),
                 AppError::BadRequest(m) => {
                     (StatusCode::BAD_REQUEST, "invalid_request_error", m, None)
                 }

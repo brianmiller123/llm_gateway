@@ -33,7 +33,7 @@
 
 - 无需登录的 `/status` 页面 + `GET /api/status`
 - 组件实时状态（网关 / PostgreSQL / 各上游供应商）+ 近 30 天按日可用率色块 + 事故历史（自动检测 + 相邻小时合并 + 严重度分级）
-- 上游供应商双证据判定：每 30 秒主动探测 `{base_url}/1/status`（HTTP 状态码 + 响应体 status 字段 / 服务标识），融合 `usage_logs` 调用统计；端点未部署（404）或鉴权被拒时自动回退纯调用统计
+- 上游供应商双证据判定：每 30 秒主动探测 `{base_url}/1/status`（HTTP 状态码 + 响应体 status 字段 / 服务标识）；非结论性（404/401/403/429 等，主流 LLM 上游普遍未部署状态端点）时回退 `GET {base_url}/models`（OpenAI 兼容事实标准探针，免费不计费），融合 `usage_logs` 调用统计；两跳均非结论性才回退纯调用统计
 - 页面每 60 秒自动刷新，刷新失败保留旧数据并显示降级提示条
 
 ## 架构总览
@@ -148,7 +148,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `POST /api/auth/login`、`/refresh`、`/logout` | — | 控制台会话（LDAP / 本地账号） |
 | `GET /api/me`、`/api/me/plan`、`/api/keys`、`/api/usage`、`/api/usage/trend` | JWT | 个人资料、我的套餐、Key 管理、用量查询 |
 | `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/quotas`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
-| `GET/POST /api/admin/plans`、`/api/admin/groups`、`/api/admin/plan-alerts`、`/api/admin/smtp` 等 | JWT + 管理员 | Coding Plan 套餐 CRUD 与用量回溯、用户分组（成员管理 / LDAP 同步 / CSV 导出）、阈值告警流、SMTP 设置 |
+| `GET/POST /api/admin/plans`、`/api/admin/groups`、`/api/admin/plan-alerts`、`/api/admin/smtp` 等 | JWT + 管理员 | Coding Plan 套餐 CRUD 与用量回溯、成员管理（直连用户 / 加入分组：列表、候选检索、批量增删）、用户分组（成员管理 / LDAP 同步 / CSV 导出）、阈值告警流、SMTP 设置 |
 
 错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；限流 429 带 `Retry-After`；上游错误透明透传。
 
@@ -161,7 +161,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
   - 2xx + 无 `status` 字段但含服务标识（service/server/version/success=true 等）→ 按连通性判正常
   - 2xx + 非 JSON / 无法识别格式 → 性能下降（可达但无法确认服务身份，防劫持页误报）
   - 连接失败 / 超时 / 5xx / `status` 自报故障 → 不可用
-  - 404（端点未部署）/ 401 / 403 / 429 → 非结论性，回退调用统计（服务可达，不武断判死）
+  - 404 / 401 / 403 / 429 → 非结论性，回退第二跳 `GET {base_url}/models`（拼接方式与代理转发一致）：2xx + 模型列表（object="list"/data 数组）→ 正常；401/403 → 性能下降（端点存活但渠道 Key 失效/无权限）；404/429/网络失败 → 仍非结论性，回退调用统计（服务可达，不武断判死）
 - **调用统计**（被动证据）：`usage_logs` 真实调用记录（`status >= 400` 视为失败；鉴权/限流 4xx 在进入代理管线前返回，不写入日志，不污染错误率）——窗口错误率判定，优先近 10 分钟，样本不足（<5 次）依次回退 60 分钟、24 小时；≥50% 不可用、≥10% 性能下降、否则正常、24 小时无流量未知
 - **融合规则**：探测不可用 → 直接不可用（结论性证据）；探测存活 → 在探测结论与「调用统计（至多性能下降）」中取更差者（探测正常 + 近期调用错误率高 → 性能下降并在详情中说明，常见为 Key 失效/配额等调用侧原因）；探测非结论性 → 完全采用调用统计
 - **30 天可用率**：按 UTC 日聚合成功率，绿/黄/红/深红分级
@@ -200,7 +200,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 
 ## Coding Plan 周期用量限制与小时级重置
 
-按分组将用户绑定到套餐（Coding Plan）：token 上限 + 统计周期 + 超额策略（`block` 拦截 429 / `downgrade` 降级到指定模型并走出站重建路径 / `log` 仅告警）。用户命中多个分组时按 `priority` 最高者整体生效（同分取 `plan_id` 大），多套餐不叠加计量——需要「小时 + 月」双重限值应拆两个分组用 priority 表达。
+用户经分组或直连两种通道加入套餐（Coding Plan）：token 上限 + 统计周期 + 超额策略（`block` 拦截 429 / `downgrade` 降级到指定模型并走出站重建路径 / `log` 仅告警）。分组与用户均为多对多关联（`plan_groups` / `plan_users`，主键即唯一约束防重复添加）；用户命中多个入口时按 `priority` 最高者整体生效（同分取 `plan_id` 大），多套餐不叠加计量——需要「小时 + 月」双重限值应拆两个分组用 priority 表达。成员管理入口在 Coding Plan 管理页（直连用户 / 加入分组，选择器分页检索 + 批量增删；重复加入返回 409）。
 
 **统计周期**：`daily`（UTC 当日 00:00 起）/ `monthly`（UTC 自然月）/ `total`（不重置）/ `hourly`（小时级滚动重置）。
 
@@ -211,7 +211,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 - `period_hours`：窗口长度 1..=168（上限一周）
 - `period_anchor_mode`：
   - `fixed`：UTC 整点网格，桶界 = `epoch + k·N·h`。仅当 N 整除 24 时桶界才与每日 00:00 对齐，N=5/7 等跨日相位漂移是有意行为（纯网格，全局均匀无重叠）
-  - `join`：按成员开通时间（`user_group_members.added_at`）偏移切桶；移除分组后重新加入视同重新开通（新桶、余量重置）
+  - `join`：按成员开通时间（分组成员取 `user_group_members.added_at`，直连用户取 `plan_users.added_at`）偏移切桶；移除后重新加入视同重新开通（新桶、余量重置）
 - **重置是推导出来的，不是调度出来的**：无任何清零定时任务。预检查内存缓存按 `period_key`（hourly 为 `h:<桶起点 epoch 秒>`）翻转归零，`plan_usage_counters` 按新 `period_start` 自然落新行，阈值告警去重键含 period_key 故新周期自动重新武装；旧周期数据保留可回溯
 
 ### 计量与一致性
@@ -221,7 +221,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 - 重启 / 宕机错过翻桶无需补偿：`period_start` 为纯时间函数，重启后首请求直接命中当前桶；时钟回拨或未来锚点钳位，不产生负槽位
 - 阈值告警 80/95/100%：站内通知 + 邮件（SMTP）+ webhook，进程内 seen 与 `plan_alerts UNIQUE(plan_id, user_id, period_key, level)` 双层去重
 
-管理端点：`/api/admin/plans`（CRUD + 用量回溯）、`/api/admin/plan-alerts`、`/api/me/plan`（我的套餐）；设计细节见 `docs/plans/hourly-reset-design.md`。
+管理端点：`/api/admin/plans`（CRUD + 用量回溯 + 成员管理：`{id}/users`、`{id}/groups` 列表 / `*-candidates` 选择器 / `*/add`、`*/remove` 批量增删，重复加入 409、参数错误 400）、`/api/admin/plan-alerts`、`/api/me/plan`（我的套餐）；设计细节见 `docs/plans/hourly-reset-design.md`。
 
 ## 数据模型
 
@@ -234,6 +234,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 | `usage_logs` | 用量明细（`request_id` 唯一防重复记账，按用户/时间索引） |
 | `user_monthly_usage` / `usage_daily` | 配额计数（记账事务内 UPSERT）；仪表盘聚合（60s 后台任务） |
 | `coding_plans` / `user_groups` / `user_group_members` | 周期配额套餐（token 上限 / 统计周期 / 超额策略）与用户分组（LDAP 联动同步） |
+| `plan_users` / `plan_groups` | Plan ↔ 用户 / 分组多对多关联（主键即唯一约束防重复添加；随 Plan 删除级联清理） |
 | `plan_usage_counters` / `plan_alerts` | Plan 当期计数（记账事务内 UPSERT，`period_start` TIMESTAMPTZ）与阈值告警（`period_key` 去重） |
 | `refresh_tokens` / `audit_logs` / `aggregation_state` | 会话、审计、聚合水位 |
 

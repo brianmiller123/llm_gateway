@@ -20,6 +20,7 @@ const router = createRouter({
         { path: 'keys', name: 'keys', component: () => import('@/views/Keys.vue'), meta: { title: 'API Keys' } },
         { path: 'usage', name: 'usage', component: () => import('@/views/Usage.vue'), meta: { title: '用量统计' } },
         { path: 'users', name: 'users', component: () => import('@/views/Users.vue'), meta: { title: '用户管理', admin: true } },
+        { path: 'groups', name: 'groups', component: () => import('@/views/Groups.vue'), meta: { title: '用户分组', admin: true } },
         { path: 'audit', name: 'audit', component: () => import('@/views/Audit.vue'), meta: { title: '审计日志', admin: true } },
         {
           path: 'my-plan',

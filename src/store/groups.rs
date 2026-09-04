@@ -1,22 +1,23 @@
 //! 用户分组存储：CRUD、成员管理（手动/批量/全部快照）、LDAP 成员增量对账、
-//! 成员分页检索与导出。
+//! 成员分页检索与导出。分组与 Plan 的关联在 plan_groups（见 store/plans.rs），
+//! 此处只读聚合展示已加入的 Plan 列表。
 //!
 //! 海量成员性能：批量添加用单条 INSERT..SELECT（unnest 数组绑定），全部用户
 //! 快照为单语句 INSERT..SELECT..ON CONFLICT DO NOTHING；列表检索走
 //! (group_id, user_id) 主键 JOIN + LIMIT/OFFSET。
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 
-/// 分组行（管理视图：含绑定 Plan 名与成员计数）
+/// 分组行（管理视图：plans 为已加入 Plan 的 jsonb 数组 [{id,name,enabled}]，含成员计数）
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
 pub struct GroupRow {
     pub id: i64,
     pub name: String,
     pub description: String,
-    pub plan_id: Option<i64>,
-    pub plan_name: Option<String>,
-    pub plan_enabled: Option<bool>,
+    /// 已加入的 Plan（plan_groups 关联，按 plan id 序）
+    pub plans: Value,
     pub ldap_sync: bool,
     pub member_count: i64,
     pub last_sync_at: Option<DateTime<Utc>>,
@@ -25,49 +26,42 @@ pub struct GroupRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// plans 聚合列：jsonb 数组 → GroupRow 直接携带（前端按数组渲染）
+const GROUP_SELECT: &str = "SELECT g.id, g.name, g.description, \
+            COALESCE(jsonb_agg(jsonb_build_object('id', p.id, 'name', p.name, 'enabled', p.enabled) \
+                               ORDER BY p.id) FILTER (WHERE p.id IS NOT NULL), '[]'::jsonb) AS plans, \
+            g.ldap_sync, \
+            (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count, \
+            g.last_sync_at, g.last_sync_result, g.created_at, g.updated_at \
+     FROM user_groups g \
+     LEFT JOIN plan_groups pg ON pg.group_id = g.id \
+     LEFT JOIN coding_plans p ON p.id = pg.plan_id";
+
 pub async fn list_groups(pool: &PgPool) -> Result<Vec<GroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, GroupRow>(
-        "SELECT g.id, g.name, g.description, g.plan_id, p.name AS plan_name, \
-                p.enabled AS plan_enabled, g.ldap_sync, \
-                (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count, \
-                g.last_sync_at, g.last_sync_result, g.created_at, g.updated_at \
-         FROM user_groups g \
-         LEFT JOIN coding_plans p ON p.id = g.plan_id \
-         ORDER BY g.id",
-    )
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, GroupRow>(&format!("{GROUP_SELECT} GROUP BY g.id ORDER BY g.id"))
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn find_group(pool: &PgPool, id: i64) -> Result<Option<GroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, GroupRow>(
-        "SELECT g.id, g.name, g.description, g.plan_id, p.name AS plan_name, \
-                p.enabled AS plan_enabled, g.ldap_sync, \
-                (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count, \
-                g.last_sync_at, g.last_sync_result, g.created_at, g.updated_at \
-         FROM user_groups g \
-         LEFT JOIN coding_plans p ON p.id = g.plan_id \
-         WHERE g.id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
+    sqlx::query_as::<_, GroupRow>(&format!("{GROUP_SELECT} WHERE g.id = $1 GROUP BY g.id"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn create_group(
     pool: &PgPool,
     name: &str,
     description: &str,
-    plan_id: Option<i64>,
     ldap_sync: bool,
 ) -> Result<GroupRow, sqlx::Error> {
     let id: (i64,) = sqlx::query_as(
-        "INSERT INTO user_groups (name, description, plan_id, ldap_sync) \
-         VALUES ($1,$2,$3,$4) RETURNING id",
+        "INSERT INTO user_groups (name, description, ldap_sync) \
+         VALUES ($1,$2,$3) RETURNING id",
     )
     .bind(name)
     .bind(description)
-    .bind(plan_id)
     .bind(ldap_sync)
     .fetch_one(pool)
     .await?;
@@ -76,28 +70,25 @@ pub async fn create_group(
         .ok_or_else(|| sqlx::Error::RowNotFound)
 }
 
-/// 部分更新；plan_id 三态：None=不修改 / Some(None)=解绑 / Some(Some(id))=绑定
+/// 部分更新（None = 保留）。加入/退出 Plan 走 plan_members API，不在分组编辑内。
 pub async fn update_group(
     pool: &PgPool,
     id: i64,
     name: Option<&str>,
     description: Option<&str>,
-    plan_id: Option<Option<i64>>,
     ldap_sync: Option<bool>,
 ) -> Result<Option<GroupRow>, sqlx::Error> {
     let n = sqlx::query(
         "UPDATE user_groups SET \
            name = COALESCE($2, name), \
            description = COALESCE($3, description), \
-           plan_id = COALESCE($4, plan_id), \
-           ldap_sync = COALESCE($5, ldap_sync), \
+           ldap_sync = COALESCE($4, ldap_sync), \
            updated_at = now() \
          WHERE id = $1",
     )
     .bind(id)
     .bind(name)
     .bind(description)
-    .bind(plan_id)
     .bind(ldap_sync)
     .execute(pool)
     .await?
