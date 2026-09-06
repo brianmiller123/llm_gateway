@@ -32,6 +32,14 @@ function windowText(p: CodingPlan): string {
   if (!p.active_start || !p.active_end) return '全天'
   return `${p.active_start.slice(0, 5)} - ${p.active_end.slice(0, 5)}`
 }
+
+function scopeText(p: CodingPlan): string {
+  if (!p.model_scope) return '全部模型'
+  const parts: string[] = []
+  if (p.model_scope.allow.length) parts.push(`仅 ${p.model_scope.allow.join('、')}`)
+  if (p.model_scope.deny.length) parts.push(`排除 ${p.model_scope.deny.join('、')}`)
+  return parts.join('；') || '全部模型'
+}
 function percent(used: number, limit: number): number {
   if (limit <= 0) return 0
   return Math.round((used * 10000) / limit) / 100
@@ -83,6 +91,9 @@ const form = reactive({
   active_enabled: false,
   active_start: '',
   active_end: '',
+  scope_enabled: false,
+  scope_allow: [] as string[],
+  scope_deny: [] as string[],
   webhook_url: '',
   enabled: true,
 })
@@ -110,6 +121,9 @@ function openCreate() {
   form.active_enabled = false
   form.active_start = ''
   form.active_end = ''
+  form.scope_enabled = false
+  form.scope_allow = []
+  form.scope_deny = []
   dialogVisible.value = true
 }
 
@@ -135,6 +149,9 @@ function openEdit(p: CodingPlan) {
   form.active_enabled = hasWindow
   form.active_start = p.active_start?.slice(0, 5) ?? ''
   form.active_end = p.active_end?.slice(0, 5) ?? ''
+  form.scope_enabled = !!p.model_scope
+  form.scope_allow = [...(p.model_scope?.allow ?? [])]
+  form.scope_deny = [...(p.model_scope?.deny ?? [])]
   dialogVisible.value = true
 }
 
@@ -159,6 +176,17 @@ async function doSave() {
     ElMessage.warning('起止时间相同；全天启用请关闭「自定义生效时段」')
     return
   }
+  const allow = form.scope_allow.map((s) => s.trim().toLowerCase()).filter(Boolean)
+  const deny = form.scope_deny.map((s) => s.trim().toLowerCase()).filter(Boolean)
+  const bad = [...allow, ...deny].find((p) => !/^[a-z0-9._+:/-]+\*?$/.test(p) || p === '*')
+  if (form.scope_enabled && bad) {
+    ElMessage.warning(`模型 pattern 不合法：${bad}（仅支持字母数字 . _ + : - / 与尾缀 *）`)
+    return
+  }
+  if (allow.some((a) => deny.includes(a))) {
+    ElMessage.warning('同一条 pattern 不能同时出现在白名单与黑名单')
+    return
+  }
   saving.value = true
   const body = {
     name: form.name.trim(),
@@ -175,6 +203,7 @@ async function doSave() {
     active_window: form.active_enabled
       ? { start: form.active_start, end: form.active_end }
       : { start: null, end: null },
+    model_scope: form.scope_enabled && (allow.length || deny.length) ? { allow, deny } : null,
     enabled: form.enabled,
   }
   try {
@@ -281,6 +310,11 @@ onMounted(loadPlans)
         </el-table-column>
         <el-table-column label="生效时段" width="120">
           <template #default="{ row }">{{ windowText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="模型作用域" min-width="150">
+          <template #default="{ row }">
+            <span :class="{ 'scope-all': !row.model_scope }">{{ scopeText(row) }}</span>
+          </template>
         </el-table-column>
         <el-table-column label="超额策略" min-width="150">
           <template #default="{ row }">
@@ -400,6 +434,41 @@ onMounted(loadPlans)
             </div>
           </div>
         </el-form-item>
+        <el-form-item label="模型作用域">
+          <div>
+            <el-switch v-model="form.scope_enabled" active-text="限定模型" />
+            <template v-if="form.scope_enabled">
+              <div class="limit-row" style="margin-top: 8px">
+                <span class="hint" style="white-space: nowrap">白名单</span>
+                <el-select
+                  v-model="form.scope_allow"
+                  multiple
+                  filterable
+                  allow-create
+                  default-first-option
+                  placeholder="如 claude-*、gpt-4o（回车添加）"
+                  class="scope-select"
+                />
+              </div>
+              <div class="limit-row" style="margin-top: 8px">
+                <span class="hint" style="white-space: nowrap">黑名单</span>
+                <el-select
+                  v-model="form.scope_deny"
+                  multiple
+                  filterable
+                  allow-create
+                  default-first-option
+                  placeholder="命中即排除，优先级高于白名单"
+                  class="scope-select"
+                />
+              </div>
+            </template>
+            <div class="hint" style="margin-top: 4px">
+              精确匹配（gpt-4o）或前缀通配（claude-* 覆盖全部 Claude 系列）；不限定 =
+              对所有模型生效
+            </div>
+          </div>
+        </el-form-item>
         <el-form-item label="超额策略">
           <el-radio-group v-model="form.overage_action">
             <el-radio-button value="block">拦截请求</el-radio-button>
@@ -460,6 +529,12 @@ onMounted(loadPlans)
 }
 .channel-tag {
   margin-right: 4px;
+}
+.scope-select {
+  min-width: 320px;
+}
+.scope-all {
+  color: #909399;
 }
 .limit-row {
   display: flex;

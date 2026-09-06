@@ -535,6 +535,16 @@ export type OverageAction = 'block' | 'downgrade' | 'log'
 export type PeriodType = 'hourly' | 'daily' | 'monthly' | 'total'
 /** hourly 锚点：fixed=UTC 整点网格 / join=按开通时间偏移 */
 export type AnchorMode = 'fixed' | 'join'
+/** Plan 模型作用域 pattern：精确或尾缀 * 前缀匹配（与路由规则同语义） */
+export type ModelPattern = string
+
+/** Plan 模型作用域（null = 对所有模型生效；deny 优先于 allow） */
+export interface ModelScope {
+  /** 白名单：缺省/空 = 不限模型（仅受 deny 约束） */
+  allow: ModelPattern[]
+  /** 黑名单：命中任一即排除 */
+  deny: ModelPattern[]
+}
 
 export interface CodingPlan {
   id: number
@@ -554,6 +564,8 @@ export interface CodingPlan {
   /** 生效时段 "HH:MM"（null = 全天）；start > end = 跨零点 */
   active_start: string | null
   active_end: string | null
+  /** 模型作用域（null = 对所有模型生效） */
+  model_scope: ModelScope | null
   enabled: boolean
   updated_at: string
 }

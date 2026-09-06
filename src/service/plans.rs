@@ -9,16 +9,33 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::store::{groups, plans as plan_store};
 
-/// 请求期配额检查：
-/// - `Ok(Some(model))` — 超额降级：请求模型改写为降级目标（路由/计价/记账随之）
-/// - `Ok(None)` — 放行（含 `log` 策略超额：仅告警不拦截）
+/// 请求期 Plan 检查结果：
+/// - `plan`：模型感知解析出的生效 Plan。代理记账载荷直接复用它，保证「检查」与
+///   「记账」同源——模型作用域下二次解析可能选中另一个 Plan（或因不匹配而漏记）。
+/// - `downgrade_to`：超额降级目标模型（`overage_action = downgrade` 且目标 ≠ 当前模型）。
+#[derive(Debug, Clone)]
+pub struct PlanDecision {
+    pub plan: Option<plan_store::PlanRuntime>,
+    pub downgrade_to: Option<String>,
+}
+
+/// 请求期配额检查（按当前请求模型解析生效 Plan，模型作用域随请求即时生效）：
+/// - `downgrade_to = Some(m)` — 超额降级：请求模型改写为 m（路由/计价/记账随之，
+///   且用量记入本 Plan 的计数器——降级是本 Plan 的处置动作）
+/// - `downgrade_to = None` — 放行（含 `log` 策略超额：仅告警不拦截）
 /// - `Err` — 超额拦截（429 insufficient_quota）
-pub fn check_plan(st: &AppState, user_id: i64, model: &str) -> Result<Option<String>, AppError> {
+pub fn check_plan(st: &AppState, user_id: i64, model: &str) -> Result<PlanDecision, AppError> {
     // 生效时段按服务器本地墙钟判定；配额统计周期仍一律 UTC
-    let Some(plan) =
-        plan_store::resolve_plan(&st.plans.read(), user_id, chrono::Local::now().time())
-    else {
-        return Ok(None);
+    let Some(plan) = plan_store::resolve_plan(
+        &st.plans.read(),
+        user_id,
+        chrono::Local::now().time(),
+        Some(model),
+    ) else {
+        return Ok(PlanDecision {
+            plan: None,
+            downgrade_to: None,
+        });
     };
     let now = chrono::Utc::now();
     let used = st
@@ -29,16 +46,28 @@ pub fn check_plan(st: &AppState, user_id: i64, model: &str) -> Result<Option<Str
     crate::service::notify::check_and_dispatch(st, user_id, &plan, used);
 
     if used < plan.token_limit {
-        return Ok(None);
+        return Ok(PlanDecision {
+            plan: Some(plan),
+            downgrade_to: None,
+        });
     }
     match plan.overage_action.as_str() {
         plan_store::OVERAGE_DOWNGRADE => match plan.downgrade_model.as_deref() {
             // 目标即当前请求模型时降级无意义 → 拦截（否则死循环在降级模型上继续超用）
-            Some(target) if target != model => Ok(Some(target.to_string())),
+            Some(target) if target != model => {
+                let downgrade_to = Some(target.to_string());
+                Ok(PlanDecision {
+                    plan: Some(plan),
+                    downgrade_to,
+                })
+            }
             _ => Err(blocked(&plan, used)),
         },
         // log：仅记录并告警（上方 check_and_dispatch 已覆盖 100% 级）
-        plan_store::OVERAGE_LOG => Ok(None),
+        plan_store::OVERAGE_LOG => Ok(PlanDecision {
+            plan: Some(plan),
+            downgrade_to: None,
+        }),
         _ => Err(blocked(&plan, used)),
     }
 }
@@ -53,11 +82,17 @@ fn blocked(plan: &plan_store::PlanRuntime, used: i64) -> AppError {
     ))
 }
 
-/// 记账事务提交后调用：用量推进可能跨过 80/95/100% 阈值 → 触发告警检查
-pub fn after_usage_record(st: &AppState, user_id: i64) {
-    let Some(plan) =
-        plan_store::resolve_plan(&st.plans.read(), user_id, chrono::Local::now().time())
+/// 记账事务提交后调用：用量推进可能跨过 80/95/100% 阈值 → 触发告警检查。
+/// `plan_id` 传代理路径解析出的记账 Plan（[`PlanDecision::plan`]）——模型作用域下
+/// 无模型二次解析可能选中另一个 Plan，把告警记到错误的配额上。
+pub fn after_usage_record(st: &AppState, user_id: i64, plan_id: i64) {
+    let Some(plan) = st
+        .plans
+        .read()
+        .get(&user_id)
+        .and_then(|c| c.iter().find(|p| p.plan_id == plan_id).cloned())
     else {
+        // Plan 已删除/停用（运行时已刷新）→ 无从告警，静默返回
         return;
     };
     let used = st

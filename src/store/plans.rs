@@ -124,6 +124,163 @@ pub fn format_token_limit(tokens: i64) -> String {
     tokens.to_string()
 }
 
+// ---------- 模型作用域（model_scope） ----------
+
+/// 单条模型 pattern 长度上限；超长视为拼写事故而非合法标识符
+pub const MAX_MODEL_PATTERN_LEN: usize = 128;
+/// allow/deny 合计 pattern 条数上限；防误配超长列表拖慢热路径匹配
+pub const MAX_MODEL_PATTERNS: usize = 32;
+
+/// Plan 的模型作用域（`coding_plans.model_scope` JSONB，NULL = 对所有模型生效）。
+/// - `allow`（白名单）：缺省/空 = 不限模型（仅受 deny 约束）
+/// - `deny`（黑名单）：命中任一即排除，优先级高于 allow（冲突时黑名单赢）
+/// pattern 语义与路由规则一致（精确匹配，或尾缀 `*` 前缀匹配覆盖模型家族，
+/// 如 `claude-*`）；parse 时统一归一化为小写，匹配大小写不敏感。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ModelScope {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl ModelScope {
+    /// 黑名单优先：命中任一 deny → false；白名单空 = 全放行（仅受 deny 约束）；
+    /// 否则需命中任一 allow。
+    pub fn matches(&self, model: &str) -> bool {
+        if self.deny.iter().any(|p| model_matches_pattern(p, model)) {
+            return false;
+        }
+        self.allow.is_empty() || self.allow.iter().any(|p| model_matches_pattern(p, model))
+    }
+
+    /// 作用域具体度（[`resolve_plan`] 择优排序键，越大越具体）：
+    /// 2 = 全部条目均为精确匹配；1 = 含通配条目。
+    /// 未配置作用域（None）由 [`scope_specificity`] 记 0（全模型 = 最不具体）。
+    pub fn specificity(&self) -> u8 {
+        if self
+            .allow
+            .iter()
+            .chain(self.deny.iter())
+            .all(|p| !p.ends_with('*'))
+        {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// 择优排序键：未配置作用域 = 0（对所有模型生效，最不具体）。
+fn scope_specificity(scope: Option<&ModelScope>) -> u8 {
+    scope.map_or(0, ModelScope::specificity)
+}
+
+/// 模型 pattern 匹配（精确 或 尾缀 `*` 前缀；大小写不敏感，零分配）。
+/// 与 `service::routing::matches_pattern` 同语义——作用域所见模型串 = 路由所见模型串。
+pub fn model_matches_pattern(pattern: &str, model: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => {
+            model.len() >= prefix.len()
+                && model.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        }
+        None => pattern.eq_ignore_ascii_case(model),
+    }
+}
+
+/// 单条 pattern 合法性（写入期明确报错，不静默忽略）：
+/// 非空、≤[`MAX_MODEL_PATTERN_LEN`]、字符集 `alnum . _ + : - / *`；
+/// 通配仅支持尾缀单个 `*`（中间 `*` / `**` 拒绝）；裸 `*` 拒绝——等价于不配置作用域，
+/// 显式写出只会制造歧义配置。
+pub fn validate_model_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("empty model pattern".into());
+    }
+    if pattern.len() > MAX_MODEL_PATTERN_LEN {
+        return Err(format!(
+            "model pattern too long (>{} chars)",
+            MAX_MODEL_PATTERN_LEN
+        ));
+    }
+    if !pattern.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'*' | b'.' | b'_' | b'+' | b':' | b'-' | b'/')
+    }) {
+        return Err(format!(
+            "invalid character in model pattern '{pattern}' (allowed: letters digits . _ + : - / and trailing *)"
+        ));
+    }
+    match pattern.matches('*').count() {
+        0 => Ok(()),
+        1 if pattern.ends_with('*') && pattern != "*" => Ok(()),
+        1 if pattern == "*" => Err("bare '*' matches every model; omit model_scope instead".into()),
+        1 => Err(format!(
+            "model pattern '{pattern}' only supports trailing '*' (prefix match, same as routing rules)"
+        )),
+        n => Err(format!(
+            "model pattern '{pattern}' must contain at most one '*' (got {n})"
+        )),
+    }
+}
+
+/// 解析 model_scope JSON（API 入参与 DB 行共用；归一化 pattern 为小写）：
+/// - NULL / 缺省 → `Ok(None)`
+/// - `{}` / 双空数组 → `Ok(None)`（等价不限制，归一化存 NULL）
+/// - allow 与 deny 存在完全相同条目 → Err（黑名单优先语义下该条目永不命中，写入期报错）
+/// - 结构错误（非对象/未知字段/非字符串条目/pattern 非法）→ Err，调用方 400 或加载期跳过该 Plan
+pub fn parse_model_scope(v: Option<&Value>) -> Result<Option<ModelScope>, String> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let obj = v.as_object().ok_or_else(|| {
+        format!("model_scope must be an object with optional 'allow'/'deny' arrays, got: {v}")
+    })?;
+    for key in obj.keys() {
+        if key != "allow" && key != "deny" {
+            return Err(format!(
+                "unknown model_scope field '{key}' (expected 'allow'/'deny'; typo?)"
+            ));
+        }
+    }
+    let parse_list = |key: &str| -> Result<Vec<String>, String> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(vec![]),
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    let s = it.as_str().ok_or_else(|| {
+                        format!("model_scope.{key} entries must be strings, got: {it}")
+                    })?;
+                    validate_model_pattern(s).map_err(|e| format!("model_scope.{key}: {e}"))?;
+                    out.push(s.to_ascii_lowercase());
+                }
+                Ok(out)
+            }
+            Some(other) => Err(format!(
+                "model_scope.{key} must be an array of strings, got: {other}"
+            )),
+        }
+    };
+    let allow = parse_list("allow")?;
+    let deny = parse_list("deny")?;
+    if allow.len() + deny.len() > MAX_MODEL_PATTERNS {
+        return Err(format!(
+            "model_scope allows at most {MAX_MODEL_PATTERNS} patterns in total"
+        ));
+    }
+    if allow.iter().any(|a| deny.contains(a)) {
+        return Err(
+            "model_scope: identical pattern in both 'allow' and 'deny' (deny wins, so the allow entry can never match)".into(),
+        );
+    }
+    if allow.is_empty() && deny.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ModelScope { allow, deny }))
+}
+
 /// 计划原始行（CRUD/审计快照）
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
 pub struct CodingPlan {
@@ -145,6 +302,8 @@ pub struct CodingPlan {
     /// 生效时段（服务器本地墙钟）；双 None = 全天；start > end = 跨零点
     pub active_start: Option<NaiveTime>,
     pub active_end: Option<NaiveTime>,
+    /// 模型作用域（NULL = 对所有模型生效；结构见 [`parse_model_scope`]）
+    pub model_scope: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -166,6 +325,7 @@ pub struct PlanSummary {
     pub webhook_url: String,
     pub active_start: Option<NaiveTime>,
     pub active_end: Option<NaiveTime>,
+    pub model_scope: Option<Value>,
     pub enabled: bool,
     pub updated_at: DateTime<Utc>,
     pub used_tokens: i64,
@@ -197,6 +357,8 @@ pub struct PlanRuntime {
     /// 生效时段（服务器本地墙钟）；双 None = 全天；start > end = 跨零点
     pub active_start: Option<NaiveTime>,
     pub active_end: Option<NaiveTime>,
+    /// 模型作用域（parse 后供热路径匹配；None = 对所有模型生效）
+    pub model_scope: Option<ModelScope>,
 }
 
 impl PlanRuntime {
@@ -271,27 +433,65 @@ struct RuntimeRow {
     priority: i32,
     active_start: Option<NaiveTime>,
     active_end: Option<NaiveTime>,
+    model_scope: Option<Value>,
 }
 
-/// 请求期解析用户生效 Plan：过滤掉当前不在生效时段的候选，取 (priority, plan_id)
-/// 最大（多分组「优先级最高、同分 plan_id 大」语义的时段感知版）。
-/// 全部候选都不在时段内 → None（该用户此刻不受该批 Plan 限额）。
+/// 请求期解析用户生效 Plan（模型感知）：
+/// 1. 过滤：当前处于生效时段，且模型作用域命中当前模型（`model=None` 用于无模型上下文
+///    的路径——记账后告警/控制台展示——此时忽略作用域，与存量行为兼容）
+/// 2. 择优：作用域更具体者优先（未配置=0 < 含通配=1 < 仅精确=2，见 [`ModelScope::specificity`]）；
+///    同具体度取 (priority, plan_id) 最大（与存量「优先级最高、同分 plan_id 大」语义衔接）
+/// 3. 冲突可追溯：≥2 个候选同时命中时 warn 一条（选中者 + 落选者及各自具体度），
+///    供排查「这个模型为什么没走我配的 Plan」。
+/// 全部候选都被过滤 → None（该用户此刻不受该批 Plan 限额）。
 pub fn resolve_plan(
     plans: &HashMap<i64, Vec<PlanRuntime>>,
     user_id: i64,
     local_now: NaiveTime,
+    model: Option<&str>,
 ) -> Option<PlanRuntime> {
-    plans
+    let candidates: Vec<&PlanRuntime> = plans
         .get(&user_id)?
         .iter()
         .filter(|p| p.active_at(local_now))
-        .max_by_key(|p| (p.priority, p.plan_id))
-        .cloned()
+        .filter(|p| match (&p.model_scope, model) {
+            (Some(scope), Some(m)) => scope.matches(m),
+            _ => true,
+        })
+        .collect();
+    let best = candidates.iter().copied().max_by_key(|p| match model {
+        // 无模型上下文：完全沿用存量 (priority, plan_id) 语义，作用域不参与排序
+        None => (0, p.priority, p.plan_id),
+        Some(_) => (
+            scope_specificity(p.model_scope.as_ref()),
+            p.priority,
+            p.plan_id,
+        ),
+    })?;
+    if candidates.len() > 1 {
+        tracing::warn!(
+            user_id,
+            model = model.unwrap_or(""),
+            chosen_plan_id = best.plan_id,
+            chosen_plan = %best.plan_name,
+            chosen_specificity = scope_specificity(best.model_scope.as_ref()),
+            overridden = ?candidates
+                .iter()
+                .filter(|c| c.plan_id != best.plan_id)
+                .map(|c| {
+                    (c.plan_id, c.plan_name.as_str(), scope_specificity(c.model_scope.as_ref()))
+                })
+                .collect::<Vec<_>>(),
+            "multiple coding plans match this model; picked by (model_scope specificity, priority, plan_id)"
+        );
+    }
+    Some(best.clone())
 }
 
 /// 全量用户 → 候选 Plan 列表（enabled 限定）。双通道入口：分组加入（plan_groups）∪
-/// 直连加入（plan_users），每用户保留全部候选行——生效时段随时刻变化，
-/// 请求期用 [`resolve_plan`] 按「当前处于生效时段 + priority 择优」解析。
+/// 直连加入（plan_users），每用户保留全部候选行——生效时段随时刻变化、模型作用域随
+/// 请求模型变化，请求期用 [`resolve_plan`] 按「生效时段 + 作用域 + 具体度/priority」解析。
+/// model_scope 解析失败的行跳过并 error 留痕（fail-closed，不猜测损坏配置的意图）。
 pub async fn load_plan_runtimes(
     pool: &PgPool,
 ) -> Result<HashMap<i64, Vec<PlanRuntime>>, sqlx::Error> {
@@ -299,13 +499,13 @@ pub async fn load_plan_runtimes(
         "SELECT user_id, plan_id, plan_name, group_name, token_limit, period_type, \
                 period_hours, period_anchor_mode, member_since, overage_action, \
                 downgrade_model, alert_channels, webhook_url, priority, \
-                active_start, active_end \
+                active_start, active_end, model_scope \
          FROM ( \
            SELECT m.user_id, p.id AS plan_id, p.name AS plan_name, g.name AS group_name, \
                   p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
                   m.added_at AS member_since, p.overage_action, p.downgrade_model, \
                   p.alert_channels, p.webhook_url, p.priority, \
-                  p.active_start, p.active_end \
+                  p.active_start, p.active_end, p.model_scope \
            FROM user_group_members m \
            JOIN user_groups g ON g.id = m.group_id \
            JOIN plan_groups pg ON pg.group_id = g.id \
@@ -315,7 +515,7 @@ pub async fn load_plan_runtimes(
                   p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
                   pu.added_at AS member_since, p.overage_action, p.downgrade_model, \
                   p.alert_channels, p.webhook_url, p.priority, \
-                  p.active_start, p.active_end \
+                  p.active_start, p.active_end, p.model_scope \
            FROM plan_users pu \
            JOIN coding_plans p ON p.id = pu.plan_id AND p.enabled = TRUE \
          ) r",
@@ -324,6 +524,20 @@ pub async fn load_plan_runtimes(
     .await?;
     let mut map: HashMap<i64, Vec<PlanRuntime>> = HashMap::new();
     for r in rows {
+        // 模型作用域解析失败 = 存量配置损坏（手改 DB / 旧版本写入）：
+        // 跳过该 Plan 并 error 留痕——宁可可修正地不限额，不可静默错误限额
+        let model_scope = match parse_model_scope(r.model_scope.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    plan_id = r.plan_id,
+                    plan = %r.plan_name,
+                    error = %e,
+                    "invalid coding plan model_scope; plan excluded from runtime until fixed"
+                );
+                continue;
+            }
+        };
         let chan: Vec<String> = serde_json::from_value(r.alert_channels.clone())
             .ok()
             .unwrap_or_else(|| vec!["in_site".into()]);
@@ -343,6 +557,7 @@ pub async fn load_plan_runtimes(
             priority: r.priority,
             active_start: r.active_start,
             active_end: r.active_end,
+            model_scope,
         });
     }
     Ok(map)
@@ -355,7 +570,7 @@ pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx
         "SELECT p.id, p.name, p.description, p.priority, p.token_limit, p.period_type, \
                 p.period_hours, p.period_anchor_mode, \
                 p.overage_action, p.downgrade_model, p.alert_channels, p.webhook_url, \
-                p.enabled, p.active_start, p.active_end, p.updated_at, \
+                p.enabled, p.active_start, p.active_end, p.model_scope, p.updated_at, \
                 COALESCE(u.used_tokens, 0)::bigint AS used_tokens, \
                 COALESCE(u.active_users, 0)::bigint AS active_users, \
                 (SELECT COUNT(*) FROM plan_groups pg WHERE pg.plan_id = p.id) AS group_count, \
@@ -390,7 +605,8 @@ pub async fn find_plan(pool: &PgPool, id: i64) -> Result<Option<CodingPlan>, sql
     sqlx::query_as::<_, CodingPlan>(
         "SELECT id, name, description, priority, token_limit, period_type, period_hours, \
                 period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-                webhook_url, enabled, active_start, active_end, created_at, updated_at \
+                webhook_url, enabled, active_start, active_end, model_scope, \
+                created_at, updated_at \
          FROM coding_plans WHERE id = $1",
     )
     .bind(id)
@@ -414,17 +630,20 @@ pub async fn create_plan(
     webhook_url: &str,
     active_start: Option<NaiveTime>,
     active_end: Option<NaiveTime>,
+    model_scope: Option<&ModelScope>,
     enabled: bool,
 ) -> Result<CodingPlan, sqlx::Error> {
+    let scope_json = model_scope.map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
     sqlx::query_as::<_, CodingPlan>(
         "INSERT INTO coding_plans \
            (name, description, priority, token_limit, period_type, period_hours, \
             period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-            webhook_url, enabled, active_start, active_end) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+            webhook_url, enabled, active_start, active_end, model_scope) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
          RETURNING id, name, description, priority, token_limit, period_type, period_hours, \
                    period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-                   webhook_url, enabled, active_start, active_end, created_at, updated_at",
+                   webhook_url, enabled, active_start, active_end, model_scope, \
+                   created_at, updated_at",
     )
     .bind(name)
     .bind(description)
@@ -440,6 +659,7 @@ pub async fn create_plan(
     .bind(enabled)
     .bind(active_start)
     .bind(active_end)
+    .bind(scope_json.as_ref())
     .fetch_one(pool)
     .await
 }
@@ -447,6 +667,7 @@ pub async fn create_plan(
 /// 部分更新（字段未提供 = 保留现值）。
 /// - downgrade_model 三态：absent=保留 / Some(None)=清空 / Some(Some(v))=设置
 /// - active_window 三态（成对原子）：absent=保留 / Some(None)=全天 / Some(Some((s,e)))=设置
+/// - model_scope 三态：absent=保留 / Some(None)=清空（全模型生效）/ Some(Some(v))=设置
 #[allow(clippy::too_many_arguments)]
 pub async fn update_plan(
     pool: &PgPool,
@@ -463,6 +684,7 @@ pub async fn update_plan(
     alert_channels: Option<&Value>,
     webhook_url: Option<&str>,
     active_window: Option<Option<(NaiveTime, NaiveTime)>>,
+    model_scope: Option<Option<ModelScope>>,
     enabled: Option<bool>,
 ) -> Result<Option<CodingPlan>, sqlx::Error> {
     // 三态展开：present 标志区分「未提供」（保留现值）与「提供 NULL」（清空）——
@@ -472,6 +694,11 @@ pub async fn update_plan(
         None => (false, None, None),
         Some(None) => (true, None, None),
         Some(Some((s, e))) => (true, Some(s), Some(e)),
+    };
+    let (scope_present, scope_json) = match &model_scope {
+        None => (false, None),
+        Some(None) => (true, None),
+        Some(Some(s)) => (true, Some(serde_json::to_value(s).unwrap_or(Value::Null))),
     };
     sqlx::query_as::<_, CodingPlan>(
         "UPDATE coding_plans SET \
@@ -489,11 +716,13 @@ pub async fn update_plan(
            enabled = COALESCE($14, enabled), \
            active_start = CASE WHEN $15 THEN $16 ELSE active_start END, \
            active_end = CASE WHEN $15 THEN $17 ELSE active_end END, \
+           model_scope = CASE WHEN $18 THEN $19 ELSE model_scope END, \
            updated_at = now() \
          WHERE id = $1 \
          RETURNING id, name, description, priority, token_limit, period_type, period_hours, \
                    period_anchor_mode, overage_action, downgrade_model, alert_channels, \
-                   webhook_url, enabled, active_start, active_end, created_at, updated_at",
+                   webhook_url, enabled, active_start, active_end, model_scope, \
+                   created_at, updated_at",
     )
     .bind(id)
     .bind(name)
@@ -512,6 +741,8 @@ pub async fn update_plan(
     .bind(win_present)
     .bind(win_start)
     .bind(win_end)
+    .bind(scope_present)
+    .bind(scope_json.as_ref())
     .fetch_optional(pool)
     .await
 }
@@ -1122,6 +1353,7 @@ mod tests {
             priority: 0,
             active_start: None,
             active_end: None,
+            model_scope: None,
         }
     }
 
@@ -1129,9 +1361,9 @@ mod tests {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
 
-    /// 全天候选下的解析（DB 测试断言用；12:00 落在任何非跨零点窗内则视窗而定）
+    /// 全天候选、无模型上下文的解析（DB 测试断言用；12:00 落在任何非跨零点窗内则视窗而定）
     fn resolve(map: &HashMap<i64, Vec<PlanRuntime>>, uid: i64) -> Option<PlanRuntime> {
-        resolve_plan(map, uid, NaiveTime::from_hms_opt(12, 0, 0).unwrap())
+        resolve_plan(map, uid, NaiveTime::from_hms_opt(12, 0, 0).unwrap(), None)
     }
 
     #[test]
@@ -1171,14 +1403,14 @@ mod tests {
         night.active_start = Some(t(23));
         night.active_end = Some(t(4));
         let map = [(7i64, vec![night.clone(), lo, hi.clone()])].into();
-        assert_eq!(resolve_plan(&map, 7, t(12)).unwrap().plan_id, 2); // 时段内取高优
-        assert_eq!(resolve_plan(&map, 7, t(20)).unwrap().plan_id, 1); // 时段外回退全天
-        assert_eq!(resolve_plan(&map, 7, t(23)).unwrap().plan_id, 3); // 23:00 hi 窗外 → night(5) 胜 lo(1)
+        assert_eq!(resolve_plan(&map, 7, t(12), None).unwrap().plan_id, 2); // 时段内取高优
+        assert_eq!(resolve_plan(&map, 7, t(20), None).unwrap().plan_id, 1); // 时段外回退全天
+        assert_eq!(resolve_plan(&map, 7, t(23), None).unwrap().plan_id, 3); // 23:00 hi 窗外 → night(5) 胜 lo(1)
         hi.active_start = Some(t(22));
         let map2 = [(7i64, vec![night.clone(), hi])].into();
-        assert_eq!(resolve_plan(&map2, 7, t(23)).unwrap().plan_id, 2); // 同分取 plan_id 大
+        assert_eq!(resolve_plan(&map2, 7, t(23), None).unwrap().plan_id, 2); // 同分取 plan_id 大
         let map3 = [(7i64, vec![night])].into();
-        assert!(resolve_plan(&map3, 7, t(12)).is_none()); // 全部不在时段 → None
+        assert!(resolve_plan(&map3, 7, t(12), None).is_none()); // 全部不在时段 → None
     }
 
     #[test]
@@ -1339,6 +1571,343 @@ mod tests {
         assert!(in_window(cur));
         assert!(!in_window(prev));
     }
+
+    // ---------- 模型作用域（model_scope） ----------
+
+    fn scope(allow: &[&str], deny: &[&str]) -> ModelScope {
+        ModelScope {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn model_pattern_matching_across_vendors() {
+        // 精确匹配：三家厂商命名规范（Anthropic / OpenAI / Google）
+        assert!(model_matches_pattern(
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5"
+        ));
+        assert!(model_matches_pattern("gpt-4o", "gpt-4o"));
+        assert!(model_matches_pattern("gemini-2.5-pro", "gemini-2.5-pro"));
+        // 大小写不敏感（客户端大小写不规范时仍命中）
+        assert!(model_matches_pattern("GPT-4o", "gpt-4O"));
+        // 尾缀 * 前缀匹配覆盖整个模型家族（Anthropic）
+        assert!(model_matches_pattern("claude-*", "claude-sonnet-4-5"));
+        assert!(model_matches_pattern("claude-*", "claude-opus-4-1"));
+        assert!(model_matches_pattern(
+            "claude-*",
+            "claude-3-5-sonnet-20241022"
+        ));
+        assert!(!model_matches_pattern("claude-*", "gpt-4o"));
+        assert!(!model_matches_pattern("claude-*", "claude")); // 不含分隔符的前缀不命中
+        // OpenAI 家族与带日期后缀变体
+        assert!(model_matches_pattern("gpt-4*", "gpt-4o-2024-11-20"));
+        assert!(model_matches_pattern("o*", "o3-mini"));
+        // Google：models/ 前缀方言
+        assert!(model_matches_pattern("models/*", "models/gemini-2.5-pro"));
+        // DeepSeek（大小写混写）与 OpenRouter（provider/model 斜杠命名）
+        assert!(model_matches_pattern("deepseek-chat", "DeepSeek-Chat"));
+        assert!(model_matches_pattern(
+            "anthropic/*",
+            "anthropic/claude-sonnet-4-5"
+        ));
+        // 非尾缀通配不受支持（与路由规则同语义，写入期拒绝）
+        assert!(!model_matches_pattern("*-latest", "gpt-4o-latest"));
+    }
+
+    #[test]
+    fn validates_model_patterns() {
+        assert!(validate_model_pattern("claude-sonnet-4-5").is_ok());
+        assert!(validate_model_pattern("claude-*").is_ok());
+        assert!(validate_model_pattern("models/gemini-2.5-pro").is_ok());
+        assert!(validate_model_pattern("GPT-4O").is_ok()); // 大小写归一化在 parse
+        // 拼写事故在写入期明确报错而非静默忽略
+        assert!(validate_model_pattern("").is_err());
+        assert!(validate_model_pattern("claude sonnet").is_err()); // 空格
+        assert!(validate_model_pattern("claude-4·5").is_err()); // 非法字符
+        assert!(validate_model_pattern("gpt-*-mini").is_err()); // 中间 *
+        assert!(validate_model_pattern("**").is_err());
+        assert!(validate_model_pattern("*").is_err()); // 裸 * 等价不配置
+        assert!(validate_model_pattern("*-latest").is_err()); // 前缀 *
+        let long = "a".repeat(MAX_MODEL_PATTERN_LEN + 1);
+        assert!(validate_model_pattern(&long).is_err());
+    }
+
+    #[test]
+    fn parses_model_scope() {
+        assert!(parse_model_scope(None).unwrap().is_none());
+        assert!(parse_model_scope(Some(&json!(null))).unwrap().is_none());
+        assert!(parse_model_scope(Some(&json!({}))).unwrap().is_none()); // 归一化为 NULL
+        assert!(
+            parse_model_scope(Some(&json!({"allow": [], "deny": []})))
+                .unwrap()
+                .is_none()
+        );
+
+        let s = parse_model_scope(Some(&json!({"allow": ["Claude-*", "gpt-4o"]})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.allow, vec!["claude-*", "gpt-4o"]); // 归一化小写
+        assert!(s.deny.is_empty());
+
+        // deny-only：除黑名单外全放行
+        let s = parse_model_scope(Some(&json!({"deny": ["gpt-*"]})))
+            .unwrap()
+            .unwrap();
+        assert!(s.allow.is_empty() && s.deny == vec!["gpt-*"]);
+
+        // 拼写/结构错误明确报错
+        assert!(parse_model_scope(Some(&json!({"white": ["claude-*"]}))).is_err());
+        assert!(parse_model_scope(Some(&json!({"allow": ["gpt-*-mini"]}))).is_err());
+        assert!(parse_model_scope(Some(&json!({"allow": [""]}))).is_err());
+        assert!(parse_model_scope(Some(&json!({"allow": [42]}))).is_err()); // 非字符串
+        assert!(parse_model_scope(Some(&json!("claude-*"))).is_err()); // 非对象
+        // 同一条目同时出现在黑白名单 → 永不命中，写入期报错
+        assert!(
+            parse_model_scope(Some(&json!(
+                {"allow": ["gpt-4o", "claude-*"], "deny": ["gpt-4o"]}
+            )))
+            .is_err()
+        );
+        // 条数上限（合计 33 条 > 32）
+        let many: Vec<String> = (0..=MAX_MODEL_PATTERNS).map(|i| format!("m{i}")).collect();
+        assert!(parse_model_scope(Some(&json!({ "allow": many }))).is_err());
+    }
+
+    #[test]
+    fn model_scope_blacklist_over_whitelist() {
+        // 冲突时黑名单优先：命中 allow 的模型被 deny 覆盖
+        let s = scope(&["claude-*"], &["claude-2*"]);
+        assert!(s.matches("claude-sonnet-4-5"));
+        assert!(s.matches("claude-3-5-haiku-latest"));
+        assert!(!s.matches("claude-2-opus")); // 黑名单赢
+        // 白名单缺省 = 全放行（仅受黑名单约束）
+        let s = scope(&[], &["gpt-4o"]);
+        assert!(s.matches("claude-sonnet-4-5"));
+        assert!(s.matches("gemini-2.5-pro"));
+        assert!(!s.matches("gpt-4o"));
+        // 精确 deny 不覆盖日期后缀变体——要覆盖变体应写 gpt-4o*（前缀通配）
+        assert!(s.matches("gpt-4o-2024-11-20"));
+        assert!(!scope(&[], &["gpt-4o*"]).matches("gpt-4o-2024-11-20"));
+        // 白名单命中才生效
+        let s = scope(&["gpt-4o", "gemini-2.5-pro"], &[]);
+        assert!(s.matches("gpt-4o"));
+        assert!(s.matches("gemini-2.5-pro"));
+        assert!(!s.matches("claude-sonnet-4-5"));
+        // 具体度：仅精确=2；含通配=1
+        assert_eq!(scope(&["gpt-4o"], &[]).specificity(), 2);
+        assert_eq!(scope(&["gpt-*"], &[]).specificity(), 1);
+        assert_eq!(scope(&["gpt-4o"], &["o*"]).specificity(), 1);
+    }
+
+    #[test]
+    fn resolve_plan_model_scope_specificity() {
+        let t = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        let mut unscoped = rt("monthly"); // plan_id 1, priority 100（高优但不限模型）
+        unscoped.plan_id = 1;
+        unscoped.priority = 100;
+        let mut wildcard = rt("monthly"); // plan_id 2, claude-*
+        wildcard.plan_id = 2;
+        wildcard.priority = 1;
+        wildcard.model_scope = Some(scope(&["claude-*"], &[]));
+        let mut exact = rt("monthly"); // plan_id 3, claude-sonnet-4-5 精确
+        exact.plan_id = 3;
+        exact.priority = 1;
+        exact.model_scope = Some(scope(&["claude-sonnet-4-5"], &[]));
+        let map = [(9i64, vec![unscoped, wildcard.clone(), exact])].into();
+
+        // 作用域更具体者优先（specificity 压过 priority）：精确 > 通配 > 不限
+        assert_eq!(
+            resolve_plan(&map, 9, t, Some("claude-sonnet-4-5"))
+                .unwrap()
+                .plan_id,
+            3
+        );
+        assert_eq!(
+            resolve_plan(&map, 9, t, Some("claude-opus-4-1"))
+                .unwrap()
+                .plan_id,
+            2
+        );
+        assert_eq!(resolve_plan(&map, 9, t, Some("gpt-4o")).unwrap().plan_id, 1);
+        assert_eq!(
+            resolve_plan(&map, 9, t, Some("gemini-2.5-pro"))
+                .unwrap()
+                .plan_id,
+            1
+        );
+        // 无模型上下文（记账后告警/控制台）：忽略作用域，回到 (priority, plan_id)
+        assert_eq!(resolve_plan(&map, 9, t, None).unwrap().plan_id, 1);
+
+        // 黑名单把在期高优 plan 排除 → 回退次优
+        let mut deny_gpt = rt("monthly");
+        deny_gpt.plan_id = 4;
+        deny_gpt.priority = 100;
+        deny_gpt.model_scope = Some(scope(&[], &["gpt-*"]));
+        let mut unscoped_lo = rt("monthly");
+        unscoped_lo.plan_id = 6;
+        unscoped_lo.priority = 0;
+        let map2 = [(9i64, vec![deny_gpt, wildcard.clone(), unscoped_lo])].into();
+        assert_eq!(
+            resolve_plan(&map2, 9, t, Some("gpt-4o")).unwrap().plan_id,
+            6
+        );
+        // deny-only 对 claude 全放行且具体度 1 > 0 → 胜 unscoped_lo
+        assert_eq!(
+            resolve_plan(&map2, 9, t, Some("claude-sonnet-4-5"))
+                .unwrap()
+                .plan_id,
+            4
+        );
+
+        // 全部作用域都不命中当前模型 → None（该模型下不受限额）
+        let mut only_claude = rt("monthly");
+        only_claude.plan_id = 5;
+        only_claude.model_scope = Some(scope(&["claude-*"], &[]));
+        let map3 = [(9i64, vec![only_claude])].into();
+        assert!(resolve_plan(&map3, 9, t, Some("gpt-4o")).is_none());
+        assert!(resolve_plan(&map3, 9, t, Some("claude-sonnet-4-5")).is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn model_scope_crud_runtime_and_resolution(pool: sqlx::PgPool) {
+        let alice = seed_user(&pool, "alice").await;
+        let unscoped = seed_plan(&pool, "all", 5, true).await;
+        let scoped = seed_plan_scoped(
+            &pool,
+            "claude-only",
+            1,
+            &parse_model_scope(Some(&json!({"allow": ["claude-*"], "deny": ["claude-2*"]})))
+                .unwrap()
+                .unwrap(),
+        )
+        .await;
+        let mut tx = pool.begin().await.unwrap();
+        add_plan_users(&mut *tx, unscoped.id, &[alice])
+            .await
+            .unwrap();
+        add_plan_users(&mut *tx, scoped.id, &[alice]).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // CRUD 回读：原始行带 model_scope
+        let raw = find_plan(&pool, scoped.id).await.unwrap().unwrap();
+        assert_eq!(
+            raw.model_scope,
+            Some(json!({"allow": ["claude-*"], "deny": ["claude-2*"]}))
+        );
+        let raw_unscoped = find_plan(&pool, unscoped.id).await.unwrap().unwrap();
+        assert_eq!(raw_unscoped.model_scope, None);
+
+        // 运行时加载：parse 后的 ModelScope 随 PlanRuntime；解析按模型作用域择优
+        let rt = load_plan_runtimes(&pool).await.unwrap();
+        let t = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        // claude-sonnet-4-5：scoped（specificity 2 > 0）压过 unscoped 的 priority 5
+        let hit = resolve_plan(&rt, alice, t, Some("claude-sonnet-4-5")).unwrap();
+        assert_eq!(hit.plan_id, scoped.id);
+        assert_eq!(hit.model_scope.as_ref().unwrap().allow, vec!["claude-*"]);
+        // gpt-4o：scoped 白名单不命中 → unscoped
+        assert_eq!(
+            resolve_plan(&rt, alice, t, Some("gpt-4o")).unwrap().plan_id,
+            unscoped.id
+        );
+        // claude-2-opus：黑名单命中 → scoped 排除 → unscoped
+        assert_eq!(
+            resolve_plan(&rt, alice, t, Some("claude-2-opus"))
+                .unwrap()
+                .plan_id,
+            unscoped.id
+        );
+
+        // PATCH 三态：设置（Some(Some)）/ 清空（Some(None)）/ 保留（None）
+        let updated = update_plan(
+            &pool,
+            scoped.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(
+                parse_model_scope(Some(&json!({"allow": ["gpt-*"]})))
+                    .unwrap()
+                    .unwrap(),
+            )),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.model_scope, Some(json!({"allow": ["gpt-*"]})));
+        let cleared = update_plan(
+            &pool,
+            scoped.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cleared.model_scope, None);
+        let kept = update_plan(
+            &pool,
+            scoped.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(kept.model_scope, None); // absent=保留现值
+
+        // 损坏的存量 scope（绕过 API 手改 DB）→ 加载期跳过该 Plan（fail-closed），其余不受影响
+        sqlx::query(
+            "UPDATE coding_plans SET model_scope = '{\"white\": [\"claude-*\"]}'::jsonb \
+             WHERE id = $1",
+        )
+        .bind(scoped.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rt2 = load_plan_runtimes(&pool).await.unwrap();
+        assert!(
+            rt2.get(&alice)
+                .unwrap()
+                .iter()
+                .all(|p| p.plan_id == unscoped.id)
+        );
+    }
     // ---------- DB 集成测试（#[sqlx::test] 每测独立临时库，自动应用迁移） ----------
 
     use serde_json::json;
@@ -1359,7 +1928,37 @@ mod tests {
             "",
             None,
             None,
+            None,
             enabled,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// 带模型作用域的种子 Plan（enabled 恒 true）
+    async fn seed_plan_scoped(
+        pool: &PgPool,
+        name: &str,
+        priority: i32,
+        scope: &ModelScope,
+    ) -> CodingPlan {
+        create_plan(
+            pool,
+            name,
+            "",
+            priority,
+            1_000_000,
+            PERIOD_MONTHLY,
+            1,
+            ANCHOR_FIXED,
+            OVERAGE_BLOCK,
+            None,
+            &json!(["in_site"]),
+            "",
+            None,
+            None,
+            Some(scope),
+            true,
         )
         .await
         .unwrap()

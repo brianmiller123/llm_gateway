@@ -142,16 +142,13 @@ fn parse_limit_value(v: &Value) -> Result<i64, AppError> {
 fn validate_plan_fields(
     overage_action: Option<&str>,
     channels: Option<&[String]>,
-    overage_action_changed: bool,
-    downgrade_model: Option<&Option<String>>,
+    downgrade_model: Option<Option<&str>>,
     st: &AppState,
 ) -> Result<(), AppError> {
-    let mut downgraded = false;
     if let Some(o) = overage_action {
         if !plan_store::VALID_OVERAGES.contains(&o) {
             return Err(AppError::BadRequest(format!("invalid overage_action: {o}")));
         }
-        downgraded = o == plan_store::OVERAGE_DOWNGRADE;
     }
     if let Some(ch) = channels {
         if ch
@@ -164,8 +161,6 @@ fn validate_plan_fields(
         }
     }
     // downgrade 需要目标模型且可路由（改写后无路由 = 必然 400，存期拦截）
-    let model_required = downgraded || (overage_action_changed && overage_action.is_none());
-    let _ = model_required;
     if let Some(Some(target)) = downgrade_model {
         let routed = {
             let routes = st.routes.read();
@@ -178,6 +173,46 @@ fn validate_plan_fields(
         }
     }
     Ok(())
+}
+
+/// model_scope 精确条目（非通配）必须命中当前任一路由 pattern（大小写不敏感）：
+/// 拼写错误的模型名在这里 400 明确报错，而不是静默配出一个永不生效的作用域。
+/// 通配条目无法证伪（家族可能尚未建路由），仅做格式校验；当前无任何路由规则时跳过
+///（空环境/测试不误伤），warn 留痕。
+fn validate_model_scope_routing(
+    st: &AppState,
+    scope: Option<&plan_store::ModelScope>,
+) -> Result<(), AppError> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    let routes = st.routes.read();
+    if routes.is_empty() {
+        tracing::warn!(
+            "model_scope configured but no model routes exist; exact-name check skipped"
+        );
+        return Ok(());
+    }
+    let check = |patterns: &[String], field: &str| -> Result<(), AppError> {
+        for p in patterns {
+            if p.ends_with('*') {
+                continue;
+            }
+            if !routes
+                .iter()
+                .any(|r| plan_store::model_matches_pattern(&r.model_pattern, p))
+            {
+                let family = p.split('-').next().unwrap_or(p);
+                return Err(AppError::BadRequest(format!(
+                    "unrecognized model '{p}' in model_scope.{field}: no routed model matches it \
+                     (typo?); add a route first or use a wildcard pattern like '{family}-*'"
+                )));
+            }
+        }
+        Ok(())
+    };
+    check(&scope.allow, "allow")?;
+    check(&scope.deny, "deny")
 }
 
 fn plan_row_to_value(p: &plan_store::CodingPlan) -> Value {
@@ -272,6 +307,9 @@ struct PlanCreateReq {
     /// 生效时段（None = 全天）
     #[serde(default)]
     active_window: Option<PlanActiveWindow>,
+    /// 模型作用域（None = 对所有模型生效）
+    #[serde(default)]
+    model_scope: Option<Value>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -308,8 +346,7 @@ async fn create_plan(
     validate_plan_fields(
         Some(&req.overage_action),
         Some(&channels),
-        true,
-        Some(&req.downgrade_model),
+        req.downgrade_model.as_deref().map(Some),
         &st,
     )?;
     if req.overage_action == plan_store::OVERAGE_DOWNGRADE && req.downgrade_model.is_none() {
@@ -322,6 +359,10 @@ async fn create_plan(
         Some((s, e)) => (Some(s), Some(e)),
         None => (None, None),
     };
+    // 模型作用域：写入期解析（格式/未知字段/黑白名单同条目冲突 400）+ 路由拼写校验
+    let model_scope =
+        plan_store::parse_model_scope(req.model_scope.as_ref()).map_err(AppError::BadRequest)?;
+    validate_model_scope_routing(&st, model_scope.as_ref())?;
     let created = plan_store::create_plan(
         &st.pool,
         name,
@@ -337,6 +378,7 @@ async fn create_plan(
         req.webhook_url.trim(),
         active_start,
         active_end,
+        model_scope.as_ref(),
         req.enabled,
     )
     .await
@@ -368,14 +410,31 @@ struct PlanUpdateReq {
     period_hours: Option<i32>,
     period_anchor_mode: Option<String>,
     overage_action: Option<String>,
-    /// Some(None) = 清空；Some(Some(m)) = 设置
+    /// 模型作用域之外的同款三态：absent=保留 / null=清空 / 字符串=设置。
+    /// 须与 model_scope 一样走 double_option，否则 null 被解成缺省、清空不可达
+    #[serde(default, deserialize_with = "double_option")]
     downgrade_model: Option<Option<String>>,
     alert_channels: Option<Vec<String>>,
     #[serde(default)]
     webhook_url: Option<String>,
     /// 生效时段（成对原子更新：absent=保留 / 双 null=全天 / "HH:MM" 对=设置）
     active_window: Option<PlanActiveWindow>,
+    /// 模型作用域三态：absent=保留 / null=清空（恢复全模型生效）/ 对象=设置。
+    /// JSON null 默认会把 Option<Option<T>> 解成 None（与缺省不可区分），须用
+    /// double_option 包一层：null → Some(None)，缺省 → None
+    #[serde(default, deserialize_with = "double_option")]
+    model_scope: Option<Option<Value>>,
     enabled: Option<bool>,
+}
+
+/// 双 Option 三态反序列化（serde_with::double_option 同款，免额外依赖）：
+/// 字段缺省走 `default` → None；显式 null → Some(None)；其余值 → Some(Some(v))
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
 }
 
 async fn update_plan(
@@ -402,22 +461,48 @@ async fn update_plan(
         .unwrap_or(&before.period_anchor_mode);
     plan_store::validate_period_config(eff_type, eff_hours, eff_anchor)
         .map_err(AppError::BadRequest)?;
+    // 降级目标三态归一化：absent=保留 / null(或空串)=清空 / 字符串=设置
+    let downgrade_model: Option<Option<&str>> = req
+        .downgrade_model
+        .as_ref()
+        .map(|o| o.as_deref().map(str::trim).filter(|s| !s.is_empty()));
     validate_plan_fields(
         req.overage_action.as_deref(),
         req.alert_channels.as_deref(),
-        req.overage_action.is_some(),
-        req.downgrade_model.as_ref(),
+        downgrade_model,
         &st,
     )?;
-    if req.overage_action.as_deref() == Some(plan_store::OVERAGE_DOWNGRADE)
-        && req.downgrade_model.is_none()
-        && before.downgrade_model.is_none()
-    {
+    // 超额策略按「请求字段 ∪ 现值」合并后校验：downgrade 必须携带有效目标
+    //（请求设置或存量），且不允许把 downgrade 计划的目标清空——null/空串仅用于
+    // 非 downgrade 策略的残留目标清理
+    let eff_action = req
+        .overage_action
+        .as_deref()
+        .unwrap_or(before.overage_action.as_str());
+    let eff_target = downgrade_model
+        .as_ref()
+        .map_or(before.downgrade_model.as_deref(), |o| o.as_deref());
+    if eff_action == plan_store::OVERAGE_DOWNGRADE && eff_target.is_none() {
         return Err(AppError::BadRequest(
             "downgrade_action requires downgrade_model".into(),
         ));
     }
     let active_window = parse_active_window(req.active_window)?;
+    // model_scope 三态解析（写入期格式/拼写校验，错误 400 不静默）
+    // 三态：absent=保留 / null=清空 / 对象=设置；`{}` 与双空数组归一化为清空
+    //（parse_model_scope 返回 Option：None = 无限制，与清空同义）
+    let model_scope = match &req.model_scope {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(v)) => {
+            Some(plan_store::parse_model_scope(Some(v)).map_err(AppError::BadRequest)?)
+        }
+    };
+    let set_scope: Option<&plan_store::ModelScope> = match &model_scope {
+        Some(Some(s)) => Some(s),
+        _ => None,
+    };
+    validate_model_scope_routing(&st, set_scope)?;
     let updated = plan_store::update_plan(
         &st.pool,
         id,
@@ -429,12 +514,11 @@ async fn update_plan(
         req.period_hours,
         req.period_anchor_mode.as_deref(),
         req.overage_action.as_deref(),
-        req.downgrade_model
-            .as_ref()
-            .map(|o| o.as_deref().map(str::trim)),
+        downgrade_model,
         channels_json.as_ref(),
         req.webhook_url.as_deref().map(str::trim),
         active_window,
+        model_scope,
         req.enabled,
     )
     .await
@@ -1374,13 +1458,28 @@ struct DailyRow {
     tokens: i64,
 }
 
+/// my_plan 查询参数：`?model=` 按指定客户端模型做作用域感知解析
+///（缺省 = 忽略作用域，与存量行为兼容；响应含 model_scope 供客户端自行判断）
+#[derive(Deserialize)]
+struct MyPlanParams {
+    model: Option<String>,
+}
+
 async fn my_plan(
     State(st): State<AppState>,
     user: super::console::ConsoleUser,
+    Query(p): Query<MyPlanParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = user.user.id;
-    // 生效时段按服务器本地墙钟；配额周期口径仍 UTC
-    let rt = plan_store::resolve_plan(&st.plans.read(), uid, chrono::Local::now().time());
+    // 生效时段按服务器本地墙钟；配额周期口径仍 UTC。
+    // 带 model 参数 = 模型作用域感知（与请求期 check_plan 同一解析语义）
+    let queried_model = p.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let rt = plan_store::resolve_plan(
+        &st.plans.read(),
+        uid,
+        chrono::Local::now().time(),
+        queried_model,
+    );
     let now = chrono::Utc::now();
     let period = match &rt {
         Some(p) => {
@@ -1414,6 +1513,8 @@ async fn my_plan(
             "downgrade_model": p.downgrade_model,
             "active_start": p.active_start.map(|t| t.format("%H:%M").to_string()),
             "active_end": p.active_end.map(|t| t.format("%H:%M").to_string()),
+            "model_scope": p.model_scope.as_ref()
+                .map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
         })
     });
     // 本人近 30 日逐日消耗（明细）
@@ -1470,4 +1571,31 @@ async fn my_notifications(
         })
         .collect();
     Ok(Json(json!({ "notifications": notifications })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PATCH 三态反序列化契约：absent=保留 / null=清空 / 值=设置。
+    /// Option<Option<T>> 不经 double_option 时 JSON null 与缺省都解成 None，
+    /// 「清空」分支不可达（回归覆盖 downgrade_model 与 model_scope 两处）
+    #[test]
+    fn plan_update_req_three_state_deserialization() {
+        let absent: PlanUpdateReq = serde_json::from_str("{}").unwrap();
+        assert!(absent.downgrade_model.is_none());
+        assert!(absent.model_scope.is_none());
+
+        let cleared: PlanUpdateReq =
+            serde_json::from_str(r#"{"downgrade_model":null,"model_scope":null}"#).unwrap();
+        assert!(matches!(cleared.downgrade_model, Some(None)));
+        assert!(matches!(cleared.model_scope, Some(None)));
+
+        let set: PlanUpdateReq = serde_json::from_str(
+            r#"{"downgrade_model":"gpt-4o-mini","model_scope":{"allow":["claude-*"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(set.downgrade_model, Some(Some("gpt-4o-mini".into())));
+        assert!(matches!(set.model_scope, Some(Some(_))));
+    }
 }

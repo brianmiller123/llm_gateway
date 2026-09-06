@@ -681,11 +681,16 @@ async fn proxy_authed(
 
     // 4b. Coding Plan 配额：超出按策略拦截(429)/降级改写模型/仅告警放行。
     // 降级改写 json["model"] 并标记 plan_downgraded——零改写快路径直传原始
-    // 客户端字节，必须强制走重建路径才能让改写生效
+    // 客户端字节，必须强制走重建路径才能让改写生效。
+    // decision.plan 即检查期按当前模型解析出的生效 Plan（模型作用域感知），
+    // 直接作为记账载荷——避免下方二次解析在作用域过滤下漏记/错记。
     let mut plan_downgraded = false;
+    let mut active_plan: Option<crate::store::plans::PlanRuntime> = None;
     if let Some(uid) = user_id {
         usage::check_quota(st, uid)?;
-        if let Some(downgraded) = crate::service::plans::check_plan(st, uid, &model)? {
+        let decision = crate::service::plans::check_plan(st, uid, &model)?;
+        active_plan = decision.plan;
+        if let Some(downgraded) = decision.downgrade_to {
             tracing::info!(user_id = uid, from = %model, to = %downgraded, "plan overage: downgraded model");
             json["model"] = serde_json::Value::String(downgraded.clone());
             model = downgraded;
@@ -886,16 +891,15 @@ async fn proxy_authed(
         Ok((bytes, upstream_path))
     };
 
-    // Coding Plan 计量载荷：生效 Plan → (plan_id, period_start, period_key)
-    let plan_bill = user_id.and_then(|uid| {
-        let rt =
-            crate::store::plans::resolve_plan(&st.plans.read(), uid, chrono::Local::now().time())?;
+    // Coding Plan 计量载荷：检查期已按当前模型解析（模型作用域感知），
+    // 此处仅换算周期窗口；None = 该用户此刻无生效 Plan（不限额不计量）
+    let plan_bill = active_plan.map(|rt| {
         let now = chrono::Utc::now();
-        Some(crate::store::usage::PlanBill {
+        crate::store::usage::PlanBill {
             plan_id: rt.plan_id,
             period_start: rt.period_start(now),
             period_key: rt.period_key(now),
-        })
+        }
     });
 
     let mut meta = UsageMeta {

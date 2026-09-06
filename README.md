@@ -15,7 +15,7 @@
 - API Key 鉴权：Key 仅存 SHA-256 哈希 + 12 位前缀定位，明文只在创建时展示一次；可配置为不鉴权（仅本地开发）
 - 三层速率限制（API Key → 用户 → 全局，令牌桶，BOOTTIME 回填时钟），命中返回 429 + `Retry-After` + OpenAI 标准错误体；长时间空闲后恢复的首请求空闲豁免，避免 agent 暂停等待用户确认后恢复即 429（见「限流与长时间空闲恢复」）
 - 月度配额：按用户限制 Token/成本上限，记账事务内原子扣减，超限 429
-- Coding Plan 周期配额：分组绑定套餐（多分组取优先级最高生效），token 上限 + 统计周期（每日 / 每月 / 总量 / 小时级——每 N 小时（1..168）滚动重置，锚点可选 UTC 整点网格或按开通时间偏移），超额策略（拦截 429 / 降级指定模型 / 仅告警）；80/95/100% 阈值告警（站内 / 邮件 / webhook）。重置由周期键在读取路径推导，无清零定时任务（见「Coding Plan 周期用量限制与小时级重置」）
+- Coding Plan 周期配额：分组绑定套餐（多分组取优先级最高生效），token 上限 + 统计周期（每日 / 每月 / 总量 / 小时级——每 N 小时（1..168）滚动重置，锚点可选 UTC 整点网格或按开通时间偏移），超额策略（拦截 429 / 降级指定模型 / 仅告警）；可选模型作用域（精确 + 前缀通配、白/黑名单黑名单优先，未配置 = 全模型生效，切换模型即时重评估，见「Coding Plan 周期用量限制与小时级重置」）；80/95/100% 阈值告警（站内 / 邮件 / webhook）。重置由周期键在读取路径推导，无清零定时任务
 - 模型路由：通配 pattern + priority 匹配，支持 `fallback_ids` 降级链（非流式对 429/5xx/超时自动重试；流式不重试避免重复生成）
 - Token 计量：优先解析上游 `usage`（流式自动注入 `include_usage`），usage 双形态（`prompt_tokens` / `input_tokens`）归一化
 - 高级请求配置（extra_body 透传）：渠道级（供应商）与模型级（路由规则）各一份 JSON 对象，请求转发前深合并进上游请求体（模型级覆盖渠道级同名叶键，配置覆盖客户端同名叶键、客户端独有字段保留）——解决 vLLM/SGLang 上 Qwen3 思考参数（`chat_template_kwargs.thinking` / `reasoning_effort`）无法透传的问题，兼容 `top_k`、`repetition_penalty` 等后端特有参数；全局开关可临时停用而不丢配置；`model`/`stream`/`stream_options` 由网关管理、配置被拒绝
@@ -221,7 +221,19 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 - 重启 / 宕机错过翻桶无需补偿：`period_start` 为纯时间函数，重启后首请求直接命中当前桶；时钟回拨或未来锚点钳位，不产生负槽位
 - 阈值告警 80/95/100%：站内通知 + 邮件（SMTP）+ webhook，进程内 seen 与 `plan_alerts UNIQUE(plan_id, user_id, period_key, level)` 双层去重
 
-管理端点：`/api/admin/plans`（CRUD + 用量回溯 + 成员管理：`{id}/users`、`{id}/groups` 列表 / `*-candidates` 选择器 / `*/add`、`*/remove` 批量增删，重复加入 409、参数错误 400）、`/api/admin/plan-alerts`、`/api/me/plan`（我的套餐）；设计细节见 `docs/plans/hourly-reset-design.md`。
+### 模型作用域（model_scope）
+
+Plan 可选限定生效模型：`{"allow": ["claude-*", "gpt-4o"], "deny": ["*-preview"]}`（NULL = 全模型，存量行为不变）。
+
+- **pattern**：精确（`gpt-4o`）或尾缀 `*` 前缀通配（`claude-*` 覆盖全家族含日期后缀变体），与路由规则同语义；大小写不敏感；合法字符 `字母数字 . _ + : - /` 与尾缀 `*`。中间 `*` / 裸 `*` / 未知字段在写入期 400 报错
+- **黑白名单**：deny 命中即排除、优先于 allow；allow 缺省 = 除 deny 外全放行；黑白名单同条目写入期报错
+- **择优**：作用域更具体者优先（仅精确 = 2 > 含通配 = 1 > 未配置 = 0，压过 priority），同具体度按存量 `(priority, plan_id)`；多候选命中时 warn 留痕（选中者 + 落选者及各自具体度），排查指南见设计文档
+- **拼写防线**：写入期精确条目须命中任一路由 `model_pattern`，否则 400 `unrecognized model ...`（只拦「未建路由的家族」；前缀路由无法识别家族内拼写差异）；绕过 API 手改 DB 的损坏 scope 在加载期剔除该 Plan 并 error 留痕（fail-closed），修复后随 reload 恢复
+- **动态生效**：作用域按每请求 `model` 字段求值——会话中切换模型的下一个请求即按新模型重评估；改配置走存量 reload 即时生效。检查与记账同源（检查期解析的 Plan 直接作为计量载荷），降级用量记入触发降级的 Plan
+
+示例：`{"allow": ["claude-*"], "deny": ["claude-2*"]}`（Claude 家族专用、排除 2.x）；`{"deny": ["gpt-4o", "claude-opus-*"]}`（除旗舰外全放行）。
+
+管理端点：`/api/admin/plans`（CRUD + 用量回溯 + 成员管理：`{id}/users`、`{id}/groups` 列表 / `*-candidates` 选择器 / `*/add`、`*/remove` 批量增删，重复加入 409、参数错误 400；`model_scope` 三态：absent=保留 / null=清空 / 对象=设置）、`/api/admin/plan-alerts`、`/api/me/plan`（我的套餐，可选 `?model=` 按模型做作用域感知解析）；设计细节见 `docs/plans/hourly-reset-design.md` 与 `docs/plans/model-scope-design.md`。
 
 ## 数据模型
 
@@ -233,7 +245,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 | `providers` / `model_routes` | 上游供应商（Key 加密存储、`api_type` 区分 Responses 原生/转换）；模型路由 + 降级链 |
 | `usage_logs` | 用量明细（`request_id` 唯一防重复记账，按用户/时间索引） |
 | `user_monthly_usage` / `usage_daily` | 配额计数（记账事务内 UPSERT）；仪表盘聚合（60s 后台任务） |
-| `coding_plans` / `user_groups` / `user_group_members` | 周期配额套餐（token 上限 / 统计周期 / 超额策略）与用户分组（LDAP 联动同步） |
+| `coding_plans` / `user_groups` / `user_group_members` | 周期配额套餐（token 上限 / 统计周期 / 超额策略 / `model_scope` 模型作用域 JSONB）与用户分组（LDAP 联动同步） |
 | `plan_users` / `plan_groups` | Plan ↔ 用户 / 分组多对多关联（主键即唯一约束防重复添加；随 Plan 删除级联清理） |
 | `plan_usage_counters` / `plan_alerts` | Plan 当期计数（记账事务内 UPSERT，`period_start` TIMESTAMPTZ）与阈值告警（`period_key` 去重） |
 | `refresh_tokens` / `audit_logs` / `aggregation_state` | 会话、审计、聚合水位 |
@@ -269,3 +281,4 @@ python3 scripts/mock_upstream.py   # http://127.0.0.1:9001/v1，支持 chat（�
 - `docs/plans/2026-08-08-llm-gateway-design.md` — 定稿设计（数据模型、安全设计、权衡清单）
 - `docs/plans/2026-08-10-responses-api-port.md` — Responses API 兼容层移植设计（转换规则、SSE 状态机、回归步骤）
 - `docs/plans/hourly-reset-design.md` — Coding Plan 小时级重置设计（滚动桶模型、边界场景、灰度发布与回滚）
+- `docs/plans/model-scope-design.md` — Coding Plan 模型作用域设计（pattern 语法、黑白名单、择优规则、冲突排查指南）

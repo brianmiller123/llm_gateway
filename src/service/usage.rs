@@ -197,7 +197,7 @@ pub async fn record(
                 if let Some(bill) = meta.plan.as_ref() {
                     st.usage
                         .incr_plan(user_id, bill.plan_id, &bill.period_key, tokens);
-                    crate::service::plans::after_usage_record(st, user_id);
+                    crate::service::plans::after_usage_record(st, user_id, bill.plan_id);
                 }
             }
             tracing::info!(
