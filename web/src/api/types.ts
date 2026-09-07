@@ -762,6 +762,16 @@ export interface MyPlanResp {
     percent: number
   } | null
   daily: DailyUsage[]
+  /** 已加入但当前不生效的 Plan（plan=null 时用于区分「未加入」与「停用/时段窗外/作用域外」） */
+  inactive_plans: InactivePlan[]
+}
+
+export interface InactivePlan {
+  plan_id: number
+  name: string
+  reason: 'disabled' | 'outside_active_window' | 'model_scope'
+  active_start: string | null
+  active_end: string | null
 }
 
 export interface MyNotificationsResp {

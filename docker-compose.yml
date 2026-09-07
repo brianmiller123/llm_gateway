@@ -12,6 +12,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    # 宿主机重启后自愈：gateway 依赖本服务，本服务停机时网关会因解析不到
+    # postgres 主机名而崩溃循环（DNS 记录随容器停止消失），整站不可用
+    restart: unless-stopped
     # 仅本地开发需要直连数据库；生产环境删除此映射
     ports:
       - "127.0.0.1:5432:5432"

@@ -1474,12 +1474,22 @@ async fn my_plan(
     // 生效时段按服务器本地墙钟；配额周期口径仍 UTC。
     // 带 model 参数 = 模型作用域感知（与请求期 check_plan 同一解析语义）
     let queried_model = p.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
-    let rt = plan_store::resolve_plan(
-        &st.plans.read(),
-        uid,
-        chrono::Local::now().time(),
-        queried_model,
-    );
+    let local_now = chrono::Local::now().time();
+    let rt = plan_store::resolve_plan(&st.plans.read(), uid, local_now, queried_model);
+    // 缓存未命中 → 直接回源 DB 解析。内存 plans 只随 reload 刷新且 reload 是
+    // 全有或全无——滚动部署/单节故障期间，管理员刚添加的成员可能尚未进入缓存；
+    // 用户可见归属以 DB 为准，不能把缓存滞后误报成「未加入任何 Plan」。
+    let rt = match rt {
+        Some(p) => Some(p),
+        None => plan_store::resolve_plan(
+            &plan_store::load_plan_runtimes_for_user(&st.pool, uid)
+                .await
+                .map_err(AppError::internal)?,
+            uid,
+            local_now,
+            queried_model,
+        ),
+    };
     let now = chrono::Utc::now();
     let period = match &rt {
         Some(p) => {
@@ -1528,10 +1538,50 @@ async fn my_plan(
     .fetch_all(&st.pool)
     .await
     .map_err(AppError::internal)?;
+    // 未命中生效 Plan 时区分「真正未加入」与「已加入但当前不生效」（停用/时段窗外/
+    // 模型不在作用域）：前端据此给出不同的诚实提示，而不是一律「未加入任何 Plan」
+    let inactive_plans = if rt.is_none() {
+        let memberships = plan_store::list_user_plan_memberships(&st.pool, uid)
+            .await
+            .map_err(AppError::internal)?;
+        memberships
+            .iter()
+            .filter_map(|m| {
+                let reason = if !m.enabled {
+                    "disabled"
+                } else if !plan_store::is_within_active_window(m.active_start, m.active_end, local_now)
+                {
+                    "outside_active_window"
+                } else {
+                    // 启用且时段内仍不命中：仅带 ?model= 时可能因作用域不命中；
+                    // 无模型上下文的解析忽略作用域，此时回源已兜底，不再归因
+                    match (queried_model, &m.model_scope) {
+                        (Some(model), Some(scope_v)) => {
+                            match plan_store::parse_model_scope(Some(scope_v)) {
+                                Ok(Some(s)) if !s.matches(model) => "model_scope",
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                };
+                Some(json!({
+                    "plan_id": m.plan_id,
+                    "name": m.plan_name,
+                    "reason": reason,
+                    "active_start": m.active_start.map(|t| t.format("%H:%M").to_string()),
+                    "active_end": m.active_end.map(|t| t.format("%H:%M").to_string()),
+                }))
+            })
+            .collect::<Vec<Value>>()
+    } else {
+        vec![]
+    };
     Ok(Json(json!({
         "plan": plan_json,
         "period": period,
         "daily": daily,
+        "inactive_plans": inactive_plans,
     })))
 }
 

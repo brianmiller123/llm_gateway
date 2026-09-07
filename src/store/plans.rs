@@ -407,11 +407,7 @@ impl PlanRuntime {
     /// 生效时段判定：双 None = 全天；[start, end) 半开区间；start > end 视为
     /// 跨零点隔夜窗。`local_now` 传服务器本地墙钟（纯函数可单测）。
     pub fn active_at(&self, local_now: NaiveTime) -> bool {
-        match (self.active_start, self.active_end) {
-            (Some(s), Some(e)) if s < e => local_now >= s && local_now < e,
-            (Some(s), Some(e)) if s > e => local_now >= s || local_now < e, // 跨零点
-            _ => true,
-        }
+        is_within_active_window(self.active_start, self.active_end, local_now)
     }
 }
 
@@ -488,19 +484,10 @@ pub fn resolve_plan(
     Some(best.clone())
 }
 
-/// 全量用户 → 候选 Plan 列表（enabled 限定）。双通道入口：分组加入（plan_groups）∪
-/// 直连加入（plan_users），每用户保留全部候选行——生效时段随时刻变化、模型作用域随
-/// 请求模型变化，请求期用 [`resolve_plan`] 按「生效时段 + 作用域 + 具体度/priority」解析。
-/// model_scope 解析失败的行跳过并 error 留痕（fail-closed，不猜测损坏配置的意图）。
-pub async fn load_plan_runtimes(
-    pool: &PgPool,
-) -> Result<HashMap<i64, Vec<PlanRuntime>>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, RuntimeRow>(
-        "SELECT user_id, plan_id, plan_name, group_name, token_limit, period_type, \
-                period_hours, period_anchor_mode, member_since, overage_action, \
-                downgrade_model, alert_channels, webhook_url, priority, \
-                active_start, active_end, model_scope \
-         FROM ( \
+/// 双通道候选行源（分组加入 plan_groups ∪ 直连加入 plan_users）。
+/// 全量加载与单用户回源查询共用同一份 SQL，避免两份语句漂移
+/// （实例间 schema/语句 skew 曾导致旧实例 reload 永久失败、缓存冻结）。
+const RUNTIME_SOURCE_SQL: &str = "\
            SELECT m.user_id, p.id AS plan_id, p.name AS plan_name, g.name AS group_name, \
                   p.token_limit, p.period_type, p.period_hours, p.period_anchor_mode, \
                   m.added_at AS member_since, p.overage_action, p.downgrade_model, \
@@ -517,11 +504,50 @@ pub async fn load_plan_runtimes(
                   p.alert_channels, p.webhook_url, p.priority, \
                   p.active_start, p.active_end, p.model_scope \
            FROM plan_users pu \
-           JOIN coding_plans p ON p.id = pu.plan_id AND p.enabled = TRUE \
-         ) r",
-    )
+           JOIN coding_plans p ON p.id = pu.plan_id AND p.enabled = TRUE";
+
+/// 全量用户 → 候选 Plan 列表（enabled 限定）。双通道入口：分组加入（plan_groups）∪
+/// 直连加入（plan_users），每用户保留全部候选行——生效时段随时刻变化、模型作用域随
+/// 请求模型变化，请求期用 [`resolve_plan`] 按「生效时段 + 作用域 + 具体度/priority」解析。
+/// model_scope 解析失败的行跳过并 error 留痕（fail-closed，不猜测损坏配置的意图）。
+pub async fn load_plan_runtimes(
+    pool: &PgPool,
+) -> Result<HashMap<i64, Vec<PlanRuntime>>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, RuntimeRow>(&format!(
+        "SELECT user_id, plan_id, plan_name, group_name, token_limit, period_type, \
+                period_hours, period_anchor_mode, member_since, overage_action, \
+                downgrade_model, alert_channels, webhook_url, priority, \
+                active_start, active_end, model_scope \
+         FROM ({RUNTIME_SOURCE_SQL}) r"
+    ))
     .fetch_all(pool)
     .await?;
+    Ok(rows_into_runtimes(rows))
+}
+
+/// 单用户回源：绕过内存缓存直接按 DB 解析该用户的候选 Plan。
+/// 用于 `/api/me/plan` 缓存未命中时的兜底——reload 是全有或全无（任一节失败即整体
+/// 不写入），多实例滚动部署/单节故障期间成员变更可能长时间不可见；用户可见的归属
+/// 必须以 DB 为准，不能让缓存故障伪装成「未加入任何 Plan」。
+pub async fn load_plan_runtimes_for_user(
+    pool: &PgPool,
+    user_id: i64,
+) -> Result<HashMap<i64, Vec<PlanRuntime>>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, RuntimeRow>(&format!(
+        "SELECT user_id, plan_id, plan_name, group_name, token_limit, period_type, \
+                period_hours, period_anchor_mode, member_since, overage_action, \
+                downgrade_model, alert_channels, webhook_url, priority, \
+                active_start, active_end, model_scope \
+         FROM ({RUNTIME_SOURCE_SQL}) r WHERE r.user_id = $1"
+    ))
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows_into_runtimes(rows))
+}
+
+/// 运行时行 → 内存映射（model_scope 解析失败跳过并 error 留痕，fail-closed 同上）
+fn rows_into_runtimes(rows: Vec<RuntimeRow>) -> HashMap<i64, Vec<PlanRuntime>> {
     let mut map: HashMap<i64, Vec<PlanRuntime>> = HashMap::new();
     for r in rows {
         // 模型作用域解析失败 = 存量配置损坏（手改 DB / 旧版本写入）：
@@ -560,7 +586,54 @@ pub async fn load_plan_runtimes(
             model_scope,
         });
     }
-    Ok(map)
+    map
+}
+
+/// 生效时段窗口判定（[`PlanRuntime::active_at`] 与用户归属归因共用）：
+/// 双 None = 全天；[start, end) 半开区间；start > end 视为跨零点隔夜窗
+pub fn is_within_active_window(
+    start: Option<NaiveTime>,
+    end: Option<NaiveTime>,
+    local_now: NaiveTime,
+) -> bool {
+    match (start, end) {
+        (Some(s), Some(e)) if s < e => local_now >= s && local_now < e,
+        (Some(s), Some(e)) if s > e => local_now >= s || local_now < e, // 跨零点
+        _ => true,
+    }
+}
+
+/// 用户在双通道下的原始 Plan 归属（不去重启用态、不去重生效时段）。
+/// 与 [`load_plan_runtimes`] 的区别：不过滤 enabled——用于「已加入但当前不生效」
+/// 的诚实呈现（停用/时段窗外时用户不该被误报成「未加入任何 Plan」）。
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct UserPlanMembership {
+    pub plan_id: i64,
+    pub plan_name: String,
+    pub enabled: bool,
+    pub active_start: Option<NaiveTime>,
+    pub active_end: Option<NaiveTime>,
+    pub model_scope: Option<Value>,
+}
+
+pub async fn list_user_plan_memberships(
+    pool: &PgPool,
+    user_id: i64,
+) -> Result<Vec<UserPlanMembership>, sqlx::Error> {
+    sqlx::query_as::<_, UserPlanMembership>(
+        "SELECT p.id AS plan_id, p.name AS plan_name, p.enabled, \
+                p.active_start, p.active_end, p.model_scope \
+         FROM coding_plans p \
+         WHERE p.id IN ( \
+           SELECT pu.plan_id FROM plan_users pu WHERE pu.user_id = $1 \
+           UNION \
+           SELECT pg.plan_id FROM plan_groups pg \
+             JOIN user_group_members m ON m.group_id = pg.group_id WHERE m.user_id = $1) \
+         ORDER BY p.id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
 }
 
 // ---------- CRUD ----------
@@ -2093,6 +2166,15 @@ mod tests {
         assert_eq!(resolve(&rt, bob).unwrap().group_name, ""); // 直连无分组名
         assert_eq!(resolve(&rt, carol).unwrap().plan_id, high.id); // priority 10 > 1
 
+        // 单用户回源与全量加载一致（/api/me/plan 缓存未命中兜底路径）
+        for uid in [alice, bob, carol] {
+            let scoped = load_plan_runtimes_for_user(&pool, uid).await.unwrap();
+            assert_eq!(resolve(&scoped, uid).map(|p| p.plan_id), resolve(&rt, uid).map(|p| p.plan_id));
+        }
+        // 无归属用户回源为空（不误报归属）
+        let dave = seed_user(&pool, "dave").await;
+        assert!(load_plan_runtimes_for_user(&pool, dave).await.unwrap().is_empty());
+
         // 停用 Plan 退出运行时：carol 回退分组通道，bob 无入口 → 不限额
         sqlx::query("UPDATE coding_plans SET enabled = FALSE WHERE id = $1")
             .bind(high.id)
@@ -2108,6 +2190,70 @@ mod tests {
         let low_row = summaries.iter().find(|p| p.id == low.id).unwrap();
         assert_eq!(low_row.group_count, 1);
         assert_eq!(low_row.member_count, 2); // alice + carol
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_membership_listing_reports_inactive_states(pool: sqlx::PgPool) {
+        // 回归「管理员添加成员后用户仍显示未加入」：归属列表不滤 enabled/window，
+        // 停用与时段窗外的成员关系必须可见（诚实呈现），回源运行时则不含它们
+        let t = |h: u32| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        let active = seed_plan(&pool, "active", 0, true).await;
+        let disabled = seed_plan(&pool, "disabled", 1, true).await;
+        sqlx::query("UPDATE coding_plans SET enabled = FALSE WHERE id = $1")
+            .bind(disabled.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let night = seed_plan(&pool, "night", 2, true).await;
+        sqlx::query("UPDATE coding_plans SET active_start = $2, active_end = $3 WHERE id = $1")
+            .bind(night.id)
+            .bind(t(22))
+            .bind(t(6))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let u = seed_user(&pool, "alice").await;
+        let g = seed_group_with_member(&pool, "dev", u).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        add_plan_users(&mut *tx, active.id, &[u]).await.unwrap();
+        add_plan_users(&mut *tx, disabled.id, &[u]).await.unwrap();
+        add_plan_groups(&mut *tx, night.id, &[g]).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // 归属列表：直连 + 分组双通道全部可见（含停用/窗外），按 plan 去重
+        let memberships = list_user_plan_memberships(&pool, u).await.unwrap();
+        let names: Vec<&str> = memberships.iter().map(|m| m.plan_name.as_str()).collect();
+        assert_eq!(names, vec!["active", "disabled", "night"]);
+        let by_name = |n: &str| memberships.iter().find(|m| m.plan_name == n).unwrap();
+        assert!(by_name("active").enabled);
+        assert!(!by_name("disabled").enabled);
+        assert!(by_name("night").enabled);
+
+        // 白天 12:00：仅 active 生效；night 时段窗外、disabled 停用
+        let rt = load_plan_runtimes_for_user(&pool, u).await.unwrap();
+        let hit = resolve_plan(&rt, u, t(12), None).unwrap();
+        assert_eq!(hit.plan_id, active.id);
+        assert!(!is_within_active_window(
+            by_name("night").active_start,
+            by_name("night").active_end,
+            t(12)
+        ));
+        assert!(is_within_active_window(
+            by_name("night").active_start,
+            by_name("night").active_end,
+            t(23)
+        ));
+        // 跨零点窗内 23:00 → night 生效（active 无窗口同样生效，priority 2 > 0 择优）
+        assert_eq!(
+            resolve_plan(&rt, u, t(23), None).unwrap().plan_id,
+            night.id
+        );
+
+        // 移除直连成员后归属消失（分组通道行不受影响）
+        remove_plan_users(&pool, active.id, &[u]).await.unwrap();
+        let memberships = list_user_plan_memberships(&pool, u).await.unwrap();
+        assert!(memberships.iter().all(|m| m.plan_id != active.id));
     }
 
     #[sqlx::test(migrations = "./migrations")]

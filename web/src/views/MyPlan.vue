@@ -10,6 +10,7 @@ const loading = ref(false)
 const plan = ref<MyPlanResp['plan']>(null)
 const period = ref<MyPlanResp['period']>(null)
 const daily = ref<MyPlanResp['daily']>([])
+const inactivePlans = ref<MyPlanResp['inactive_plans']>([])
 const notifications = ref<MyNotificationsResp['notifications']>([])
 
 const PERIOD_LABELS: Record<string, string> = {
@@ -68,6 +69,7 @@ async function load() {
     plan.value = resp.plan
     period.value = resp.period
     daily.value = resp.daily
+    inactivePlans.value = resp.inactive_plans ?? []
     const notif = await request<MyNotificationsResp>('/api/me/notifications')
     notifications.value = notif.notifications
     await nextTick()
@@ -76,6 +78,20 @@ async function load() {
     ElMessage.error(e instanceof Error ? e.message : '加载套餐信息失败')
   } finally {
     loading.value = false
+  }
+}
+
+/** 「已加入但当前不生效」的原因文案（与后端 reason 对应） */
+function inactiveReason(p: MyPlanResp['inactive_plans'][number]): string {
+  switch (p.reason) {
+    case 'disabled':
+      return '该 Plan 已停用'
+    case 'outside_active_window':
+      return `不在生效时段（${p.active_start ?? '--'} - ${p.active_end ?? '--'}）`
+    case 'model_scope':
+      return '该模型不在 Plan 的模型作用域内'
+    default:
+      return '当前不生效'
   }
 }
 
@@ -118,11 +134,22 @@ onBeforeUnmount(() => {
     </el-card>
 
     <el-alert
-      v-if="!loading && !plan"
+      v-if="!loading && !plan && inactivePlans.length"
+      type="warning"
+      :closable="false"
+      title="已加入 Coding Plan，但当前不生效"
+    >
+      <div v-for="p in inactivePlans" :key="p.plan_id">
+        「{{ p.name }}」：{{ inactiveReason(p) }}
+      </div>
+    </el-alert>
+
+    <el-alert
+      v-if="!loading && !plan && !inactivePlans.length"
       type="info"
       :closable="false"
       title="尚未加入任何 Coding Plan"
-      description="您所在的用户分组未绑定 Coding Plan，当前不受配额限制。请联系管理员。"
+      description="您还未被加入任何 Coding Plan（成员可由管理员按「直连用户」或「用户分组」两种方式添加），当前不受配额限制。请联系管理员。"
     />
 
     <el-card v-if="daily.length" shadow="never">

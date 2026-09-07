@@ -8,6 +8,10 @@
   4. 参数错误：空 user_ids/group_ids、不存在的 id、不存在的 plan → 400
   5. 无权限：未登录 → 401 unauthorized；普通用户 → 403 forbidden
   6. 运行时生效：直连/分组双通道用户 /api/me/plan 即时生效与移除后回退
+  6b. 重登回归：添加成员后用户重新登录 → /api/me/plan 必须准确显示归属
+      （回归「未加入任何 Coding Plan」误报；缓存未命中时回源 DB）
+  6c. 诚实呈现：已加入但停用/时段窗外 → inactive_plans 带原因，
+      不与「真正未加入」（inactive_plans 为空）混同
   7. 移除成员：计数正确；Plan 删除返回解绑分组数与直连用户数
 
 前置环境（参照 scripts/test_conformance.py 的启动方式）：
@@ -221,6 +225,78 @@ def main() -> int:
     st, body = api("GET", "/api/me/plan", who="alice")
     check("分组+直连用户 alice 命中 Plan", st == 200 and body.get("plan", {})
           and body["plan"].get("name") == plan_name, f"{st} {body}")
+
+    # ---------- 6b. 重登回归（添加成员后用户重新登录） ----------
+    print("== 重登回归 ==")
+    st, body = raw("POST", "/api/auth/login",
+                   {"username": users["carol"]["username"], "password": "pass12345"},
+                   with_auth=False)
+    check("carol 重登成功", st == 200, f"{st} {body}")
+    USER_TOKENS["carol"] = body.get("access_token", "")
+    st, body = api("GET", "/api/me/plan", who="carol")
+    check("未加入用户 plan=null 且 inactive_plans 为空（不误报）",
+          st == 200 and body.get("plan") is None
+          and body.get("inactive_plans") == [], f"{st} {body}")
+    # 管理员添加 carol（直接加入成员列表）→ 用户重新登录 → 必须准确显示归属
+    st, body = api("POST", f"{pu}/users/add", {"user_ids": [users["carol"]["id"]]})
+    check("添加 carol 入成员列表", st == 200 and body.get("added") == 1, f"{st} {body}")
+    st, body = raw("POST", "/api/auth/login",
+                   {"username": users["carol"]["username"], "password": "pass12345"},
+                   with_auth=False)
+    USER_TOKENS["carol"] = body.get("access_token", "")
+    st, body = api("GET", "/api/me/plan", who="carol")
+    check("重登后 carol 命中 Plan（回归：未加入任何 Coding Plan 误报）",
+          st == 200 and body.get("plan", {})
+          and body["plan"].get("name") == plan_name, f"{st} {body}")
+
+    # ---------- 6c. 已加入但当前不生效的诚实呈现 ----------
+    print("== 已加入但不生效 ==")
+    # 独立用户 + 动态时段窗（自当前时刻 +2h 起的 1 小时窗，保证运行时必在窗外）
+    st, body = api("POST", "/api/admin/users",
+                   {"username": f"e2e_pm_dave_{SUFFIX}", "password": "pass12345"})
+    check("创建用户 dave", st in (200, 201), f"{st} {body}")
+    users["dave"] = {"id": body.get("user", {}).get("id") or body.get("id"),
+                     "username": f"e2e_pm_dave_{SUFFIX}"}
+    st, body = raw("POST", "/api/auth/login",
+                   {"username": users["dave"]["username"], "password": "pass12345"},
+                   with_auth=False)
+    check("登录 dave", st == 200, f"{st} {body}")
+    USER_TOKENS["dave"] = body.get("access_token", "")
+    w_start = (time.gmtime()[3] + 2) % 24
+    w_end = (w_start + 1) % 24
+    st, body = api("POST", "/api/admin/plans", {
+        "name": f"e2e-pm-win-{SUFFIX}", "description": "时段窗", "priority": 50,
+        "token_limit": "10M", "period_type": "monthly", "overage_action": "block",
+        "alert_channels": ["in_site"], "enabled": True,
+        "active_window": {"start": f"{w_start:02d}:00", "end": f"{w_end:02d}:00"},
+    })
+    win_plan_id = body.get("plan", {}).get("id")
+    check(f"创建时段窗 Plan（{w_start:02d}:00-{w_end:02d}:00）", st == 201 and win_plan_id,
+          f"{st} {body}")
+    st, body = api("POST", f"/api/admin/plans/{win_plan_id}/users/add",
+                   {"user_ids": [users["dave"]["id"]]})
+    check("dave 加入时段窗 Plan", st == 200, f"{st} {body}")
+    st, body = api("GET", "/api/me/plan", who="dave")
+    inactive = body.get("inactive_plans", [])
+    win_hit = next((p for p in inactive if p.get("plan_id") == win_plan_id), None)
+    check("已加入但时段窗外 → plan=null 且 inactive_plans 明示 outside_active_window",
+          st == 200 and body.get("plan") is None
+          and win_hit is not None
+          and win_hit.get("reason") == "outside_active_window"
+          and win_hit.get("active_start") == f"{w_start:02d}:00"
+          and win_hit.get("active_end") == f"{w_end:02d}:00", f"{st} {body}")
+    st, body = api("PATCH", f"/api/admin/plans/{win_plan_id}", {"enabled": False})
+    check("停用时段窗 Plan", st == 200, f"{st} {body}")
+    st, body = api("GET", "/api/me/plan", who="dave")
+    win_hit = next((p for p in body.get("inactive_plans", [])
+                    if p.get("plan_id") == win_plan_id), None)
+    check("停用后 → inactive_plans 明示 disabled",
+          st == 200 and win_hit is not None
+          and win_hit.get("reason") == "disabled", f"{st} {body}")
+    st, body = api("DELETE", f"/api/admin/plans/{win_plan_id}")
+    check("清理时段窗 Plan", st == 200, f"{st} {body}")
+    st, body = api("POST", f"{pu}/users/remove", {"user_ids": [users["carol"]["id"]]})
+    check("移除 carol 直连成员", st == 200, f"{st} {body}")
 
     # ---------- 7. 移除 ----------
     print("== 移除成员 ==")

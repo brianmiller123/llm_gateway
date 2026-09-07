@@ -154,44 +154,93 @@ impl AppState {
         Ok(())
     }
 
-    /// 全量热加载：供应商 / 路由 / 限流规则 / 配额 / 单价 / 访问授权 / LDAP
+    /// 全量热加载：供应商 / 路由 / 限流规则 / 配额 / 单价 / 访问授权 / LDAP。
+    ///
+    /// 分节独立应用：任一节加载失败只影响该节（沿用旧值并 error 留痕），不再让
+    /// 整体 reload 中途返回、其余节全部冻结——历史上 schema 演进后旧实例的
+    /// plan 节 SQL 永久失败，全有或全无的 reload 让成员变更传播整体停摆。
+    /// 启动期（init）返回首个错误 fail-fast；周期刷新沿用旧值继续运行。
     pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let providers = load_providers(&self.pool).await?;
-        let routes = load_routes(&self.pool).await?;
-        let rules = load_rules(&self.pool).await?;
-        let quotas: HashMap<_, _> = load_quotas(&self.pool)
-            .await?
-            .into_iter()
-            .map(|q| (q.user_id, q))
-            .collect();
-        let prices: HashMap<_, _> = load_prices(&self.pool)
-            .await?
-            .into_iter()
-            .map(|p| (p.model.clone(), p))
-            .collect();
-        let mut user_access: HashMap<i64, Vec<UserAccessRule>> = HashMap::new();
-        for r in load_user_access(&self.pool).await? {
-            user_access.entry(r.user_id).or_default().push(r);
+        let mut first_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        macro_rules! section {
+            ($name:literal, $expr:expr) => {
+                if let Err(e) = $expr.await {
+                    tracing::error!(section = $name, error = %e, "config reload section failed; keeping previous values");
+                    first_err.get_or_insert(e);
+                }
+            };
         }
-        let admin_ids: HashSet<i64> = crate::store::users::load_admin_ids(&self.pool).await?;
-        let plan_runtimes = crate::store::plans::load_plan_runtimes(&self.pool).await?;
-
-        *self.providers.write() = providers;
-        *self.routes.write() = routes;
-        *self.rules.write() = rules;
-        *self.quotas.write() = quotas;
-        *self.prices.write() = prices;
-        *self.user_access.write() = user_access;
-        *self.admin_ids.write() = admin_ids;
-        *self.plans.write() = plan_runtimes;
-        *self.extra_body_enabled.write() =
-            crate::store::config::load_extra_body_enabled(&self.pool).await?;
-        *self.api_endpoints.write() =
-            crate::store::config::load_api_endpoint_settings(&self.pool).await?;
-        self.reload_ldap().await?;
-        *self.custom_headers.write() =
-            crate::store::config::load_header_settings(&self.pool).await?;
-        Ok(())
+        section!("providers", async {
+            let v = load_providers(&self.pool).await?;
+            *self.providers.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("routes", async {
+            let v = load_routes(&self.pool).await?;
+            *self.routes.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("rules", async {
+            let v = load_rules(&self.pool).await?;
+            *self.rules.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("quotas", async {
+            let v: HashMap<_, _> = load_quotas(&self.pool)
+                .await?
+                .into_iter()
+                .map(|q| (q.user_id, q))
+                .collect();
+            *self.quotas.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("prices", async {
+            let v: HashMap<_, _> = load_prices(&self.pool)
+                .await?
+                .into_iter()
+                .map(|p| (p.model.clone(), p))
+                .collect();
+            *self.prices.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("user_access", async {
+            let mut v: HashMap<i64, Vec<UserAccessRule>> = HashMap::new();
+            for r in load_user_access(&self.pool).await? {
+                v.entry(r.user_id).or_default().push(r);
+            }
+            *self.user_access.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("admin_ids", async {
+            let v: HashSet<i64> = crate::store::users::load_admin_ids(&self.pool).await?;
+            *self.admin_ids.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("plans", async {
+            let v = crate::store::plans::load_plan_runtimes(&self.pool).await?;
+            *self.plans.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("extra_body_enabled", async {
+            let v = crate::store::config::load_extra_body_enabled(&self.pool).await?;
+            *self.extra_body_enabled.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("api_endpoints", async {
+            let v = crate::store::config::load_api_endpoint_settings(&self.pool).await?;
+            *self.api_endpoints.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("ldap", self.reload_ldap());
+        section!("custom_headers", async {
+            let v = crate::store::config::load_header_settings(&self.pool).await?;
+            *self.custom_headers.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// 周期热加载 + 月度用量缓存兜底重载

@@ -6,3 +6,4 @@ vendor/
 *.zip
 test_.py
 *.pyc
+.agent
