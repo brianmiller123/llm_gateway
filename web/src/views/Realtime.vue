@@ -19,7 +19,7 @@
     </div>
 
     <el-row :gutter="16" class="cards" v-loading="loading && !data">
-      <el-col :span="4" v-for="card in cards" :key="card.label">
+      <el-col :span="3" v-for="card in cards" :key="card.label">
         <el-card shadow="never" class="stat-card">
           <div class="stat-title">{{ card.label }}</div>
           <div class="stat-value" :class="{ danger: card.danger }">{{ card.value }}</div>
@@ -39,6 +39,11 @@
           <template #default="{ row }">
             <span class="username">{{ row.username ?? '匿名' }}</span>
             <span v-if="row.display_name" class="display-name">（{{ row.display_name }}）</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="并发" align="right" width="70">
+          <template #default="{ row }">
+            <span :class="activeOf(row) > 1 ? 'err' : 'calls'">{{ activeOf(row) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="5 分钟调用" align="right" width="150">
@@ -140,11 +145,17 @@ const loading = ref(false)
 const autoRefresh = ref(true)
 const intervalSec = ref(5)
 const lastUpdated = ref<Date | null>(null)
-/** 每秒跳动，驱动相对时间重新渲染 */
-const tick = ref(0)
-
 const users = computed(() => data.value?.users ?? [])
 const recent = computed(() => data.value?.recent ?? [])
+/** user_id → 在途请求数；无记录（近 60 分钟无调用但在途）视为 0 */
+const activeMap = computed(
+  () => new Map((data.value?.active_by_user ?? []).map((u) => [u.user_id, u.active])),
+)
+function activeOf(row: RealtimeUserStat): number {
+  return row.user_id != null ? (activeMap.value.get(row.user_id) ?? 0) : 0
+}
+/** 每秒跳动，驱动相对时间重新渲染 */
+const tick = ref(0)
 
 const lastUpdatedText = computed(() => {
   if (!lastUpdated.value) return ''
@@ -160,6 +171,7 @@ const cards = computed(() => {
     { label: '5 分钟调用', value: s ? fmt(s.calls) : '-', danger: false },
     { label: '5 分钟错误', value: s ? fmt(s.errors) : '-', danger: !!s && s.errors > 0 },
     { label: '成功率', value: rate, danger: false },
+    { label: '在途请求', value: data.value ? fmt(data.value.active_total) : '-', danger: !!data.value && data.value.active_total > 50 },
     { label: 'Token 入/出', value: s ? `${fmt(s.input_tokens)} / ${fmt(s.output_tokens)}` : '-', danger: false },
     { label: '平均延迟', value: s ? `${s.avg_latency_ms} ms` : '-', danger: false },
     { label: '成本', value: s ? fmtCost(s.cost) : '-', danger: false },

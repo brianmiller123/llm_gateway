@@ -25,7 +25,7 @@
 
 - LDAP 登录（AD / OpenLDAP 配置驱动，memberOf 组映射管理员）+ 本地账号；内置 break-glass 本地管理员
 - JWT 会话（access 15 分钟 / refresh 30 天，可配置），支持强制下线（token 版本吊销）
-- 仪表盘、API Key 自助管理、用量统计（时间段 × 模型维度 + 图表）、实时监控（5 分钟粒度轮询）、我的套餐（当前生效 Coding Plan 的余量与用量）
+- 仪表盘、API Key 自助管理、用量统计（时间段 × 模型维度 + 图表）、实时监控（5 分钟粒度轮询 + 全站在途请求数 + 每用户实时并发——进程内计数，guard 绑定响应体生命周期，流式请求流尽/断开才释放）、我的套餐（当前生效 Coding Plan 的余量与用量）
 - 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线）、供应商配置（Key AES-256-GCM 加密落库，永不回显；`api_type` 区分 openai / openai-responses / anthropic）、路由规则、模型库、限流规则、月度配额、模型价格、Coding Plan 套餐管理、用户分组（批量添加 / LDAP 目录联动同步 / CSV 导出）、Plan 用量监控（趋势图 / 按用户按日期回溯 / 告警流）、LDAP 设置（含连通性测试）、SMTP 告警邮件设置、高级请求配置（extra_body JSON 编辑 + 校验 + 快捷预设 + 最终请求体实时预览）
 - 管理操作全部写入审计日志，可追溯
 
@@ -150,7 +150,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/quotas`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
 | `GET/POST /api/admin/plans`、`/api/admin/groups`、`/api/admin/plan-alerts`、`/api/admin/smtp` 等 | JWT + 管理员 | Coding Plan 套餐 CRUD 与用量回溯、成员管理（直连用户 / 加入分组：列表、候选检索、批量增删）、用户分组（成员管理 / LDAP 同步 / CSV 导出）、阈值告警流、SMTP 设置 |
 
-错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；限流 429 带 `Retry-After`；上游错误透明透传。
+错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；限流 429 带 `Retry-After`；Coding Plan 配额拦截 429（`insufficient_quota`）同样带 `Retry-After`（距当前统计周期边界的秒数，上限 24h；`total` 周期无边界则不带）——周期内重试必然失败，客户端应等到边界而非空转重试；`/v1/messages` 方言保留 Plan 拦截的明细消息（套餐名/周期/用量），便于区分「限流（短退避可重试）」与「配额耗尽（等到周期边界）」。上游错误透明透传。
 
 ## 状态页监测语义
 
@@ -173,7 +173,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 
 ### 策略与空闲期配额语义
 
-三层规则（API Key → 用户 → 全局）均为**进程内令牌桶**：桶容量 = `burst`，回填速率 = `rpm/60` 每秒，请求消耗 1 个令牌，不足即 429 + `Retry-After`（距下一个令牌的秒数，上限 24h）。空闲期间**没有任何扣减**——桶按真实流逝时间惰性回填直至 `burst`（`rpm=1, burst=5` 时空闲 5 分钟即回满）。回填时钟在 Linux 上取 `CLOCK_BOOTTIME`（含系统挂起/睡眠时间；`std::time::Instant` 的 `CLOCK_MONOTONIC` 在机器睡眠时不前进，会导致睡眠等待后的令牌少回填）。
+三层规则（API Key → 用户 → 全局）均为**进程内令牌桶**：桶容量 = `burst`，回填速率 = `rpm/60` 每秒，请求消耗 1 个令牌，不足即 429 + `Retry-After`（取全部命中桶中的最大等待秒数，上限 24h，并加 [0,1s) 随机抖动——避免所有被拒客户端按相同报头值整秒对齐重试、互相挤兑每秒唯一回填令牌）。多规则两阶段判定：全部命中桶都足额才统一扣减，拒绝路径**零扣减**（不会白烧其他桶令牌）。空闲期间**没有任何扣减**——桶按真实流逝时间惰性回填直至 `burst`（`rpm=1, burst=5` 时空闲 5 分钟即回满）。回填时钟在 Linux 上取 `CLOCK_BOOTTIME`（含系统挂起/睡眠时间；`std::time::Instant` 的 `CLOCK_MONOTONIC` 在机器睡眠时不前进，会导致睡眠等待后的令牌少回填）。
 
 ### 长时间等待后恢复触发 429 的根因
 
@@ -200,7 +200,7 @@ agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）�
 
 ## Coding Plan 周期用量限制与小时级重置
 
-用户经分组或直连两种通道加入套餐（Coding Plan）：token 上限 + 统计周期 + 超额策略（`block` 拦截 429 / `downgrade` 降级到指定模型并走出站重建路径 / `log` 仅告警）。分组与用户均为多对多关联（`plan_groups` / `plan_users`，主键即唯一约束防重复添加）；用户命中多个入口时按 `priority` 最高者整体生效（同分取 `plan_id` 大），多套餐不叠加计量——需要「小时 + 月」双重限值应拆两个分组用 priority 表达。成员管理入口在 Coding Plan 管理页（直连用户 / 加入分组，选择器分页检索 + 批量增删；重复加入返回 409）。
+用户经分组或直连两种通道加入套餐（Coding Plan）：token 上限 + 统计周期 + 超额策略（`block` 拦截 429（`insufficient_quota` + `Retry-After`=距周期边界秒数，`total` 周期除外）/ `downgrade` 降级到指定模型并走出站重建路径 / `log` 仅告警）。分组与用户均为多对多关联（`plan_groups` / `plan_users`，主键即唯一约束防重复添加）；用户命中多个入口时按 `priority` 最高者整体生效（同分取 `plan_id` 大），多套餐不叠加计量——需要「小时 + 月」双重限值应拆两个分组用 priority 表达。成员管理入口在 Coding Plan 管理页（直连用户 / 加入分组，选择器分页检索 + 批量增删；重复加入返回 409）。
 
 **统计周期**：`daily`（UTC 当日 00:00 起）/ `monthly`（UTC 自然月）/ `total`（不重置）/ `hourly`（小时级滚动重置）。
 

@@ -154,11 +154,19 @@ export interface RealtimeCallRow {
   cost: number | null
   created_at: string
 }
+/** 实时监控：当前在途请求的用户（进程内计数，按并发降序） */
+export interface RealtimeActiveUser {
+  user_id: number
+  active: number
+}
 
 /** 实时监控响应（管理员） */
 export interface RealtimeUsageResp {
   now: string
   summary: RealtimeSummary
+  /** 全站在途请求数（含流式未结束的请求） */
+  active_total: number
+  active_by_user: RealtimeActiveUser[]
   users: RealtimeUserStat[]
   recent: RealtimeCallRow[]
 }

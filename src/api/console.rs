@@ -683,10 +683,24 @@ async fn admin_usage_realtime(
     .fetch_all(&st.pool)
     .await
     .map_err(AppError::internal)?;
+    // 按用户实时并发（进程内在途计数；与限流器同单实例语义）+ 全站在途总数
+    let active_by_user: Vec<serde_json::Value> = {
+        let m = st.active_by_user.lock();
+        let mut rows: Vec<(i64, i64)> = m.iter().map(|(k, c)| (*k, *c)).collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        rows.into_iter()
+            .map(|(user_id, active)| json!({ "user_id": user_id, "active": active }))
+            .collect()
+    };
+    let active_total = st
+        .active_requests
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(Json(json!({
         "now": Utc::now(),
         "summary": summary,
+        "active_total": active_total,
+        "active_by_user": active_by_user,
         "users": users,
         "recent": recent,
     })))

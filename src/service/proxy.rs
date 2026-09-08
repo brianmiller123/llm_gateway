@@ -532,6 +532,63 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
+/// 按用户实时并发 guard：鉴权后 +1，响应真正结束时 -1，归零移除条目。
+struct UserActiveGuard {
+    map: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<i64, i64>>>,
+    user_id: i64,
+}
+
+impl UserActiveGuard {
+    fn enter(
+        map: &std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<i64, i64>>>,
+        user_id: i64,
+    ) -> Self {
+        *map.lock().entry(user_id).or_insert(0) += 1;
+        Self {
+            map: map.clone(),
+            user_id,
+        }
+    }
+}
+
+impl Drop for UserActiveGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock();
+        if let Some(c) = m.get_mut(&self.user_id) {
+            *c -= 1;
+        }
+        // 归零移除：防止表随历史用户无限增长
+        m.retain(|_, c| *c > 0);
+    }
+}
+
+/// 响应级 guard 组：handler 返回 ≠ 响应结束（SSE 流可远长于首字节），
+/// 计数 guard 必须活到响应体流尽/客户端断开，否则流式请求严重少计。
+struct ResponseGuards {
+    active: ActiveRequestGuard,
+    user_active: Option<UserActiveGuard>,
+}
+
+/// 把 guard 绑定到响应体生命周期：逐帧透传，流尽时释放；
+/// 客户端中途断开时 body 连同 unfold 状态一起 drop，同样释放。
+fn bind_guards_to_body(resp: Response, guards: ResponseGuards) -> Response {
+    let (parts, body) = resp.into_parts();
+    let bound = futures_util::stream::unfold(
+        (body.into_data_stream(), Some(guards)),
+        |state| async move {
+            let (mut stream, guards) = state;
+            match futures_util::StreamExt::next(&mut stream).await {
+                Some(item) => Some((item, (stream, guards))),
+                None => {
+                    drop(guards);
+                    None
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(bound))
+}
+
 /// OpenAI 兼容代理入口：鉴权 → 管线
 pub async fn proxy(
     st: &AppState,
@@ -540,19 +597,27 @@ pub async fn proxy(
     endpoint: Endpoint,
     client_ip: std::net::IpAddr,
 ) -> Result<Response, AppError> {
-    let _active = ActiveRequestGuard::enter(&st.active_requests);
+    let active = ActiveRequestGuard::enter(&st.active_requests);
     // P1-6：request_id 前移到入口——鉴权/限流/配额/解析等早期失败也能关联，
     // 且下游转发沿用同一 id（日志-响应头一致）。错误统一附 X-Request-Id 头。
     let request_id = Uuid::new_v4();
     let auth = crate::service::auth::authenticate(st, &headers).await;
     let (user_id, key_id) = match auth {
         Ok(v) => v,
-        Err(e) => return Err(fail_with_request_id(e, request_id)),
+        Err(e) => {
+            drop(active);
+            return Err(fail_with_request_id(e, request_id));
+        }
+    };
+    let guards = ResponseGuards {
+        active,
+        user_active: user_id.map(|uid| UserActiveGuard::enter(&st.active_by_user, uid)),
     };
     proxy_authed(
         st, headers, body, endpoint, client_ip, user_id, key_id, false, request_id,
     )
     .await
+    .map(|resp| bind_guards_to_body(resp, guards))
     .map_err(|e| fail_with_request_id(e, request_id))
 }
 
@@ -563,7 +628,7 @@ fn fail_with_request_id(e: AppError, request_id: Uuid) -> AppError {
 }
 
 /// 管理员测试入口：跳过鉴权与用户/Key 限流上下文，且不记账
-///（test_call → 不写 usage_logs，不污染状态页错误率与用量统计）
+/// （test_call → 不写 usage_logs，不污染状态页错误率与用量统计）
 pub async fn proxy_test(
     st: &AppState,
     headers: HeaderMap,
@@ -571,12 +636,16 @@ pub async fn proxy_test(
     endpoint: Endpoint,
     client_ip: std::net::IpAddr,
 ) -> Result<Response, AppError> {
-    let _active = ActiveRequestGuard::enter(&st.active_requests);
+    let guards = ResponseGuards {
+        active: ActiveRequestGuard::enter(&st.active_requests),
+        user_active: None,
+    };
     let request_id = Uuid::new_v4();
     proxy_authed(
         st, headers, body, endpoint, client_ip, None, None, true, request_id,
     )
     .await
+    .map(|resp| bind_guards_to_body(resp, guards))
     .map_err(|e| fail_with_request_id(e, request_id))
 }
 fn apply_extra(body: &mut Value, extra: Option<&Value>) {
@@ -3261,5 +3330,54 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["message"], "boom");
         assert_eq!(v["error"]["code"], "upstream_error");
+    }
+
+    /// 按用户并发 guard：同用户累加、归零移除条目、不同用户互不影响
+    #[test]
+    fn user_active_guard_counts_and_cleans_up() {
+        let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let g1 = UserActiveGuard::enter(&map, 7);
+        let _g2 = UserActiveGuard::enter(&map, 7);
+        let _g3 = UserActiveGuard::enter(&map, 8);
+        assert_eq!(map.lock()[&7], 2);
+        assert_eq!(map.lock()[&8], 1);
+        drop(g1);
+        assert_eq!(map.lock()[&7], 1, "仅归还一份并发");
+        drop(_g2);
+        drop(_g3);
+        assert!(
+            map.lock().is_empty(),
+            "全部归还后条目应移除,表不得随历史用户增长"
+        );
+    }
+
+    /// guard 绑定响应体:数据帧流尽才释放(handler 返回 ≠ 响应结束,SSE 长流
+    /// 期间计数必须保持);客户端中途断开时 body 连同 unfold 状态一起 drop。
+    #[tokio::test]
+    async fn guards_release_only_after_body_stream_exhausted() {
+        let counter = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let active = ActiveRequestGuard::enter(&counter);
+        let user_active = Some(UserActiveGuard::enter(&map, 42));
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("hello"))
+            .unwrap();
+        let resp = bind_guards_to_body(
+            resp,
+            ResponseGuards {
+                active,
+                user_active,
+            },
+        );
+        // body 未消费 → guard 仍持有
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(map.lock()[&42], 1);
+        let mut stream = resp.into_body().into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "流尽后全局计数归零");
+        assert!(map.lock().is_empty(), "流尽后用户条目移除");
     }
 }

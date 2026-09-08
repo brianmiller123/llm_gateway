@@ -44,6 +44,10 @@ pub struct AppState {
     /// 全局自定义 Header（upstream → 上游请求；response → 客户端响应）
     pub custom_headers: Arc<RwLock<crate::store::config::HeaderSettings>>,
     pub active_requests: Arc<std::sync::atomic::AtomicI64>,
+    /// 按用户实时并发（在途请求数；进程内，与 active_requests / limiter 同单实例
+    /// 语义）。请求鉴权后挂 guard：+1 进入、响应体流尽或客户端断开 -1，
+    /// 归零即移除条目——表大小以「并发中的用户数」为上界。实时监控端点暴露。
+    pub active_by_user: Arc<Mutex<HashMap<i64, i64>>>,
     /// P0-1：Responses previous_response_id 桥接历史（进程内 LRU；仅转换路径
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
     pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,
@@ -107,6 +111,7 @@ impl AppState {
             ldap: Arc::new(RwLock::new(ldap)),
             extra_body_enabled: Arc::new(RwLock::new(true)),
             active_requests: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            active_by_user: Arc::new(Mutex::new(HashMap::new())),
             api_endpoints: Arc::new(RwLock::new(crate::store::config::ApiEndpointSettings {
                 responses_enabled: true,
                 responses_visible: true,
