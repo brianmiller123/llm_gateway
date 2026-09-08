@@ -20,7 +20,7 @@ pub enum AppError {
     QuotaExceeded,
     /// Coding Plan 周期配额耗尽且策略为拦截（429 insufficient_quota）
     #[error("{0}")]
-    PlanQuotaExceeded(String),
+    PlanQuotaExceeded(String, Option<u64>),
     /// 状态冲突（如重复加入同一 Coding Plan）
     #[error("conflict: {0}")]
     Conflict(String),
@@ -96,9 +96,12 @@ impl IntoResponse for AppError {
                     "Monthly quota exceeded, please contact administrator".to_string(),
                     None,
                 ),
-                AppError::PlanQuotaExceeded(m) => {
-                    (StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", m, None)
-                }
+                AppError::PlanQuotaExceeded(m, retry) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "insufficient_quota",
+                    m,
+                    retry,
+                ),
                 AppError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m, None),
                 AppError::BadRequest(m) => {
                     (StatusCode::BAD_REQUEST, "invalid_request_error", m, None)
@@ -136,5 +139,41 @@ impl IntoResponse for AppError {
         builder
             .body(Body::from(body.to_string()))
             .expect("static response is valid")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    /// Plan 配额 429 携带 Retry-After：客户端可等到周期重置而非空转重试
+    #[tokio::test]
+    async fn plan_quota_response_carries_retry_after() {
+        let resp =
+            AppError::PlanQuotaExceeded("plan p exhausted".into(), Some(3600)).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "3600");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "insufficient_quota");
+        assert_eq!(v["error"]["message"], "plan p exhausted");
+    }
+
+    /// total 周期无边界 → 无 Retry-After（不承诺不确定的等待）
+    #[tokio::test]
+    async fn plan_quota_without_boundary_has_no_retry_after() {
+        let resp = AppError::PlanQuotaExceeded("x".into(), None).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("Retry-After").is_none());
+    }
+
+    /// 限流 Retry-After 上限钳制（rpm<=0 产生的巨值不得直达客户端）
+    #[tokio::test]
+    async fn rate_limited_retry_after_is_capped() {
+        let resp = AppError::RateLimited(1e9).into_response();
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "86400");
     }
 }

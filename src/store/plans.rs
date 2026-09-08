@@ -393,6 +393,31 @@ impl PlanRuntime {
         }
     }
 
+    /// 当前统计窗口结束时刻（UTC，开区间右端）：daily=次日 00:00 / monthly=次月
+    /// 1 日 00:00 / hourly=桶起点+period_hours；total 无边界 → None。
+    /// 配额耗尽 429 的 Retry-After 依据：窗口内重试必然失败，等满到边界才有意义。
+    pub fn period_end(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self.period_type.as_str() {
+            PERIOD_DAILY => Some(self.period_start(now) + chrono::Duration::days(1)),
+            PERIOD_MONTHLY => {
+                let (ny, nm) = if now.month() == 12 {
+                    (now.year() + 1, 1)
+                } else {
+                    (now.year(), now.month() + 1)
+                };
+                Some(
+                    NaiveDate::from_ymd_opt(ny, nm, 1)?
+                        .and_hms_opt(0, 0, 0)?
+                        .and_utc(),
+                )
+            }
+            PERIOD_HOURLY => Some(
+                self.period_start(now) + chrono::Duration::hours(self.period_hours.max(1) as i64),
+            ),
+            _ => None,
+        }
+    }
+
     /// 缓存/告警去重键：d:2026-09-01 / m:2026-09 / h:1788300000 / t。
     /// hourly 用桶起点 epoch 秒，与 plan_usage_counters.period_start 一一对应。
     pub fn period_key(&self, now: DateTime<Utc>) -> String {
@@ -1515,6 +1540,33 @@ mod tests {
         assert!(rt("hourly").period_key(now).starts_with("h:"));
     }
 
+    /// 窗口边界（配额 429 Retry-After 的依据）：daily/monthly 精确 UTC 边界（含
+    /// 跨年），hourly 边界=桶起点+period_hours 且恰为新桶起点，total 无边界
+    #[test]
+    fn period_end_boundaries() {
+        let now = utc(2026, 9, 2, 10, 30, 0);
+        assert_eq!(rt("daily").period_end(now), Some(utc(2026, 9, 3, 0, 0, 0)));
+        assert_eq!(
+            rt("monthly").period_end(now),
+            Some(utc(2026, 10, 1, 0, 0, 0))
+        );
+        // 跨年：12 月窗口止于次年 1 月 1 日
+        assert_eq!(
+            rt("monthly").period_end(utc(2026, 12, 15, 23, 0, 0)),
+            Some(utc(2027, 1, 1, 0, 0, 0))
+        );
+        let hourly = rt_cfg(
+            "hourly",
+            5,
+            ANCHOR_FIXED,
+            Utc.timestamp_opt(0, 0).single().unwrap(),
+        );
+        let end = hourly.period_end(now).unwrap();
+        assert_eq!(end, hourly.period_start(now) + chrono::Duration::hours(5));
+        assert_eq!(hourly.period_start(end), end, "边界恰为新桶起点");
+        assert!(end > now);
+        assert_eq!(rt("total").period_end(now), None);
+    }
     #[test]
     fn legacy_period_starts() {
         let now = utc(2026, 9, 2, 10, 30, 5);

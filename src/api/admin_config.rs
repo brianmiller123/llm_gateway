@@ -1849,7 +1849,7 @@ fn app_error_status(e: &AppError) -> u16 {
         AppError::WithRequestId { inner, .. } => app_error_status(inner),
         AppError::Auth(_) | AppError::Unauthorized(_) => 401,
         AppError::Forbidden(_) => 403,
-        AppError::RateLimited(_) | AppError::QuotaExceeded | AppError::PlanQuotaExceeded(_) => 429,
+        AppError::RateLimited(_) | AppError::QuotaExceeded | AppError::PlanQuotaExceeded(..) => 429,
         AppError::BadRequest(_) => 400,
         AppError::Conflict(_) => 409,
         AppError::Internal(_) => 500,

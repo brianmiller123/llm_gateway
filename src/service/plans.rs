@@ -61,25 +61,38 @@ pub fn check_plan(st: &AppState, user_id: i64, model: &str) -> Result<PlanDecisi
                     downgrade_to,
                 })
             }
-            _ => Err(blocked(&plan, used)),
+            _ => Err(blocked(&plan, used, now)),
         },
         // log：仅记录并告警（上方 check_and_dispatch 已覆盖 100% 级）
         plan_store::OVERAGE_LOG => Ok(PlanDecision {
             plan: Some(plan),
             downgrade_to: None,
         }),
-        _ => Err(blocked(&plan, used)),
+        _ => Err(blocked(&plan, used, now)),
     }
 }
 
-fn blocked(plan: &plan_store::PlanRuntime, used: i64) -> AppError {
-    AppError::PlanQuotaExceeded(format!(
-        "Coding Plan「{}」{}配额已用尽（{}/{} tokens）",
-        plan.plan_name,
-        crate::service::notify::period_label(&plan.period_type),
-        used,
-        plan.token_limit
-    ))
+fn blocked(
+    plan: &plan_store::PlanRuntime,
+    used: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AppError {
+    // Retry-After = 距当前周期边界的秒数（total 周期无边界 → None）。
+    // 窗口内重试必然失败：携带明确等待可让遵循报头的客户端睡到周期重置，
+    // 而非按自身默认退避把重试预算烧在注定失败的努力上。
+    let retry_after = plan
+        .period_end(now)
+        .map(|end| ((end - now).num_seconds().max(1) as u64).min(86400));
+    AppError::PlanQuotaExceeded(
+        format!(
+            "Coding Plan「{}」{}配额已用尽（{}/{} tokens）",
+            plan.plan_name,
+            crate::service::notify::period_label(&plan.period_type),
+            used,
+            plan.token_limit
+        ),
+        retry_after,
+    )
 }
 
 /// 记账事务提交后调用：用量推进可能跨过 80/95/100% 阈值 → 触发告警检查。

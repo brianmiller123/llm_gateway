@@ -48,6 +48,7 @@ pub struct RateLimiter {
     identities: Mutex<HashMap<String, Identity>>,
 }
 
+#[derive(Clone, Copy)]
 struct Bucket {
     tokens: f64,
     last: Ts,
@@ -82,7 +83,10 @@ impl RateLimiter {
     }
 
     /// 多规则原子检查（api_key > user > global，命中即拒）：
-    /// - 所有匹配桶逐个消耗令牌，首个拒绝即终止；
+    /// - 两阶段判定：先对全部匹配桶只读回填，全部足额才统一扣减落库；
+    ///   任一桶不足即整体拒绝（拒绝路径零扣减——旧实现按序消耗、遇拒绝即
+    ///   break，被拒请求会白烧掉前面桶的令牌）。返回值为各不足桶中的最大
+    ///   等待秒数（整体可通过的最早时刻；rpm<=0 且无余量时为无穷）。
     /// - identity 给定时记录本次活动，并在"该主体静默 ≥ idle_exempt"时
     ///   豁免本次拒绝（恢复后的首个请求放行，不扣空桶，也不重置任何桶）。
     ///   每个空闲间隙至多豁免一次；持续高频请求永远攒不出间隙，不受影响。
@@ -103,9 +107,11 @@ impl RateLimiter {
             }
         }
 
-        let mut rejected: Option<(String, f64)> = None;
+        let mut touched: Vec<(String, Bucket, bool)> = Vec::with_capacity(rules.len());
+        let mut max_wait = 0.0f64;
+        let mut rejected = false;
         for (key, rpm, burst) in rules {
-            let bucket = buckets.entry(key.clone()).or_insert(Bucket {
+            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
                 tokens: *burst,
                 last: now,
                 rpm: *rpm,
@@ -118,18 +124,25 @@ impl RateLimiter {
             let elapsed = now.saturating_sub(bucket.last).as_secs_f64();
             bucket.last = now;
             bucket.tokens = (bucket.tokens + elapsed * bucket.rpm / 60.0).min(bucket.burst);
-
-            if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
-            } else {
+            let ok = bucket.tokens >= 1.0;
+            if !ok {
                 let wait = if bucket.rpm > 0.0 {
                     (1.0 - bucket.tokens) / (bucket.rpm / 60.0)
                 } else {
                     f64::INFINITY
                 };
-                rejected = Some((key.clone(), wait));
-                break;
+                max_wait = max_wait.max(wait);
+                rejected = true;
             }
+            touched.push((key.clone(), bucket, ok));
+        }
+        // 回填落库：拒绝=仅入账本次累计与配置刷新（不扣减）；成功=统一扣减 1 令牌
+        for (key, bucket, ok) in &touched {
+            let mut b = *bucket;
+            if !rejected && *ok {
+                b.tokens -= 1.0;
+            }
+            buckets.insert(key.clone(), b);
         }
         drop(buckets);
 
@@ -151,17 +164,16 @@ impl RateLimiter {
         };
 
         match rejected {
-            None => Ok(()),
-            Some((key, wait)) => {
+            false => Ok(()),
+            true => {
                 if exempt_ok {
                     tracing::info!(
-                        rule_key = %key,
                         identity = identity.unwrap_or(""),
                         "rate limit resume exemption granted"
                     );
                     Ok(())
                 } else {
-                    Err(wait)
+                    Err(max_wait)
                 }
             }
         }
@@ -236,6 +248,11 @@ pub fn apply_rate_limits(
     ) {
         Ok(()) => Ok(()),
         Err(retry) => {
+            // 重试群打散：报头值加 [0,1s) 均匀抖动。被拒客户端若都按相同报头值
+            // （rpm=60 下恒为 1s）整秒对齐重试，每秒仅回填 1 令牌时对齐流只会
+            // 让同一批客户端互相挤兑；抖动使各端重试到达时刻去相关，显著降低
+            // 个别客户端连续落败直至放弃重试的概率。
+            let retry = retry + rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..1.0);
             tracing::warn!(
                 identity = identity.as_deref().unwrap_or(""),
                 model = %model,
@@ -342,6 +359,54 @@ mod tests {
             .unwrap_err();
         // rpm=60 → 1 token/s，桶空 → 恰好 1s
         assert!((err - 1.0).abs() < 1e-9, "retry after ~1s, got {err}");
+    }
+
+    /// 拒绝路径零泄漏：慢桶拒绝时，快桶令牌不得被白烧。
+    /// global rpm=0/burst=2（永不回填）+ user rpm=6/burst=1（10s 攒 1 令牌）：
+    /// 首请求放行后 user 桶空；旧实现每次拒绝都先扣掉 global 令牌（rpm=0
+    /// 永不回填）→ 慢桶回满后仍被 global 无限拒绝；两阶段判定下 global
+    /// 令牌原样保留，慢桶攒够即整体放行。
+    #[test]
+    fn rejection_does_not_leak_other_buckets() {
+        let rl = RateLimiter::new();
+        let rules = vec![
+            ("global".to_string(), 0.0, 2.0),
+            ("user:7".to_string(), 6.0, 1.0),
+        ];
+        // 双桶初始满额 → 放行一次（global 2→1，user 1→0）
+        assert!(
+            rl.check_rules_at(Duration::ZERO, &rules, None, Duration::ZERO)
+                .is_ok()
+        );
+        for _ in 0..3 {
+            let err = rl
+                .check_rules_at(Duration::ZERO, &rules, None, Duration::ZERO)
+                .unwrap_err();
+            assert!(
+                (err - 10.0).abs() < 1e-9,
+                "慢桶 rpm=6 → 等待 10s，got {err}"
+            );
+        }
+        assert!(
+            rl.check_rules_at(Duration::from_secs(10), &rules, None, Duration::ZERO)
+                .is_ok(),
+            "global 令牌未被泄漏，慢桶回填后应整体放行"
+        );
+    }
+
+    /// Retry-After 取所有不足桶的最大等待（整体可过的最早时刻），而非首个拒绝桶
+    #[test]
+    fn retry_after_is_max_across_failing_buckets() {
+        let rl = RateLimiter::new();
+        // 两只空桶：rpm=60 → 等 1s；rpm=6 → 等 10s
+        let rules = vec![
+            ("global".to_string(), 60.0, 0.0),
+            ("user:7".to_string(), 6.0, 0.0),
+        ];
+        let err = rl
+            .check_rules_at(Duration::ZERO, &rules, None, Duration::ZERO)
+            .unwrap_err();
+        assert!((err - 10.0).abs() < 1e-9, "应取最大等待 10s，got {err}");
     }
 
     /// 短等待：回填不足 1 个令牌，仍拒绝且等待时间按比例缩短

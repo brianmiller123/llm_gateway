@@ -99,11 +99,16 @@ pub fn error_response(err: &AppError) -> Response {
                 secs.ceil().max(1.0) as u64
             ),
         ),
-        AppError::QuotaExceeded | AppError::PlanQuotaExceeded(_) => (
+        AppError::QuotaExceeded => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
             "quota exceeded, please contact administrator".into(),
         ),
+        // Plan 配额拦截保留明细（plan 名/周期/用量）——客户端排障需要区分
+        // 「限流（短退避可重试）」与「配额耗尽（须等到周期边界）」
+        AppError::PlanQuotaExceeded(m, _) => {
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", m.clone())
+        }
         AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "invalid_request_error", m.clone()),
         AppError::Conflict(m) => (StatusCode::CONFLICT, "invalid_request_error", m.clone()),
         AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error", m.clone()),
@@ -121,14 +126,15 @@ pub fn error_response(err: &AppError) -> Response {
         ),
     };
 
+    let retry_after: Option<u64> = match err {
+        AppError::RateLimited(secs) => Some(secs.ceil().max(1.0).min(86400.0) as u64),
+        AppError::PlanQuotaExceeded(_, retry) => *retry,
+        _ => None,
+    };
     let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json");
-    if matches!(err, AppError::RateLimited(_)) {
-        let retry = match err {
-            AppError::RateLimited(secs) => secs.ceil().max(1.0).min(86400.0) as u64,
-            _ => 1,
-        };
+    if let Some(retry) = retry_after {
         builder = builder.header("Retry-After", retry.to_string());
     }
     if let Some(id) = request_id {
@@ -287,6 +293,30 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).unwrap();
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.chars().count() <= 1800, "len={}", msg.len());
+    }
+
+    /// Plan 配额拦截：anthropic 方言保留明细 + Retry-After——客户端可区分
+    /// 「限流（短退避可重试）」与「配额耗尽（须等到周期边界）」
+    #[test]
+    fn plan_quota_error_keeps_detail_and_retry_after() {
+        let resp = error_response(&AppError::PlanQuotaExceeded(
+            "Coding Plan「pro」小时配额已用尽（100/200 tokens）".into(),
+            Some(3600),
+        ));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "3600");
+        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        });
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("「pro」"), "{msg}");
+        assert!(msg.contains("100/200"), "{msg}");
     }
 }
 
