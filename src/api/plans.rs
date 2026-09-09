@@ -13,7 +13,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -912,11 +912,41 @@ async fn plan_group_candidates(
 struct PlanUsageParams {
     /// 趋势天数（默认 30，上限 365）
     days: Option<i32>,
-    /// 用户维度回溯区间（缺省近 30 天）
+    /// 用户维度回溯区间（缺省近 30 天；当期口径见响应 `current` 段）
     from: Option<String>,
     to: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+/// 当前周期起点（展示用，UTC）：daily=今日 00:00 / monthly=本月 1 日 /
+/// hourly fixed=当前桶起点（与 [`plan_store::PlanRuntime::period_start`] 同式）。
+/// hourly join 锚点按成员各自 added_at 切桶，无单一 plan 级起点 → None；
+/// total 不重置 → None。
+fn plan_current_period_start(
+    plan: &plan_store::CodingPlan,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match plan.period_type.as_str() {
+        plan_store::PERIOD_DAILY => Some(
+            now.date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc(),
+        ),
+        plan_store::PERIOD_MONTHLY => Some(
+            NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                .expect("first of month is a valid date")
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc(),
+        ),
+        plan_store::PERIOD_HOURLY if plan.period_anchor_mode == plan_store::ANCHOR_FIXED => {
+            let step = (plan.period_hours.max(1) as i64).saturating_mul(3600);
+            DateTime::from_timestamp(now.timestamp().div_euclid(step) * step, 0)
+        }
+        _ => None,
+    }
 }
 
 async fn plan_usage(
@@ -949,12 +979,24 @@ async fn plan_usage(
     let (user_rows, total) = plan_store::plan_user_usage(&st.pool, id, from, to, limit, offset)
         .await
         .map_err(AppError::internal)?;
+    // 当期（自上次重置）成员用量：与配额检查/阈值告警同源，供看板默认展示
+    let (cur_rows, cur_total, cur_used) =
+        plan_store::plan_user_usage_current(&st.pool, id, limit, offset)
+            .await
+            .map_err(AppError::internal)?;
+    let current_period_start = plan_current_period_start(&plan, Utc::now());
     Ok(Json(json!({
         "plan": plan_row_to_value(&plan),
         "trend": trend,
         "periods": periods,
         "range": {"from": from, "to": to},
         "users": {"rows": user_rows, "total": total, "limit": limit, "offset": offset},
+        "current": {
+            "period_start": current_period_start,
+            "used_tokens": cur_used,
+            "users": cur_rows,
+            "total": cur_total,
+        },
     })))
 }
 

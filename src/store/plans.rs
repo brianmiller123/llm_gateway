@@ -1349,6 +1349,65 @@ pub struct PlanUserUsage {
     pub tokens: i64,
 }
 
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct PlanUserCurrentUsage {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub tokens: i64,
+}
+
+/// 「当前周期」计数器谓词：与 [`load_usage_snapshots`] / [`list_plan_summaries`]
+/// 的当期口径一致（daily=今日 UTC 桶 / monthly=本月桶 / hourly=(now-hours, now] 当前桶
+/// / total=全部），改一处须三处同步。
+const CURRENT_PERIOD_PREDICATE: &str = "((p.period_type = 'total') \
+     OR (p.period_type = 'daily' AND pc.period_start = \
+         date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+     OR (p.period_type = 'monthly' AND pc.period_start = \
+         date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+     OR (p.period_type = 'hourly' \
+         AND pc.period_start > now() - make_interval(hours => p.period_hours) \
+         AND pc.period_start <= now()))";
+
+/// 当前周期（自上次重置）成员按用户用量——plan_usage_counters 权威口径，与配额
+/// 检查/阈值告警同源；按日期回溯请用 [`plan_user_usage`]（usage_daily）。
+/// 返回 (分页行, 用户总数, 当期合计 tokens)。
+pub async fn plan_user_usage_current(
+    pool: &PgPool,
+    plan_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<PlanUserCurrentUsage>, i64, i64), sqlx::Error> {
+    let rows = sqlx::query_as::<_, PlanUserCurrentUsage>(&format!(
+        "SELECT u.id AS user_id, u.username, u.display_name, \
+                SUM(pc.tokens)::bigint AS tokens \
+         FROM plan_usage_counters pc \
+         JOIN coding_plans p ON p.id = pc.plan_id \
+         JOIN users u ON u.id = pc.user_id \
+         WHERE pc.plan_id = $1 AND {CURRENT_PERIOD_PREDICATE} \
+         GROUP BY u.id, u.username, u.display_name \
+         ORDER BY tokens DESC \
+         LIMIT $2 OFFSET $3",
+    ))
+    .bind(plan_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let (total, used): (i64, i64) = sqlx::query_as(
+        &format!(
+            "SELECT COUNT(DISTINCT pc.user_id)::bigint, COALESCE(SUM(pc.tokens), 0)::bigint \
+         FROM plan_usage_counters pc \
+         JOIN coding_plans p ON p.id = pc.plan_id \
+         WHERE pc.plan_id = $1 AND {CURRENT_PERIOD_PREDICATE}",
+        ),
+    )
+    .bind(plan_id)
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total, used))
+}
+
 /// 时间范围内 Plan 成员按用户用量（回溯查询；分页）
 pub async fn plan_user_usage(
     pool: &PgPool,

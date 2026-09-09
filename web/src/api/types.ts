@@ -609,6 +609,13 @@ export interface PlanUserUsage {
   tokens: number
 }
 
+export interface PlanCurrentUserUsage {
+  user_id: number
+  username: string
+  display_name: string | null
+  tokens: number
+}
+
 export interface PlanUsageResp {
   plan: CodingPlan
   trend: DailyUsage[]
@@ -619,6 +626,13 @@ export interface PlanUsageResp {
     total: number
     limit: number
     offset: number
+  }
+  /** 当前周期（自上次重置）成员用量：plan_usage_counters 权威口径，与配额/告警同源 */
+  current: {
+    period_start: string | null
+    used_tokens: number
+    users: PlanCurrentUserUsage[]
+    total: number
   }
 }
 

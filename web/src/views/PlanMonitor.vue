@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import { request } from '@/api/client'
@@ -9,6 +9,10 @@ const plans = ref<PlansResp['plans']>([])
 const selectedPlanId = ref<number | null>(null)
 const detail = ref<PlanUsageResp | null>(null)
 const detailLoading = ref(false)
+
+// 成员用量视图：默认「当前周期」（自上次重置，与配额/告警口径一致）；
+// 30 天累计会远超单周期配额，默认展示只会全是告警，故回溯降级为切换项
+const usageMode = ref<'current' | 'range'>('current')
 
 const PERIOD_LABELS: Record<string, string> = {
   hourly: '小时级重置',
@@ -60,7 +64,11 @@ async function loadDetail() {
   }
 }
 
-watch(selectedPlanId, loadDetail)
+watch(selectedPlanId, () => {
+  currentPage.page = 1
+  userPage.page = 1
+  loadDetail()
+})
 
 // —— 趋势图（echarts，同 Usage.vue 模式）——
 const trendChartRef = ref<HTMLDivElement>()
@@ -127,6 +135,48 @@ function levelTagType(level: number): string {
   return 'info'
 }
 
+// —— 成员当期用量（自上次重置；plan_usage_counters 与配额/告警同源）——
+const currentPage = reactive({ page: 1, page_size: 20 })
+
+const currentUsed = computed(
+  () => detail.value?.current?.used_tokens ?? detail.value?.periods[0]?.tokens ?? 0,
+)
+
+const currentPeriodText = computed(() => {
+  if (!detail.value) return ''
+  const ps = detail.value.current?.period_start
+  if (!ps) {
+    return detail.value.plan.period_type === 'total' ? '累计总量（不重置）' : ''
+  }
+  return `当前周期起点：${fmtAlertTime(ps)}（${periodLabel(detail.value.plan.period_type, detail.value.plan.period_hours)}）`
+})
+
+function shareOf(row: { tokens: number }): number {
+  if (currentUsed.value <= 0) return 0
+  return Math.round(((row.tokens * 100) / currentUsed.value) * 10) / 10
+}
+
+async function loadCurrentPage(page = 1) {
+  if (selectedPlanId.value == null || !detail.value) return
+  currentPage.page = page
+  detailLoading.value = true
+  try {
+    const params = new URLSearchParams({
+      limit: String(currentPage.page_size),
+      offset: String((page - 1) * currentPage.page_size),
+    })
+    const resp = await request<PlanUsageResp>(
+      `/api/admin/plans/${selectedPlanId.value}/usage?${params}`,
+    )
+    // 仅替换当期用量段，保留趋势与周期
+    if (detail.value) detail.value.current = resp.current
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '加载当期用量失败')
+  } finally {
+    detailLoading.value = false
+  }
+}
+
 // —— 用户维度回溯 ——
 const userPage = reactive({ page: 1, page_size: 20 })
 const rangeForm = reactive({
@@ -155,6 +205,11 @@ async function loadUserPage(page = 1) {
   } finally {
     detailLoading.value = false
   }
+}
+
+function onPageChange(page: number) {
+  if (usageMode.value === 'current') loadCurrentPage(page)
+  else loadUserPage(page)
 }
 
 onMounted(async () => {
@@ -198,12 +253,12 @@ onBeforeUnmount(() => {
       </el-col>
       <el-col :span="8">
         <el-card shadow="never">
-          <div class="stat-label">已用 / 剩余</div>
+          <div class="stat-label">已用 / 剩余（自上次重置）</div>
           <div class="stat-value">
-            {{ (detail.plan.token_limit - (detail.periods[0]?.tokens ?? 0)).toLocaleString() }}
+            {{ (detail.plan.token_limit - currentUsed).toLocaleString() }}
           </div>
           <div class="stat-sub">
-            当期成员合计 {{ detail.periods[0]?.tokens.toLocaleString() ?? 0 }} tokens
+            当期成员合计 {{ currentUsed.toLocaleString() }} tokens
           </div>
         </el-card>
       </el-col>
@@ -228,26 +283,77 @@ onBeforeUnmount(() => {
 
     <el-card v-if="detail" shadow="never">
       <div class="section-head">
-        <div class="stat-label">分组明细（成员按用户用量回溯）</div>
+        <div>
+          <div class="stat-label">
+            {{ usageMode === 'current' ? '成员当期用量（自上次重置，与配额/告警同口径）' : '成员用量回溯（按日期区间）' }}
+          </div>
+          <div v-if="usageMode === 'current' && currentPeriodText" class="stat-sub">
+            {{ currentPeriodText }}
+          </div>
+        </div>
         <div class="range-row">
-          <el-date-picker
-            v-model="rangeForm.from"
-            type="date"
-            value-format="YYYY-MM-DD"
-            placeholder="开始日期"
-            style="width: 140px"
-          />
-          <el-date-picker
-            v-model="rangeForm.to"
-            type="date"
-            value-format="YYYY-MM-DD"
-            placeholder="结束日期"
-            style="width: 140px"
-          />
-          <el-button type="primary" @click="loadUserPage(1)">查询</el-button>
+          <el-radio-group v-model="usageMode" size="small">
+            <el-radio-button value="current">当前周期</el-radio-button>
+            <el-radio-button value="range">历史回溯</el-radio-button>
+          </el-radio-group>
+          <template v-if="usageMode === 'range'">
+            <el-date-picker
+              v-model="rangeForm.from"
+              type="date"
+              value-format="YYYY-MM-DD"
+              placeholder="开始日期"
+              style="width: 140px"
+            />
+            <el-date-picker
+              v-model="rangeForm.to"
+              type="date"
+              value-format="YYYY-MM-DD"
+              placeholder="结束日期"
+              style="width: 140px"
+            />
+            <el-button type="primary" @click="loadUserPage(1)">查询</el-button>
+          </template>
         </div>
       </div>
-      <el-table v-loading="detailLoading" :data="detail.users.rows" stripe size="small">
+
+      <el-table
+        v-if="usageMode === 'current'"
+        v-loading="detailLoading"
+        :data="detail.current?.users ?? []"
+        stripe
+        size="small"
+      >
+        <el-table-column label="用户" min-width="140">
+          <template #default="{ row }">
+            {{ row.username }}
+            <span v-if="row.display_name" class="muted">（{{ row.display_name }}）</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="tokens" min-width="120">
+          <template #default="{ row }">{{ row.tokens.toLocaleString() }}</template>
+        </el-table-column>
+        <el-table-column label="占当期合计" min-width="200">
+          <template #default="{ row }">
+            <div class="share-row">
+              <el-progress
+                :percentage="shareOf(row)"
+                :stroke-width="6"
+                :show-text="false"
+                class="share-bar"
+              />
+              <span class="share-text">{{ shareOf(row).toFixed(1) }}%</span>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <el-table
+        v-else
+        v-loading="detailLoading"
+        :data="detail.users.rows"
+        stripe
+        size="small"
+      >
         <el-table-column label="用户" min-width="140">
           <template #default="{ row }">
             {{ row.username }}
@@ -260,10 +366,10 @@ onBeforeUnmount(() => {
       <el-pagination
         class="pager"
         layout="total, prev, pager, next"
-        :total="detail.users.total"
+        :total="usageMode === 'current' ? (detail.current?.total ?? 0) : detail.users.total"
         :page-size="userPage.page_size"
-        :current-page="userPage.page"
-        @current-change="loadUserPage"
+        :current-page="usageMode === 'current' ? currentPage.page : userPage.page"
+        @current-change="onPageChange"
       />
     </el-card>
 
@@ -371,6 +477,20 @@ onBeforeUnmount(() => {
 .muted {
   color: #909399;
   font-size: 12px;
+}
+.share-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.share-bar {
+  flex: 1;
+}
+.share-text {
+  font-size: 12px;
+  color: #606266;
+  min-width: 48px;
+  text-align: right;
 }
 .channel-tag {
   margin-right: 4px;
