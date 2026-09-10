@@ -31,7 +31,7 @@
       <template #header>
         <div class="card-header">
           <span>用户调用情况（近 60 分钟）</span>
-          <span class="sub">按 5 分钟调用量排序，红色为错误数</span>
+          <span class="sub">按 5 分钟调用量排序，红色为错误数；并发列悬停查看模型分布</span>
         </div>
       </template>
       <el-table v-if="data && users.length" :data="users" size="small" :row-class-name="userRowClass">
@@ -43,7 +43,16 @@
         </el-table-column>
         <el-table-column label="并发" align="right" width="70">
           <template #default="{ row }">
-            <span :class="activeOf(row) > 1 ? 'err' : 'calls'">{{ activeOf(row) }}</span>
+            <el-tooltip v-if="activeOf(row) > 0" placement="top">
+              <template #content>
+                <div v-for="m in activeModelsOf(row)" :key="m.model" class="active-tip-row">
+                  <span class="mono">{{ m.model || '（缺 model）' }}</span>
+                  <span class="active-tip-n">{{ m.active }}</span>
+                </div>
+              </template>
+              <span class="active-cell" :class="activeOf(row) > 1 ? 'err' : 'calls'">{{ activeOf(row) }}</span>
+            </el-tooltip>
+            <span v-else class="calls">0</span>
           </template>
         </el-table-column>
         <el-table-column label="5 分钟调用" align="right" width="150">
@@ -138,7 +147,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { request } from '@/api/client'
-import type { RealtimeCallRow, RealtimeUsageResp, RealtimeUserStat } from '@/api/types'
+import type { RealtimeActiveModel, RealtimeCallRow, RealtimeUsageResp, RealtimeUserStat } from '@/api/types'
 
 const data = ref<RealtimeUsageResp | null>(null)
 const loading = ref(false)
@@ -151,8 +160,15 @@ const recent = computed(() => data.value?.recent ?? [])
 const activeMap = computed(
   () => new Map((data.value?.active_by_user ?? []).map((u) => [u.user_id, u.active])),
 )
+/** user_id → 在途请求的模型分布（客户端请求的原始 model） */
+const activeModelsMap = computed(
+  () => new Map((data.value?.active_by_user ?? []).map((u) => [u.user_id, u.by_model ?? []])),
+)
 function activeOf(row: RealtimeUserStat): number {
   return row.user_id != null ? (activeMap.value.get(row.user_id) ?? 0) : 0
+}
+function activeModelsOf(row: RealtimeUserStat): RealtimeActiveModel[] {
+  return row.user_id != null ? (activeModelsMap.value.get(row.user_id) ?? []) : []
 }
 /** 每秒跳动，驱动相对时间重新渲染 */
 const tick = ref(0)
@@ -432,6 +448,24 @@ onBeforeUnmount(() => {
 .err {
   color: #f56c6c;
   font-size: 12px;
+}
+
+.active-cell {
+  cursor: default;
+  text-decoration: underline dotted;
+  text-decoration-color: rgba(144, 147, 153, 0.7);
+  text-underline-offset: 3px;
+}
+
+.active-tip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  line-height: 1.7;
+}
+
+.active-tip-n {
+  font-weight: 600;
 }
 
 .tok-in {

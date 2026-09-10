@@ -44,10 +44,12 @@ pub struct AppState {
     /// 全局自定义 Header（upstream → 上游请求；response → 客户端响应）
     pub custom_headers: Arc<RwLock<crate::store::config::HeaderSettings>>,
     pub active_requests: Arc<std::sync::atomic::AtomicI64>,
-    /// 按用户实时并发（在途请求数；进程内，与 active_requests / limiter 同单实例
-    /// 语义）。请求鉴权后挂 guard：+1 进入、响应体流尽或客户端断开 -1，
-    /// 归零即移除条目——表大小以「并发中的用户数」为上界。实时监控端点暴露。
-    pub active_by_user: Arc<Mutex<HashMap<i64, i64>>>,
+    /// 按用户×模型实时并发（在途请求数；进程内，与 active_requests / limiter 同
+    /// 单实例语义）。请求鉴权并解析出模型后挂 guard：+1 进入、响应体流尽或客户端
+    /// 断开 -1，归零即移除条目——表大小以「并发中的 用户×模型 组合数」为上界。
+    /// 实时监控端点暴露。模型为客户端请求体原始 model（管线内的路由改写/Plan 降级
+    /// 发生在挂载之后，不改计数键；缺 model 字段的瞬态条目落空串键，随 400 释放）。
+    pub active_by_user: Arc<Mutex<HashMap<(i64, String), i64>>>,
     /// P0-1：Responses previous_response_id 桥接历史（进程内 LRU；仅转换路径
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
     pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,

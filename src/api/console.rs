@@ -683,15 +683,9 @@ async fn admin_usage_realtime(
     .fetch_all(&st.pool)
     .await
     .map_err(AppError::internal)?;
-    // 按用户实时并发（进程内在途计数；与限流器同单实例语义）+ 全站在途总数
-    let active_by_user: Vec<serde_json::Value> = {
-        let m = st.active_by_user.lock();
-        let mut rows: Vec<(i64, i64)> = m.iter().map(|(k, c)| (*k, *c)).collect();
-        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        rows.into_iter()
-            .map(|(user_id, active)| json!({ "user_id": user_id, "active": active }))
-            .collect()
-    };
+    // 按用户×模型实时并发（进程内在途计数；与限流器同单实例语义）聚合为
+    // 每用户总数 + 模型分布，另附全站在途总数
+    let active_by_user = aggregate_active_by_user(&st.active_by_user.lock());
     let active_total = st
         .active_requests
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -704,6 +698,35 @@ async fn admin_usage_realtime(
         "users": users,
         "recent": recent,
     })))
+}
+
+/// 在途计数聚合：(user_id, model) → n 折叠为每用户一行（总数降序、同数按
+/// user_id 升序），行内 by_model 按模型名升序。模型为客户端请求的原始 model；
+/// 空串键是缺 model 字段请求的瞬态条目，原样透出由前端标注。
+fn aggregate_active_by_user(
+    m: &std::collections::HashMap<(i64, String), i64>,
+) -> Vec<serde_json::Value> {
+    use std::collections::{BTreeMap, HashMap};
+    let mut agg: HashMap<i64, (i64, BTreeMap<&str, i64>)> = HashMap::new();
+    for ((uid, model), c) in m {
+        let e = agg.entry(*uid).or_insert_with(|| (0, BTreeMap::new()));
+        e.0 += c;
+        *e.1.entry(model.as_str()).or_insert(0) += c;
+    }
+    let mut rows: Vec<(i64, i64, BTreeMap<&str, i64>)> = agg
+        .into_iter()
+        .map(|(uid, (total, models))| (uid, total, models))
+        .collect();
+    rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.into_iter()
+        .map(|(user_id, active, models)| {
+            let by_model: Vec<serde_json::Value> = models
+                .into_iter()
+                .map(|(model, active)| json!({ "model": model, "active": active }))
+                .collect();
+            json!({ "user_id": user_id, "active": active, "by_model": by_model })
+        })
+        .collect()
 }
 
 /// 按日趋势点（图表用，日期缺失补零到完整范围）
@@ -1477,4 +1500,53 @@ fn user_json(u: &users::UserRow) -> serde_json::Value {
         "last_login_at": u.last_login_at,
         "created_at": u.created_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_active_by_user;
+    use std::collections::HashMap;
+
+    /// 在途聚合：同用户跨模型合计、总数降序/同数按 user_id 升序、by_model
+    /// 模型名升序、空模型键原样透出、空表→空数组
+    #[test]
+    fn aggregate_active_by_user_folds_models_and_sorts() {
+        assert!(aggregate_active_by_user(&HashMap::new()).is_empty());
+
+        let mut m: HashMap<(i64, String), i64> = HashMap::new();
+        m.insert((7, "gpt-b".into()), 2);
+        m.insert((7, "gpt-a".into()), 1);
+        m.insert((8, "gpt-a".into()), 3);
+        m.insert((9, "".into()), 3);
+        let rows = aggregate_active_by_user(&m);
+
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|r| r["user_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![7, 8, 9],
+            "总数降序(7:3,8:3,9:3 并列)后按 user_id 升序"
+        );
+        assert_eq!(rows[0]["active"], 3, "同用户跨模型合计");
+
+        let models: Vec<(&str, i64)> = rows[0]["by_model"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v["model"].as_str().unwrap(), v["active"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(
+            models,
+            vec![("gpt-a", 1), ("gpt-b", 2)],
+            "by_model 按模型名升序"
+        );
+
+        assert_eq!(
+            rows[2]["by_model"][0]["model"], "",
+            "缺 model 的空串键原样透出"
+        );
+        assert_eq!(rows[2]["by_model"][0]["active"], 3);
+    }
 }

@@ -154,10 +154,17 @@ export interface RealtimeCallRow {
   cost: number | null
   created_at: string
 }
+/** 实时监控：单用户在途请求的模型分布（模型为客户端请求的原始 model；空串 = 缺 model 字段的瞬态请求） */
+export interface RealtimeActiveModel {
+  model: string
+  active: number
+}
+
 /** 实时监控：当前在途请求的用户（进程内计数，按并发降序） */
 export interface RealtimeActiveUser {
   user_id: number
   active: number
+  by_model: RealtimeActiveModel[]
 }
 
 /** 实时监控响应（管理员） */

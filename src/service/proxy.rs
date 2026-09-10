@@ -532,21 +532,25 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
-/// 按用户实时并发 guard：鉴权后 +1，响应真正结束时 -1，归零移除条目。
+/// 按用户×模型实时并发 guard：鉴权并解析出模型后 +1，响应真正结束时 -1，
+/// 归零移除条目。模型取客户端请求体原始 model（后续改写不影响已挂计数键），
+/// 缺 model 时落空串键——该请求随即在管线 400，条目只存活毫秒级。
 struct UserActiveGuard {
-    map: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<i64, i64>>>,
-    user_id: i64,
+    map: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<(i64, String), i64>>>,
+    key: (i64, String),
 }
 
 impl UserActiveGuard {
     fn enter(
-        map: &std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<i64, i64>>>,
+        map: &std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<(i64, String), i64>>>,
         user_id: i64,
+        model: Option<String>,
     ) -> Self {
-        *map.lock().entry(user_id).or_insert(0) += 1;
+        let key = (user_id, model.unwrap_or_default());
+        *map.lock().entry(key.clone()).or_insert(0) += 1;
         Self {
             map: map.clone(),
-            user_id,
+            key,
         }
     }
 }
@@ -554,10 +558,10 @@ impl UserActiveGuard {
 impl Drop for UserActiveGuard {
     fn drop(&mut self) {
         let mut m = self.map.lock();
-        if let Some(c) = m.get_mut(&self.user_id) {
+        if let Some(c) = m.get_mut(&self.key) {
             *c -= 1;
         }
-        // 归零移除：防止表随历史用户无限增长
+        // 归零移除：防止表随历史用户×模型组合无限增长
         m.retain(|_, c| *c > 0);
     }
 }
@@ -609,16 +613,65 @@ pub async fn proxy(
             return Err(fail_with_request_id(e, request_id));
         }
     };
+    // 端点开关与请求体解析从 proxy_authed 前置到此处（保持原有次序：开关拒绝
+    // 优先于 body 400）：解析只做一次，解析出的 JSON 全管线复用，模型维度
+    // （客户端原始 model）在挂载用户并发 guard 前即可取得
+    ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
+    let json =
+        parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
+    let model = requested_model(&json);
     let guards = ResponseGuards {
         active,
-        user_active: user_id.map(|uid| UserActiveGuard::enter(&st.active_by_user, uid)),
+        user_active: user_id.map(|uid| UserActiveGuard::enter(&st.active_by_user, uid, model)),
     };
     proxy_authed(
-        st, headers, body, endpoint, client_ip, user_id, key_id, false, request_id,
+        st, headers, body, json, endpoint, client_ip, user_id, key_id, false, request_id,
     )
     .await
     .map(|resp| bind_guards_to_body(resp, guards))
     .map_err(|e| fail_with_request_id(e, request_id))
+}
+
+/// API 端点运行时开关检查（原 proxy_authed 步骤 0）：管理员停用的端点直接拒绝。
+/// 真实请求与测试请求都走此检查（测试停用状态本身是合法的测试意图）
+fn ensure_endpoint_enabled(st: &AppState, endpoint: Endpoint) -> Result<(), AppError> {
+    let eps = st.api_endpoints.read();
+    if endpoint.responses && !eps.responses_enabled {
+        return Err(AppError::ServiceUnavailable(
+            "the Responses API (/v1/responses) is currently disabled by the administrator".into(),
+        ));
+    }
+    if endpoint.anthropic && !eps.messages_enabled {
+        return Err(AppError::ServiceUnavailable(
+            "the Anthropic Messages API (/v1/messages) is currently disabled by the administrator"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// M24：请求体解析（先按 Content-Encoding 解压，再解析 JSON）。
+/// 在入口挂用户并发 guard 前调用一次，结果传入管线复用——整份请求体
+/// 不做第二次解压/解析。
+fn parse_request_json(body: &Bytes, headers: &HeaderMap) -> Result<Value, AppError> {
+    let decompressed = decompress_request_body(
+        body,
+        headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+    )
+    .map_err(AppError::BadRequest)?;
+    serde_json::from_slice(&decompressed)
+        .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))
+}
+
+/// 客户端请求的原始模型名（空/缺失 → None）。仅用于用户并发观测维度；
+/// 管线内对缺 model 的正式校验仍在下游（错误语义不变）
+fn requested_model(json: &Value) -> Option<String> {
+    json.get("model")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
 }
 
 /// P1-6：早期失败日志 + 请求 id 包装（响应头由 IntoResponse 附带）
@@ -641,8 +694,11 @@ pub async fn proxy_test(
         user_active: None,
     };
     let request_id = Uuid::new_v4();
+    ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
+    let json =
+        parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
     proxy_authed(
-        st, headers, body, endpoint, client_ip, None, None, true, request_id,
+        st, headers, body, json, endpoint, client_ip, None, None, true, request_id,
     )
     .await
     .map(|resp| bind_guards_to_body(resp, guards))
@@ -667,11 +723,14 @@ fn apply_extra(body: &mut Value, extra: Option<&Value>) {
     }
 }
 
-/// 已鉴权代理管线：端点开关 → 限流 → 配额 → 路由 → 转发（含降级）→ 记账
+/// 已鉴权代理管线：限流 → 配额 → 路由 → 转发（含降级）→ 记账。
+/// 端点开关检查与请求体解压/解析已在入口（proxy / proxy_test）完成，
+/// `json` 为解析结果、`body` 为原始字节（零改写快路径直传用）。
 async fn proxy_authed(
     st: &AppState,
     headers: HeaderMap,
     body: Bytes,
+    mut json: Value,
     endpoint: Endpoint,
     client_ip: std::net::IpAddr,
     user_id: Option<i64>,
@@ -681,38 +740,8 @@ async fn proxy_authed(
 ) -> Result<Response, AppError> {
     let started = Instant::now();
 
-    // 0. API 端点开关：管理员可在控制台停用单个 API；另一 API 不受影响。
-    // 真实请求与测试请求都走此检查（测试停用状态本身是合法的测试意图）
-    {
-        let eps = st.api_endpoints.read();
-        if endpoint.responses && !eps.responses_enabled {
-            return Err(AppError::ServiceUnavailable(
-                "the Responses API (/v1/responses) is currently disabled by the administrator"
-                    .into(),
-            ));
-        }
-        if endpoint.anthropic && !eps.messages_enabled {
-            return Err(AppError::ServiceUnavailable(
-                "the Anthropic Messages API (/v1/messages) is currently disabled by the administrator"
-                    .into(),
-            ));
-        }
-    }
-
-    // 2. 解析请求体（M24：先按 Content-Encoding 解压，再解析 JSON；
-    //    后做 role 归一化，所有下游分支共用改写后的 json；
-    //    Anthropic 方言跳过 OpenAI 归一化）
-    let mut json: Value = {
-        let decompressed = decompress_request_body(
-            &body,
-            headers
-                .get(header::CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok()),
-        )
-        .map_err(AppError::BadRequest)?;
-        serde_json::from_slice(&decompressed)
-            .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?
-    };
+    // 2. 请求体归一化（解压/解析已在入口完成）：role 归一化后所有下游分支
+    //    共用改写后的 json；Anthropic 方言跳过 OpenAI 归一化
     let mut roles_rewritten = false;
     // P0-6：请求带 Content-Encoding（gzip/br/zstd…）时零改写快路径不能直传
     // 原始压缩字节（上游按 Content-Type: application/json 解析必失败）→ 记录
@@ -3332,22 +3361,32 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         assert_eq!(v["error"]["code"], "upstream_error");
     }
 
-    /// 按用户并发 guard：同用户累加、归零移除条目、不同用户互不影响
+    /// 按用户×模型并发 guard：同用户同模型累加、同用户异模型独立计数、
+    /// 缺 model 落空串键、归零移除条目、不同用户互不影响
     #[test]
     fn user_active_guard_counts_and_cleans_up() {
         let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let g1 = UserActiveGuard::enter(&map, 7);
-        let _g2 = UserActiveGuard::enter(&map, 7);
-        let _g3 = UserActiveGuard::enter(&map, 8);
-        assert_eq!(map.lock()[&7], 2);
-        assert_eq!(map.lock()[&8], 1);
+        let key = |uid: i64, m: &str| (uid, m.to_string());
+        let g1 = UserActiveGuard::enter(&map, 7, Some("m1".into()));
+        let _g2 = UserActiveGuard::enter(&map, 7, Some("m1".into()));
+        let _g3 = UserActiveGuard::enter(&map, 7, Some("m2".into()));
+        let _g4 = UserActiveGuard::enter(&map, 8, Some("m1".into()));
+        let _g5 = UserActiveGuard::enter(&map, 7, None);
+        assert_eq!(map.lock()[&key(7, "m1")], 2);
+        assert_eq!(map.lock()[&key(7, "m2")], 1, "同用户异模型独立计数");
+        assert_eq!(map.lock()[&key(8, "m1")], 1, "同模型异用户独立计数");
+        assert_eq!(map.lock()[&key(7, "")], 1, "缺 model 落空串键");
         drop(g1);
-        assert_eq!(map.lock()[&7], 1, "仅归还一份并发");
+        assert_eq!(map.lock()[&key(7, "m1")], 1, "仅归还一份并发");
         drop(_g2);
+        assert!(!map.lock().contains_key(&key(7, "m1")), "归零条目移除");
+        assert_eq!(map.lock()[&key(7, "m2")], 1, "同用户其他模型不受影响");
         drop(_g3);
+        drop(_g4);
+        drop(_g5);
         assert!(
             map.lock().is_empty(),
-            "全部归还后条目应移除,表不得随历史用户增长"
+            "全部归还后条目应移除,表不得随历史用户×模型增长"
         );
     }
 
@@ -3358,7 +3397,7 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         let counter = Arc::new(std::sync::atomic::AtomicI64::new(0));
         let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let active = ActiveRequestGuard::enter(&counter);
-        let user_active = Some(UserActiveGuard::enter(&map, 42));
+        let user_active = Some(UserActiveGuard::enter(&map, 42, Some("m".into())));
         let resp = Response::builder()
             .status(StatusCode::OK)
             .body(Body::from("hello"))
@@ -3372,12 +3411,52 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         );
         // body 未消费 → guard 仍持有
         assert_eq!(counter.load(Ordering::Relaxed), 1);
-        assert_eq!(map.lock()[&42], 1);
+        assert_eq!(map.lock()[&(42, "m".to_string())], 1);
         let mut stream = resp.into_body().into_data_stream();
         while let Some(chunk) = stream.next().await {
             chunk.unwrap();
         }
         assert_eq!(counter.load(Ordering::Relaxed), 0, "流尽后全局计数归零");
         assert!(map.lock().is_empty(), "流尽后用户条目移除");
+    }
+
+    /// 入口解析（挂用户并发 guard 前的唯一一次解压+解析）：identity 直通、
+    /// gzip 解压、坏 JSON / 不支持编码 → 400；模型提取空/缺失 → None
+    #[test]
+    fn parse_request_json_at_entry_and_requested_model() {
+        use std::io::Write;
+        let raw = br#"{"model":"gpt-x","messages":[]}"#;
+        let json = parse_request_json(&Bytes::from_static(raw), &HeaderMap::new()).unwrap();
+        assert_eq!(requested_model(&json).as_deref(), Some("gpt-x"));
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(raw).unwrap();
+        let gz = enc.finish().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let json = parse_request_json(&Bytes::from(gz.clone()), &headers).unwrap();
+        assert_eq!(
+            requested_model(&json).as_deref(),
+            Some("gpt-x"),
+            "gzip 请求体解压后解析"
+        );
+
+        assert!(matches!(
+            parse_request_json(&Bytes::from_static(b"{not json"), &HeaderMap::new()),
+            Err(AppError::BadRequest(_))
+        ));
+        let mut bad = HeaderMap::new();
+        bad.insert(header::CONTENT_ENCODING, "lzma".parse().unwrap());
+        assert!(matches!(
+            parse_request_json(&Bytes::from(gz), &bad),
+            Err(AppError::BadRequest(_))
+        ));
+
+        assert_eq!(requested_model(&serde_json::json!({ "model": "" })), None);
+        assert_eq!(
+            requested_model(&serde_json::json!({ "messages": [] })),
+            None
+        );
+        assert_eq!(requested_model(&serde_json::json!({ "model": 1 })), None);
     }
 }
