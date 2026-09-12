@@ -359,6 +359,8 @@ export interface ModelRow {
   provider_id: number
   provider_name: string
   model_id: string
+  /** 启停：false = 该模型在该供应商不作为路由候选、不在 /v1/models 列出 */
+  enabled: boolean
   created_at: string
 }
 

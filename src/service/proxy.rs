@@ -812,6 +812,37 @@ async fn proxy_authed(
             route.model_pattern
         )));
     }
+    // P1-20：Claude Code 长上下文 `[1m]` 后缀剥离（路由未配置映射时防上游
+    // 404/400；cc-switch model_mapper.rs:163-186 同款）
+    let outbound_model: String = route.upstream_model.clone().unwrap_or_else(|| {
+        model
+            .strip_suffix("[1m]")
+            .map(str::to_string)
+            .unwrap_or_else(|| model.clone())
+    });
+    // 模型库启停：模型库记录的是上游侧模型名，按出站模型名剔除已禁用的
+    // (供应商, 模型) 候选——主上游被禁则走降级链，全部被禁显式 503
+    let candidates = {
+        let before = candidates.len();
+        let kept: Vec<_> = candidates
+            .into_iter()
+            .filter(|p| !crate::service::routing::model_disabled(st, p.id, &outbound_model))
+            .collect();
+        if kept.len() < before {
+            tracing::info!(
+                model = %model,
+                upstream_model = %outbound_model,
+                skipped = before - kept.len(),
+                "skipping candidates whose model is disabled in the model catalog"
+            );
+        }
+        kept
+    };
+    if candidates.is_empty() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "model '{model}' is disabled by the administrator"
+        )));
+    }
     // 用户访问授权：无规则=默认放行；有规则则过滤掉未授权候选（含降级链）；admin 跳过
     let candidates = match user_id {
         Some(uid) if !st.admin_ids.read().contains(&uid) => {
@@ -866,14 +897,6 @@ async fn proxy_authed(
         .upstream_model
         .clone()
         .unwrap_or_else(|| model.clone());
-    // P1-20：Claude Code 长上下文 `[1m]` 后缀剥离（路由未配置映射时防上游
-    // 404/400；cc-switch model_mapper.rs:163-186 同款）
-    let outbound_model: String = route.upstream_model.clone().unwrap_or_else(|| {
-        model
-            .strip_suffix("[1m]")
-            .map(str::to_string)
-            .unwrap_or_else(|| model.clone())
-    });
     // P1-3：客户端模型带 `[1m]` 后缀（无论是否被剥离映射）→ 原生 Anthropic
     // 上游需要 context-1m-2025-08-07 beta 才真正启用 1M 上下文
     let wants_1m = model.ends_with("[1m]") || outbound_model.ends_with("[1m]");

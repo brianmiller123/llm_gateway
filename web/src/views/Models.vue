@@ -12,6 +12,8 @@ const models = ref<ModelRow[]>([])
 const testing = ref(false)
 /** 单模型测试进行中（行 id） */
 const testingId = ref<number | null>(null)
+/** 启停切换进行中（行 id） */
+const togglingId = ref<number | null>(null)
 /** 测试全部结果弹窗 */
 const resultDialog = ref(false)
 const results = ref<ModelTestResult[]>([])
@@ -76,6 +78,28 @@ async function deleteModel(row: ModelRow) {
   }
 }
 
+/**
+ * 启停切换：禁用后该 (供应商, 模型) 不再作为路由候选、不在 /v1/models 列出；
+ * 路由规则与价格配置不受影响。el-switch 已乐观翻转 row.enabled，失败回滚。
+ */
+async function toggleEnabled(row: ModelRow) {
+  const next = row.enabled
+  togglingId.value = row.id
+  try {
+    await request(`/api/admin/models/${row.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    })
+    ElMessage.success(`「${row.model_id}」已${next ? '启用' : '禁用'}`)
+  } catch (e) {
+    row.enabled = !next
+    ElMessage.error(e instanceof Error ? e.message : '切换失败')
+  } finally {
+    togglingId.value = null
+  }
+}
+
 /** 单模型测试：发最小 chat 请求验证上游可用性 */
 async function testOne(row: ModelRow) {
   testingId.value = row.id
@@ -127,7 +151,7 @@ onMounted(loadModels)
 <template>
   <div class="page">
     <div class="toolbar">
-      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择</span>
+      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出</span>
       <div class="toolbar-actions">
         <el-button type="primary" :loading="testing" @click="testAll">
           <el-icon style="margin-right: 4px"><Cpu /></el-icon>
@@ -145,11 +169,21 @@ onMounted(loadModels)
       <el-table v-loading="loading" :data="models" stripe>
         <el-table-column prop="model_id" label="模型 ID" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">
-            <span class="mono">{{ row.model_id }}</span>
+            <span class="mono" :class="{ disabled: !row.enabled }">{{ row.model_id }}</span>
           </template>
         </el-table-column>
         <el-table-column label="供应商" min-width="130" show-overflow-tooltip>
           <template #default="{ row }">{{ row.provider_name }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="90" align="center">
+          <template #default="{ row }">
+            <el-switch
+              v-model="row.enabled"
+              :loading="togglingId === row.id"
+              :disabled="togglingId != null && togglingId !== row.id"
+              @change="toggleEnabled(row)"
+            />
+          </template>
         </el-table-column>
         <el-table-column label="创建时间" min-width="150">
           <template #default="{ row }">{{ fmt(row.created_at) }}</template>
@@ -226,5 +260,10 @@ onMounted(loadModels)
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 12px;
   word-break: break-all;
+}
+
+.mono.disabled {
+  color: #a8abb2;
+  text-decoration: line-through;
 }
 </style>

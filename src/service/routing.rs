@@ -22,6 +22,15 @@ pub fn matches_pattern(pattern: &str, model: &str) -> bool {
     }
 }
 
+/// 模型库启停：该供应商下的（上游侧）模型是否已被管理员禁用。
+/// 代理管线按出站模型名剔除候选，/v1/models 按目录行过滤——同一判定。
+pub fn model_disabled(st: &AppState, provider_id: i64, upstream_model: &str) -> bool {
+    st.disabled_models
+        .read()
+        .get(&provider_id)
+        .is_some_and(|models| models.contains(upstream_model))
+}
+
 /// 用户访问授权判定（白名单）：
 /// - admin 用户不受限
 /// - 用户无任何规则 = 默认放行（兼容既有账号）

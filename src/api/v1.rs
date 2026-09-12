@@ -212,10 +212,11 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         }));
     };
 
-    // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商的模型
+    // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商下已启用的模型
     let catalog: Vec<(String, i64)> = sqlx::query_as::<_, (String, i64)>(
         "SELECT m.model_id, m.provider_id FROM models m \
-         JOIN providers p ON p.id = m.provider_id AND p.enabled",
+         JOIN providers p ON p.id = m.provider_id AND p.enabled \
+         WHERE m.enabled",
     )
     .fetch_all(&st.pool)
     .await
@@ -226,17 +227,20 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         }
     }
 
-    // 2) 已启用路由的具体 pattern（通配符仅用于匹配，不对外列出）
+    // 2) 已启用路由的具体 pattern（通配符仅用于匹配，不对外列出）；
+    //    路由指向的供应商若在模型库中禁用了该（上游侧）模型则不计入
     let routes = st.routes.read();
     for r in routes.iter() {
         if r.model_pattern.ends_with('*') {
             continue;
         }
+        let upstream_model = r.upstream_model.as_deref().unwrap_or(&r.model_pattern);
         let providers = st
             .providers
             .read()
             .iter()
             .filter(|p| p.id == r.provider_id || r.fallback_ids.contains(&p.id))
+            .filter(|p| !crate::service::routing::model_disabled(&st, p.id, upstream_model))
             .cloned()
             .collect::<Vec<_>>();
         if providers.is_empty() {

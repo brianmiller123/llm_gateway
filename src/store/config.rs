@@ -495,17 +495,55 @@ pub struct AdminModel {
     pub provider_id: i64,
     pub provider_name: String,
     pub model_id: String,
+    /// 启停：false = 该模型在该供应商不作为路由候选、不在 /v1/models 列出
+    pub enabled: bool,
     pub created_at: DateTime<Utc>,
 }
 
+const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.created_at \
+     FROM models m JOIN providers p ON p.id = m.provider_id";
+
 pub async fn list_models(pool: &PgPool) -> Result<Vec<AdminModel>, sqlx::Error> {
-    sqlx::query_as::<_, AdminModel>(
-        "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.created_at \
-         FROM models m JOIN providers p ON p.id = m.provider_id \
-         ORDER BY p.name, m.model_id",
-    )
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, AdminModel>(&format!("{ADMIN_MODEL_SELECT} ORDER BY p.name, m.model_id"))
+        .fetch_all(pool)
+        .await
+}
+
+/// 模型启停；返回更新后的行（不存在 → None）
+pub async fn set_model_enabled(
+    pool: &PgPool,
+    id: i64,
+    enabled: bool,
+) -> Result<Option<AdminModel>, sqlx::Error> {
+    let res = sqlx::query("UPDATE models SET enabled = $2 WHERE id = $1")
+        .bind(id)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    sqlx::query_as::<_, AdminModel>(&format!("{ADMIN_MODEL_SELECT} WHERE m.id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// 已禁用模型：provider_id → 该供应商下已禁用的 model_id 集合——运行时缓存在
+/// AppState，代理管线按出站模型名过滤候选、/v1/models 过滤目录
+pub async fn load_disabled_models(
+    pool: &PgPool,
+) -> Result<std::collections::HashMap<i64, std::collections::HashSet<String>>, sqlx::Error> {
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT provider_id, model_id FROM models WHERE NOT enabled")
+            .fetch_all(pool)
+            .await?;
+    let mut out: std::collections::HashMap<i64, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (pid, model) in rows {
+        out.entry(pid).or_default().insert(model);
+    }
+    Ok(out)
 }
 
 /// 与 service::routing::matches_pattern 同语义：尾缀 `*` 前缀匹配或精确相等
@@ -516,7 +554,8 @@ fn pattern_hits(pattern: &str, model: &str) -> bool {
     }
 }
 
-/// 整表替换某供应商的模型列表（事务；测试连接/手动刷新时调用）
+/// 同步某供应商的模型列表（事务；测试连接/手动刷新时调用）：上游已不存在的
+/// 模型删除，仍存在的保留原行（启停状态、创建时间不变），新模型插入（默认启用）。
 /// 同时为模型库中无任何已启用路由可命中的模型自动创建精确路由（兜底：
 /// 列表中的模型必须可调用；已有通配/精确路由的模型不受影响，尊重手动配置）。
 /// 返回写入的模型数
@@ -526,8 +565,10 @@ pub async fn replace_provider_models(
     models: &[String],
 ) -> Result<usize, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM models WHERE provider_id = $1")
+    // 整表删除重插会把管理员的禁用状态一并抹掉——只删上游已不再返回的模型
+    sqlx::query("DELETE FROM models WHERE provider_id = $1 AND NOT (model_id = ANY($2))")
         .bind(provider_id)
+        .bind(models)
         .execute(&mut *tx)
         .await?;
     let enabled_patterns: Vec<(String,)> =
@@ -887,4 +928,111 @@ pub async fn save_smtp_settings(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn seed_provider(pool: &PgPool, name: &str) -> AdminProvider {
+        create_provider(
+            pool,
+            name,
+            "openai",
+            "https://example.invalid/v1",
+            "",
+            30_000,
+            true,
+            &serde_json::json!({}),
+            "bearer",
+            &serde_json::json!({}),
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn models_of(rows: &[AdminModel], provider_id: i64) -> Vec<(String, bool)> {
+        rows.iter()
+            .filter(|m| m.provider_id == provider_id)
+            .map(|m| (m.model_id.clone(), m.enabled))
+            .collect()
+    }
+
+    /// 模型库启停：默认启用；set_model_enabled 落库并回带供应商名、不存在 → None；
+    /// 刷新只删上游不再返回的模型——仍在列表的保留原行（禁用状态与 id 不变）、
+    /// 新模型默认启用；禁用集合按供应商分组，同名模型在另一供应商不受影响；
+    /// 空列表刷新清空该供应商
+    #[sqlx::test(migrations = "./migrations")]
+    async fn model_enabled_survives_refresh_and_loads_disabled_set(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        let p2 = seed_provider(&pool, "p2").await;
+        let s = |v: &[&str]| v.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        replace_provider_models(&pool, p1.id, &s(&["a", "b", "c"]))
+            .await
+            .unwrap();
+        replace_provider_models(&pool, p2.id, &s(&["b"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        assert!(rows.iter().all(|m| m.enabled), "入库默认启用");
+        assert!(load_disabled_models(&pool).await.unwrap().is_empty());
+
+        let b = rows
+            .iter()
+            .find(|m| m.provider_id == p1.id && m.model_id == "b")
+            .unwrap()
+            .clone();
+        let updated = set_model_enabled(&pool, b.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.provider_name, "p1", "返回行带供应商名");
+        assert!(
+            set_model_enabled(&pool, i64::MAX, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "不存在 → None"
+        );
+
+        // 刷新：b 仍在（保留禁用）、c 下架（删除）、d 新增（默认启用）
+        replace_provider_models(&pool, p1.id, &s(&["a", "b", "d"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        assert_eq!(
+            models_of(&rows, p1.id),
+            vec![
+                ("a".to_string(), true),
+                ("b".to_string(), false),
+                ("d".to_string(), true)
+            ],
+            "刷新保留禁用状态、删除下架模型、新模型默认启用"
+        );
+        let b_after = rows
+            .iter()
+            .find(|m| m.provider_id == p1.id && m.model_id == "b")
+            .unwrap();
+        assert_eq!(b_after.id, b.id, "仍在列表的模型保留原行, id 不变");
+
+        let disabled = load_disabled_models(&pool).await.unwrap();
+        assert_eq!(disabled.len(), 1);
+        assert!(disabled[&p1.id].contains("b"));
+        assert!(
+            !disabled.contains_key(&p2.id),
+            "同名模型 b 在 p2 仍启用, 禁用按 (供应商, 模型) 独立"
+        );
+
+        replace_provider_models(&pool, p1.id, &[]).await.unwrap();
+        assert!(
+            models_of(&list_models(&pool).await.unwrap(), p1.id).is_empty(),
+            "空列表刷新清空该供应商模型"
+        );
+        assert!(
+            load_disabled_models(&pool).await.unwrap().is_empty(),
+            "禁用行随下架一并清理"
+        );
+    }
 }

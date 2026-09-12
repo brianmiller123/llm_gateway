@@ -31,6 +31,10 @@ pub struct AppState {
     pub plans: Arc<RwLock<HashMap<i64, Vec<crate::store::plans::PlanRuntime>>>>,
     /// 管理员用户 id 集合（授权检查时跳过）
     pub admin_ids: Arc<RwLock<HashSet<i64>>>,
+    /// 模型库中已禁用的模型：provider_id → model_id 集合。代理管线按出站模型名
+    /// 剔除候选供应商（全部被剔 → 503），/v1/models 不列出。模型库启停后 reload
+    /// 即时生效
+    pub disabled_models: Arc<RwLock<HashMap<i64, HashSet<String>>>>,
     /// M3：进程内每渠道熔断器（连续可重试失败 → 短窗跳过；仅内存态）
     pub breaker: Arc<crate::service::breaker::Breaker>,
     pub limiter: Arc<RateLimiter>,
@@ -108,6 +112,7 @@ impl AppState {
             user_access: Arc::new(RwLock::new(HashMap::new())),
             plans: Arc::new(RwLock::new(HashMap::new())),
             admin_ids: Arc::new(RwLock::new(HashSet::new())),
+            disabled_models: Arc::new(RwLock::new(HashMap::new())),
             breaker: Arc::new(crate::service::breaker::Breaker::new_with(breaker_cfg)),
             limiter: Arc::new(RateLimiter::new()),
             ldap: Arc::new(RwLock::new(ldap)),
@@ -221,6 +226,11 @@ impl AppState {
         section!("admin_ids", async {
             let v: HashSet<i64> = crate::store::users::load_admin_ids(&self.pool).await?;
             *self.admin_ids.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("disabled_models", async {
+            let v = crate::store::config::load_disabled_models(&self.pool).await?;
+            *self.disabled_models.write() = v;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("plans", async {

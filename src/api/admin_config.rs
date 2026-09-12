@@ -112,7 +112,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/models/{id}",
-            delete(delete_model).layer(admin.clone()),
+            patch(update_model)
+                .delete(delete_model)
+                .layer(admin.clone()),
         )
         .route(
             "/api/admin/settings/ldap/test",
@@ -275,6 +277,8 @@ async fn delete_model(
     {
         return Err(AppError::BadRequest("model not found".into()));
     }
+    // 删除的可能是已禁用行：即时刷新禁用集合，避免残留条目误拦指向它的路由
+    st.reload().await.map_err(AppError::internal)?;
     audit::log(
         &st.pool,
         Some(admin.0.id),
@@ -286,6 +290,41 @@ async fn delete_model(
     .await
     .map_err(AppError::internal)?;
     Ok(Json(json!({ "deleted": true })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ModelPatch {
+    enabled: bool,
+}
+
+/// 模型启停：禁用后该 (供应商, 模型) 不再作为路由候选、不在 /v1/models 列出；
+/// 路由规则与价格配置不受影响。reload 即时生效。
+async fn update_model(
+    State(st): State<AppState>,
+    admin: Admin,
+    Path(id): Path<i64>,
+    Json(req): Json<ModelPatch>,
+) -> Result<Response, AppError> {
+    let model = config::set_model_enabled(&st.pool, id, req.enabled)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
+    st.reload().await.map_err(AppError::internal)?;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        if req.enabled {
+            "model.enable"
+        } else {
+            "model.disable"
+        },
+        Some("model"),
+        Some(id),
+        Some(json!({ "provider_id": model.provider_id, "model_id": model.model_id })),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({ "model": model })).into_response())
 }
 
 /// 对全部启用中的供应商并发拉取 /models 并写入模型库；
@@ -423,7 +462,9 @@ async fn test_models(
                 .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
             vec![m]
         }
-        None => models,
+        // 测试全部跳过已禁用模型（管理员已明确停用，不再耗上游调用）；
+        // 单模型测试不受限——显式指定即视为诊断意图
+        None => models.into_iter().filter(|m| m.enabled).collect(),
     };
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
