@@ -55,6 +55,8 @@ interface RateForm {
   model: string
   rpm: number | null
   burst: number | null
+  /** 并发上限（0 = 不限） */
+  concurrency: number | null
   enabled: boolean
 }
 
@@ -65,6 +67,7 @@ const rateForm = reactive<RateForm>({
   model: '',
   rpm: 60,
   burst: 10,
+  concurrency: 0,
   enabled: true,
 })
 
@@ -75,6 +78,7 @@ function resetRateForm() {
   rateForm.model = ''
   rateForm.rpm = 60
   rateForm.burst = 10
+  rateForm.concurrency = 0
   rateForm.enabled = true
 }
 
@@ -90,6 +94,7 @@ function openEditRate(row: RateRuleRow) {
   rateForm.model = row.model ?? ''
   rateForm.rpm = row.rpm
   rateForm.burst = row.burst
+  rateForm.concurrency = row.concurrency
   rateForm.enabled = row.enabled
   rateVisible.value = true
 }
@@ -116,6 +121,10 @@ async function submitRate() {
     ElMessage.warning('突发上限必须为大于 0 的数字')
     return
   }
+  if (rateForm.concurrency === null || rateForm.concurrency < 0 || !Number.isInteger(rateForm.concurrency)) {
+    ElMessage.warning('并发上限必须为不小于 0 的整数（0 = 不限）')
+    return
+  }
   rateSaving.value = true
   try {
     const payload = {
@@ -126,6 +135,7 @@ async function submitRate() {
       model: rateForm.model.trim() || null,
       rpm: rateForm.rpm,
       burst: rateForm.burst,
+      concurrency: rateForm.concurrency,
       enabled: rateForm.enabled,
     }
     if (rateForm.id === null) {
@@ -274,7 +284,7 @@ onMounted(loadQuotas)
     <el-tabs v-model="activeTab">
       <el-tab-pane label="限流规则" name="rate">
         <div class="toolbar">
-          <span class="desc">令牌桶：api_key &gt; user &gt; global 命中即拒，超限返回 429+Retry-After；可选模型限定（按客户端模型名精确匹配，独立计量）</span>
+          <span class="desc">令牌桶 + 并发上限：api_key &gt; user &gt; global 命中即拒，超限返回 429+Retry-After；可选模型限定（按客户端模型名精确匹配，独立计量）</span>
           <el-button type="primary" @click="openCreateRate">
             <el-icon><Plus /></el-icon>
             <span>新建规则</span>
@@ -301,6 +311,12 @@ onMounted(loadQuotas)
             </el-table-column>
             <el-table-column prop="rpm" label="每分钟请求数" min-width="140" />
             <el-table-column prop="burst" label="突发上限" min-width="120" />
+            <el-table-column label="并发上限" width="100" align="right">
+              <template #default="{ row }">
+                <span v-if="row.concurrency > 0">{{ row.concurrency }}</span>
+                <span v-else class="sub">不限</span>
+              </template>
+            </el-table-column>
             <el-table-column label="状态" width="80">
               <template #default="{ row }">
                 <el-tag :type="row.enabled ? 'success' : 'danger'" size="small">
@@ -349,9 +365,10 @@ onMounted(loadQuotas)
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="90" fixed="right">
+            <el-table-column label="操作" width="130" fixed="right">
               <template #default="{ row }">
-                <el-button link type="primary" @click="openEditQuota(row)">编辑</el-button>
+                <el-button v-if="!row.protected" link type="primary" @click="openEditQuota(row)">编辑</el-button>
+                <span v-else class="sub">内置管理员</span>
               </template>
             </el-table-column>
             <template #empty>
@@ -418,6 +435,17 @@ onMounted(loadQuotas)
             placeholder="令牌桶容量"
             style="width: 100%"
           />
+        </el-form-item>
+        <el-form-item label="并发上限">
+          <el-input-number
+            v-model="rateForm.concurrency"
+            :min="0"
+            :step="1"
+            :controls="false"
+            placeholder="0 = 不限并发"
+            style="width: 100%"
+          />
+          <div class="form-tip">同时在途的请求数上限：从进入管线起计数，响应流式传输结束（或客户端断开）后释放；0 = 不限。多条规则叠加时须全部未满。</div>
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="rateForm.enabled" />

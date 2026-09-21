@@ -16,6 +16,9 @@ pub enum AppError {
     Forbidden(String),
     #[error("rate limited, retry after {0}s")]
     RateLimited(f64),
+    /// 并发上限（在途请求数）满：与 RateLimited 同为 429，但消息可区分
+    #[error("concurrency limit exceeded, retry after {0}s")]
+    ConcurrentLimited(f64),
     #[error("monthly quota exceeded")]
     QuotaExceeded,
     /// Coding Plan 周期配额耗尽且策略为拦截（429 insufficient_quota）
@@ -87,6 +90,16 @@ impl IntoResponse for AppError {
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate_limit_exceeded",
                         format!("Rate limit exceeded, retry after {retry}s"),
+                        Some(retry),
+                    )
+                }
+                AppError::ConcurrentLimited(secs) => {
+                    // 同 RateLimited：钳制 [1, 86400]，防溢出/巨值直达客户端
+                    let retry = secs.ceil().max(1.0).min(86400.0) as u64;
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_exceeded",
+                        format!("Concurrency limit exceeded, retry after {retry}s"),
                         Some(retry),
                     )
                 }

@@ -133,7 +133,20 @@ pub async fn load_admin_ids(pool: &PgPool) -> Result<HashSet<i64>, sqlx::Error> 
     let rows: Vec<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE is_admin AND status = 1")
         .fetch_all(pool)
         .await?;
+
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 设置管理员身份。即时生效：控制台中间件每请求查库，代理路径靠 reload 刷新
+/// admin_ids 缓存（调用方负责）。LDAP 登录 JIT 会按目录组重算，手动设置对
+/// source='ldap' 用户仅存活到其下次登录。
+pub async fn set_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET is_admin = $1 WHERE id = $2")
+        .bind(is_admin)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 /// 是否存在本地管理员（break-glass 种子判断）

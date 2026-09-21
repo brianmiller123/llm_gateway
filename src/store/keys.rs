@@ -24,6 +24,14 @@ pub async fn find_by_prefix(pool: &PgPool, prefix: &str) -> Result<Option<ApiKey
     .await
 }
 
+/// Key 归属用户 id（限流规则定向守卫用）
+pub async fn find_owner_user_id(pool: &PgPool, key_id: i64) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT user_id FROM api_keys WHERE id = $1")
+        .bind(key_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// 自助 Key 列表（仅启用的，不含哈希）
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct KeyMeta {

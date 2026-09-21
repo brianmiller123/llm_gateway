@@ -27,7 +27,11 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
     }
 
     let ldap_settings = st.ldap.read().clone();
-    if ldap_settings.is_configured() {
+    // break-glass 管理员仅走本地密码：目录同名用户的 LDAP 登录会经 upsert_ldap_user
+    // 改写 is_admin/source，可能把唯一管理入口降级。跳过目录分支（含 BadCredentials
+    // 不回退的防枚举语义），始终落到本地密码验证。
+    let skip_ldap = crate::api::console::is_protected_admin(&st.cfg, username);
+    if ldap_settings.is_configured() && !skip_ldap {
         match ldap::authenticate(&ldap_settings, username, password).await {
             Ok(identity) => {
                 let user = users::upsert_ldap_user(

@@ -99,6 +99,14 @@ pub fn error_response(err: &AppError) -> Response {
                 secs.ceil().max(1.0) as u64
             ),
         ),
+        AppError::ConcurrentLimited(secs) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            format!(
+                "Concurrency limit exceeded, retry after {}s",
+                secs.ceil().max(1.0) as u64
+            ),
+        ),
         AppError::QuotaExceeded => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
@@ -127,7 +135,9 @@ pub fn error_response(err: &AppError) -> Response {
     };
 
     let retry_after: Option<u64> = match err {
-        AppError::RateLimited(secs) => Some(secs.ceil().max(1.0).min(86400.0) as u64),
+        AppError::RateLimited(secs) | AppError::ConcurrentLimited(secs) => {
+            Some(secs.ceil().max(1.0).min(86400.0) as u64)
+        }
         AppError::PlanQuotaExceeded(_, retry) => *retry,
         _ => None,
     };

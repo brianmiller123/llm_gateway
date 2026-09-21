@@ -2,6 +2,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
+      TZ: Asia/Shanghai
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: gateway
       POSTGRES_DB: llm_gateway
@@ -28,6 +29,9 @@ services:
       - "8443:443"
       - "8080:80"
     environment:
+      # 容器时区：chrono::Local（Plan 时段窗判定/价格生效日）与容器日志用它；
+      # environment 优先级高于 env_file，覆盖 .env 中可能的 TZ
+      TZ: Asia/Shanghai
       # 覆盖 .env 中的本机开发地址/连接串（容器内必须 0.0.0.0 才能端口映射；DB 走 compose 网络）
       GATEWAY_DATABASE_URL: postgres://gateway:gateway@postgres:5432/llm_gateway
       GATEWAY_TLS_CERT: /certs/cert.pem

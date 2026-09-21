@@ -9,6 +9,8 @@ pub struct RateRule {
     pub burst: i32,
     /// 模型限定（NULL = 所有模型）；按客户端请求的模型名精确匹配
     pub model: Option<String>,
+    /// 并发上限（在途请求数；0 = 不限）
+    pub concurrency: i32,
 }
 
 /// 用户月度配额
@@ -33,7 +35,7 @@ pub struct ModelPrice {
 
 pub async fn load_rules(pool: &PgPool) -> Result<Vec<RateRule>, sqlx::Error> {
     sqlx::query_as::<_, RateRule>(
-        "SELECT scope, scope_id, rpm, burst, model FROM rate_limit_rules WHERE enabled = TRUE",
+        "SELECT scope, scope_id, rpm, burst, model, concurrency FROM rate_limit_rules WHERE enabled = TRUE",
     )
     .fetch_all(pool)
     .await

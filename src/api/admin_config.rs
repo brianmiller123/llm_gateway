@@ -1116,6 +1116,9 @@ struct RateLimitReq {
     rpm: i32,
     #[serde(default = "default_burst")]
     burst: i32,
+    /// 并发上限（在途请求数；0 = 不限）
+    #[serde(default)]
+    concurrency: i32,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -1148,6 +1151,34 @@ async fn list_rate_limits(State(st): State<AppState>, _a: Admin) -> Result<Respo
     Ok(Json(json!({"rules": rules})).into_response())
 }
 
+/// 定向限制守卫：用户/Key 维度的限流·并发规则不得指向受保护管理员——
+/// 否则绕过用户管理守卫，直接锁死唯一管理入口的代理访问（429）。
+async fn ensure_rule_target_allowed(
+    st: &AppState,
+    scope: &str,
+    scope_id: Option<i64>,
+) -> Result<(), AppError> {
+    match scope {
+        "user" => {
+            if let Some(sid) = scope_id {
+                crate::api::console::ensure_not_protected_by_id(st, sid).await?;
+            }
+        }
+        "api_key" => {
+            if let Some(kid) = scope_id {
+                if let Some(uid) = crate::store::keys::find_owner_user_id(&st.pool, kid)
+                    .await
+                    .map_err(AppError::internal)?
+                {
+                    crate::api::console::ensure_not_protected_by_id(st, uid).await?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn create_rate_limit(
     State(st): State<AppState>,
     admin: Admin,
@@ -1159,8 +1190,12 @@ async fn create_rate_limit(
             "scope must be global | user | api_key".into(),
         ));
     }
+    ensure_rule_target_allowed(&st, &scope, req.scope_id).await?;
     if req.rpm <= 0 || req.burst <= 0 {
         return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
+    }
+    if req.concurrency < 0 {
+        return Err(AppError::BadRequest("concurrency must be >= 0 (0 = unlimited)".into()));
     }
     let model = normalize_rule_model(req.model.as_deref())?;
     let rule = config::create_rate_rule(
@@ -1170,6 +1205,7 @@ async fn create_rate_limit(
         model.as_deref(),
         req.rpm,
         req.burst,
+        req.concurrency,
         req.enabled,
     )
     .await
@@ -1197,6 +1233,7 @@ struct RateLimitPatch {
     model: Option<Option<String>>,
     rpm: Option<i32>,
     burst: Option<i32>,
+    concurrency: Option<i32>,
     enabled: Option<bool>,
 }
 
@@ -1217,6 +1254,23 @@ async fn update_rate_limit(
     if req.rpm.is_some_and(|v| v <= 0) || req.burst.is_some_and(|v| v <= 0) {
         return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
     }
+    let old = config::list_rate_rules(&st.pool)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| AppError::BadRequest("rate limit rule not found".into()))?;
+    let final_scope = req
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_string)
+        .unwrap_or_else(|| old.scope.clone());
+    let final_scope_id = match req.scope_id {
+        Some(v) => v,
+        None => old.scope_id,
+    };
+    ensure_rule_target_allowed(&st, &final_scope, final_scope_id).await?;
     let model = match req.model {
         None => None,
         Some(m) => Some(normalize_rule_model(m.as_deref())?),
@@ -1229,6 +1283,7 @@ async fn update_rate_limit(
         model.as_ref().map(|m| m.as_deref()),
         req.rpm,
         req.burst,
+        req.concurrency,
         req.enabled,
     )
     .await
@@ -1279,6 +1334,19 @@ async fn list_quotas(State(st): State<AppState>, _a: Admin) -> Result<Response, 
     let quotas = config::list_quotas(&st.pool)
         .await
         .map_err(AppError::internal)?;
+    let quotas: Vec<serde_json::Value> = quotas
+        .into_iter()
+        .map(|q| {
+            let mut v = serde_json::to_value(&q).map_err(AppError::internal)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "protected".into(),
+                    json!(crate::api::console::is_protected_admin(&st.cfg, &q.username)),
+                );
+            }
+            Ok(v)
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
     Ok(Json(json!({"quotas": quotas})).into_response())
 }
 
@@ -1315,6 +1383,7 @@ async fn upsert_quota(
             return Err(AppError::BadRequest("billing_day must be 1-28".into()));
         }
     }
+    crate::api::console::ensure_not_protected_by_id(&st, user_id).await?;
     let quota = config::upsert_quota(
         &st.pool,
         user_id,
@@ -1890,7 +1959,10 @@ fn app_error_status(e: &AppError) -> u16 {
         AppError::WithRequestId { inner, .. } => app_error_status(inner),
         AppError::Auth(_) | AppError::Unauthorized(_) => 401,
         AppError::Forbidden(_) => 403,
-        AppError::RateLimited(_) | AppError::QuotaExceeded | AppError::PlanQuotaExceeded(..) => 429,
+        AppError::RateLimited(_)
+        | AppError::ConcurrentLimited(_)
+        | AppError::QuotaExceeded
+        | AppError::PlanQuotaExceeded(..) => 429,
         AppError::BadRequest(_) => 400,
         AppError::Conflict(_) => 409,
         AppError::Internal(_) => 500,

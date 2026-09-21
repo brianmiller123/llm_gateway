@@ -186,7 +186,7 @@ async fn login(
         "refresh_token": session.refresh_token,
         "token_type": "Bearer",
         "expires_in": st.cfg.access_token_ttl,
-        "user": user_json(&session.user),
+        "user": user_json(&st, &session.user),
     })))
 }
 
@@ -205,7 +205,7 @@ async fn refresh(
         "refresh_token": session.refresh_token,
         "token_type": "Bearer",
         "expires_in": st.cfg.access_token_ttl,
-        "user": user_json(&session.user),
+        "user": user_json(&st, &session.user),
     })))
 }
 
@@ -242,7 +242,7 @@ async fn me(State(st): State<AppState>, user: ConsoleUser) -> Result<impl IntoRe
             .map_err(AppError::internal)?;
 
     Ok(Json(json!({
-        "user": user_json(&user.user),
+        "user": user_json(&st, &user.user),
         "usage": {
             "month": month,
             "tokens": monthly.map(|m| m.0).unwrap_or(0),
@@ -751,15 +751,15 @@ struct UserTrend {
 #[derive(serde::Deserialize)]
 struct TrendParams {
     days: Option<i64>,
-    /// day（按天，默认）或 half_hour（近 24 小时每 30 分钟）
+    /// day（按天，默认）/ half_hour（近 24 小时每 30 分钟）/ minute（近 60 分钟每分钟）
     granularity: Option<String>,
     /// 按模型过滤（空/缺省 = 全部模型）
     model: Option<String>,
 }
 
-/// 每 30 分钟趋势点（近 24h 用；stat_date 为对齐后的桶起点 UTC）
-#[derive(sqlx::FromRow, serde::Serialize)]
-struct HalfHourPoint {
+/// 统计桶趋势点（half_hour / minute 共用；stat_date 为对齐后的桶起点 UTC）
+#[derive(sqlx::FromRow, serde::Serialize, Clone)]
+struct BucketPoint {
     stat_date: chrono::DateTime<Utc>,
     call_count: i64,
     input_tokens: i64,
@@ -767,31 +767,29 @@ struct HalfHourPoint {
     cost: f64,
 }
 
-/// 近 24h 每 30 分钟桶补零到完整 48 点（与当前桶对齐）
-fn fill_half_hour_gaps(rows: Vec<HalfHourPoint>) -> Vec<HalfHourPoint> {
-    let now_ts = Utc::now().timestamp();
-    let bucket_now = now_ts - now_ts.rem_euclid(1800);
-    let start = bucket_now - 47 * 1800;
-    let mut out = Vec::with_capacity(48);
+/// 桶补零到完整 count 点（与当前桶对齐；now_ts 注入便于测试）
+fn fill_bucket_gaps_at(
+    rows: Vec<BucketPoint>,
+    now_ts: i64,
+    bucket_secs: i64,
+    count: i64,
+) -> Vec<BucketPoint> {
+    let bucket_now = now_ts - now_ts.rem_euclid(bucket_secs);
+    let start = bucket_now - (count - 1) * bucket_secs;
+    let mut out = Vec::with_capacity(count as usize);
     let mut it = rows.into_iter();
     let mut next = it.next();
-    for i in 0..48 {
-        let ts = start + i * 1800;
+    for i in 0..count {
+        let ts = start + i * bucket_secs;
         let date = chrono::DateTime::from_timestamp(ts, 0).expect("valid ts");
         if let Some(p) = next.as_ref() {
             if p.stat_date.timestamp() == ts {
-                out.push(HalfHourPoint {
-                    stat_date: p.stat_date,
-                    call_count: p.call_count,
-                    input_tokens: p.input_tokens,
-                    output_tokens: p.output_tokens,
-                    cost: p.cost,
-                });
+                out.push(p.clone());
                 next = it.next();
                 continue;
             }
         }
-        out.push(HalfHourPoint {
+        out.push(BucketPoint {
             stat_date: date,
             call_count: 0,
             input_tokens: 0,
@@ -802,29 +800,39 @@ fn fill_half_hour_gaps(rows: Vec<HalfHourPoint>) -> Vec<HalfHourPoint> {
     out
 }
 
-/// 近 24h 每 30 分钟趋势（user_id 为 Some 时限定单用户；model 为 Some 时限定模型）
-async fn fetch_trend_half_hour(
+fn fill_bucket_gaps(rows: Vec<BucketPoint>, bucket_secs: i64, count: i64) -> Vec<BucketPoint> {
+    fill_bucket_gaps_at(rows, Utc::now().timestamp(), bucket_secs, count)
+}
+
+/// 近 count 个 bucket_secs 桶趋势（user_id 为 Some 时限定单用户；model 为 Some 时限定模型）。
+/// 窗口取 count*bucket_secs 秒，覆盖含当前桶在内的全部 count 个桶。
+async fn fetch_trend_bucket(
     pool: &sqlx::PgPool,
     user_id: Option<i64>,
     model: Option<&str>,
-) -> Result<Vec<HalfHourPoint>, AppError> {
-    let rows: Vec<HalfHourPoint> = sqlx::query_as(
-        "SELECT to_timestamp(floor(extract(epoch FROM created_at) / 1800) * 1800) AS stat_date, \
+    bucket_secs: i64,
+    count: i64,
+) -> Result<Vec<BucketPoint>, AppError> {
+    let rows: Vec<BucketPoint> = sqlx::query_as(
+        "SELECT to_timestamp(floor(extract(epoch FROM created_at) / $3) * $3) AS stat_date, \
                 COUNT(*)::bigint AS call_count, \
                 COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens, \
                 COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens, \
                 COALESCE(SUM(cost), 0)::float8 AS cost \
          FROM usage_logs \
-         WHERE created_at >= now() - interval '24 hours' AND ($1::bigint IS NULL OR user_id = $1) \
+         WHERE created_at >= now() - ($4::bigint * interval '1 second') \
+           AND ($1::bigint IS NULL OR user_id = $1) \
            AND ($2::text IS NULL OR model = $2) \
          GROUP BY 1 ORDER BY 1",
     )
     .bind(user_id)
     .bind(model)
+    .bind(bucket_secs)
+    .bind(count * bucket_secs)
     .fetch_all(pool)
     .await
     .map_err(AppError::internal)?;
-    Ok(fill_half_hour_gaps(rows))
+    Ok(fill_bucket_gaps(rows, bucket_secs, count))
 }
 
 /// 拉取近 N 天按日趋势（补零；user_id 为 Some 时限定单用户；model 为 Some 时限定模型）
@@ -955,18 +963,18 @@ async fn fetch_trend_by_user(
     Ok(users)
 }
 
-/// 单个用户的半小时趋势序列（管理员视图）
+/// 单个用户的桶状趋势序列（管理员视图，half_hour / minute 共用）
 #[derive(serde::Serialize)]
-struct UserTrendHalfHour {
+struct UserTrendBucket {
     user_id: i64,
     username: String,
     display_name: Option<String>,
-    daily: Vec<HalfHourPoint>,
+    daily: Vec<BucketPoint>,
 }
 
-/// 近 24h 按用户每 30 分钟序列（平铺行 + 分组补零到 48 点）
+/// 近 count 个 bucket_secs 桶按用户序列（平铺行 + 分组补零）
 #[derive(sqlx::FromRow)]
-struct UserHalfHourRow {
+struct UserBucketRow {
     user_id: i64,
     username: String,
     display_name: Option<String>,
@@ -977,35 +985,35 @@ struct UserHalfHourRow {
     cost: f64,
 }
 
-async fn fetch_trend_by_user_half_hour(
+async fn fetch_trend_by_user_bucket(
     pool: &sqlx::PgPool,
     model: Option<&str>,
-) -> Result<Vec<UserTrendHalfHour>, AppError> {
-    let rows: Vec<UserHalfHourRow> = sqlx::query_as(
+    bucket_secs: i64,
+    count: i64,
+) -> Result<Vec<UserTrendBucket>, AppError> {
+    let rows: Vec<UserBucketRow> = sqlx::query_as(
         "SELECT l.user_id, usr.username, usr.display_name, \
-                to_timestamp(floor(extract(epoch FROM l.created_at) / 1800) * 1800) AS stat_date, \
+                to_timestamp(floor(extract(epoch FROM l.created_at) / $2) * $2) AS stat_date, \
                 COUNT(*)::bigint AS call_count, \
                 COALESCE(SUM(l.input_tokens), 0)::bigint AS input_tokens, \
                 COALESCE(SUM(l.output_tokens), 0)::bigint AS output_tokens, \
                 COALESCE(SUM(l.cost), 0)::float8 AS cost \
          FROM usage_logs l JOIN users usr ON usr.id = l.user_id \
-         WHERE l.created_at >= now() - interval '24 hours' \
+         WHERE l.created_at >= now() - ($3::bigint * interval '1 second') \
            AND ($1::text IS NULL OR l.model = $1) \
          GROUP BY l.user_id, usr.username, usr.display_name, 4 ORDER BY l.user_id, 4",
     )
     .bind(model)
+    .bind(bucket_secs)
+    .bind(count * bucket_secs)
     .fetch_all(pool)
     .await
     .map_err(AppError::internal)?;
 
-    let now_ts = Utc::now().timestamp();
-    let bucket_now = now_ts - now_ts.rem_euclid(1800);
-    let start = bucket_now - 47 * 1800;
-
-    let mut users: Vec<UserTrendHalfHour> = Vec::new();
+    let mut users: Vec<UserTrendBucket> = Vec::new();
     for row in rows {
         if users.last().map(|u| u.user_id) != Some(row.user_id) {
-            users.push(UserTrendHalfHour {
+            users.push(UserTrendBucket {
                 user_id: row.user_id,
                 username: row.username,
                 display_name: row.display_name,
@@ -1013,7 +1021,7 @@ async fn fetch_trend_by_user_half_hour(
             });
         }
         let cur = users.last_mut().expect("just pushed");
-        cur.daily.push(HalfHourPoint {
+        cur.daily.push(BucketPoint {
             stat_date: row.stat_date,
             call_count: row.call_count,
             input_tokens: row.input_tokens,
@@ -1022,42 +1030,7 @@ async fn fetch_trend_by_user_half_hour(
         });
     }
     for u in &mut users {
-        let mut filled = Vec::with_capacity(48);
-        let mut it = u.daily.iter();
-        let mut next = it.next();
-        for i in 0..48 {
-            let ts = start + i * 1800;
-            let date = chrono::DateTime::from_timestamp(ts, 0).expect("valid ts");
-            if let Some(p) = next {
-                if p.stat_date.timestamp() == ts {
-                    filled.push(HalfHourPoint {
-                        stat_date: p.stat_date,
-                        call_count: p.call_count,
-                        input_tokens: p.input_tokens,
-                        output_tokens: p.output_tokens,
-                        cost: p.cost,
-                    });
-                    next = it.next();
-                } else {
-                    filled.push(HalfHourPoint {
-                        stat_date: date,
-                        call_count: 0,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cost: 0.0,
-                    });
-                }
-            } else {
-                filled.push(HalfHourPoint {
-                    stat_date: date,
-                    call_count: 0,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cost: 0.0,
-                });
-            }
-        }
-        u.daily = filled;
+        u.daily = fill_bucket_gaps(std::mem::take(&mut u.daily), bucket_secs, count);
     }
     Ok(users)
 }
@@ -1090,10 +1063,20 @@ async fn usage_trend(
         .filter(|m| !m.is_empty());
     let models = fetch_models(&st.pool, Some(user.user.id)).await?;
     if params.granularity.as_deref() == Some("half_hour") {
-        let daily = fetch_trend_half_hour(&st.pool, Some(user.user.id), model).await?;
+        let daily = fetch_trend_bucket(&st.pool, Some(user.user.id), model, 1800, 48).await?;
         return Ok(Json(json!({
             "days": 1,
             "granularity": "half_hour",
+            "daily": daily,
+            "by_user": [],
+            "models": models,
+        })));
+    }
+    if params.granularity.as_deref() == Some("minute") {
+        let daily = fetch_trend_bucket(&st.pool, Some(user.user.id), model, 60, 60).await?;
+        return Ok(Json(json!({
+            "days": 1,
+            "granularity": "minute",
             "daily": daily,
             "by_user": [],
             "models": models,
@@ -1109,7 +1092,7 @@ async fn usage_trend(
     })))
 }
 
-/// 管理员用量趋势：全站 + 按用户（近 N 天按日 / 近 24h 每 30 分钟）
+/// 管理员用量趋势：全站 + 按用户（近 N 天按日 / 近 24h 每 30 分钟 / 近 60 分钟每分钟）
 async fn admin_usage_trend(
     State(st): State<AppState>,
     Query(params): Query<TrendParams>,
@@ -1124,11 +1107,22 @@ async fn admin_usage_trend(
         .filter(|m| !m.is_empty());
     let models = fetch_models(&st.pool, None).await?;
     if params.granularity.as_deref() == Some("half_hour") {
-        let daily = fetch_trend_half_hour(&st.pool, None, model).await?;
-        let by_user = fetch_trend_by_user_half_hour(&st.pool, model).await?;
+        let daily = fetch_trend_bucket(&st.pool, None, model, 1800, 48).await?;
+        let by_user = fetch_trend_by_user_bucket(&st.pool, model, 1800, 48).await?;
         return Ok(Json(json!({
             "days": 1,
             "granularity": "half_hour",
+            "daily": daily,
+            "by_user": by_user,
+            "models": models,
+        })));
+    }
+    if params.granularity.as_deref() == Some("minute") {
+        let daily = fetch_trend_bucket(&st.pool, None, model, 60, 60).await?;
+        let by_user = fetch_trend_by_user_bucket(&st.pool, model, 60, 60).await?;
+        return Ok(Json(json!({
+            "days": 1,
+            "granularity": "minute",
             "daily": daily,
             "by_user": by_user,
             "models": models,
@@ -1156,7 +1150,27 @@ async fn list_users(
     let list = users::list_users(&st.pool, &month)
         .await
         .map_err(AppError::internal)?;
-    Ok(Json(json!({"users": list})))
+    let users: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|u| {
+            let protected = is_protected_admin(&st.cfg, &u.username);
+            json!({
+                "id": u.id,
+                "username": u.username,
+                "email": u.email,
+                "display_name": u.display_name,
+                "source": u.source,
+                "is_admin": u.is_admin,
+                "status": u.status,
+                "last_login_at": u.last_login_at,
+                "created_at": u.created_at,
+                "month_tokens": u.month_tokens,
+                "month_cost": u.month_cost,
+                "protected": protected,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"users": users})))
 }
 
 #[derive(Deserialize)]
@@ -1218,13 +1232,17 @@ async fn create_user(
     )
     .await
     .map_err(AppError::internal)?;
-    Ok(Json(json!({"user": user_json(&created)})))
+    Ok(Json(json!({"user": user_json(&st, &created)})))
 }
 
 #[derive(Deserialize)]
 struct UpdateUserReq {
     /// 1 = 启用, 0 = 禁用
     status: Option<i16>,
+    /// Some(true) = 授权管理员, Some(false) = 取消管理员;None = 不变更。
+    /// 变更后 reload 刷新 admin_ids 缓存（代理路径授权即时生效）；
+    /// 控制台中间件每请求查库，天然即时。
+    is_admin: Option<bool>,
 }
 
 async fn update_user(
@@ -1234,13 +1252,13 @@ async fn update_user(
     Json(req): Json<UpdateUserReq>,
 ) -> Result<impl IntoResponse, AppError> {
     let actor = admin.id;
-    if users::find_by_id(&st.pool, id)
+    let Some(target) = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
-        .is_none()
-    {
+    else {
         return Err(AppError::BadRequest("user not found".into()));
-    }
+    };
+    ensure_not_protected(&st.cfg, &target)?;
     if let Some(status) = req.status {
         if !(0..=1).contains(&status) {
             return Err(AppError::BadRequest("status must be 0 or 1".into()));
@@ -1265,11 +1283,29 @@ async fn update_user(
         .await
         .map_err(AppError::internal)?;
     }
+    if let Some(grant) = req.is_admin {
+        if target.is_admin != grant {
+            users::set_is_admin(&st.pool, id, grant)
+                .await
+                .map_err(AppError::internal)?;
+            st.reload().await.map_err(AppError::internal)?;
+            audit::log(
+                &st.pool,
+                Some(actor),
+                "user.is_admin",
+                Some("user"),
+                Some(id),
+                Some(json!({"is_admin": grant, "username": target.username})),
+            )
+            .await
+            .map_err(AppError::internal)?;
+        }
+    }
     let updated = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Internal("user vanished".into()))?;
-    Ok(Json(json!({"user": user_json(&updated)})))
+    Ok(Json(json!({"user": user_json(&st, &updated)})))
 }
 
 async fn force_logout(
@@ -1278,13 +1314,13 @@ async fn force_logout(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let actor = admin.id;
-    if users::find_by_id(&st.pool, id)
+    let Some(target) = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
-        .is_none()
-    {
+    else {
         return Err(AppError::BadRequest("user not found".into()));
-    }
+    };
+    ensure_not_protected(&st.cfg, &target)?;
     // 事务内 token_version+1 + 全量吊销 refresh token（与并发 refresh 的用户行锁串行化）
     crate::store::force_logout(&st.pool, id)
         .await
@@ -1320,6 +1356,7 @@ async fn reset_password(
     else {
         return Err(AppError::BadRequest("user not found".into()));
     };
+    ensure_not_protected(&st.cfg, &target)?;
     if target.source != "local" {
         return Err(AppError::BadRequest(
             "LDAP users are managed in the directory; reset password there".into(),
@@ -1395,13 +1432,13 @@ async fn put_user_access(
     Path(id): Path<i64>,
     Json(req): Json<PutAccessReq>,
 ) -> Result<impl IntoResponse, AppError> {
-    if users::find_by_id(&st.pool, id)
+    let Some(target) = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
-        .is_none()
-    {
+    else {
         return Err(AppError::BadRequest("user not found".into()));
-    }
+    };
+    ensure_not_protected(&st.cfg, &target)?;
     // 归一化：空 pattern 视为 NULL；trim；长度限制
     let mut pairs = Vec::with_capacity(req.rules.len());
     for r in &req.rules {
@@ -1487,7 +1524,7 @@ async fn get_audit(
 
 // ---------- 工具 ----------
 
-fn user_json(u: &users::UserRow) -> serde_json::Value {
+fn user_json(st: &AppState, u: &users::UserRow) -> serde_json::Value {
     json!({
         "id": u.id,
         "username": u.username,
@@ -1499,12 +1536,47 @@ fn user_json(u: &users::UserRow) -> serde_json::Value {
         "status": u.status,
         "last_login_at": u.last_login_at,
         "created_at": u.created_at,
+        "protected": is_protected_admin(&st.cfg, &u.username),
     })
+}
+
+/// 是否 break-glass 种子管理员（SEED_ADMIN_USERNAME）：唯一管理入口，禁止经管理端修改
+pub(crate) fn is_protected_admin(cfg: &crate::config::AppConfig, username: &str) -> bool {
+    cfg.seed_admin_username.as_deref() == Some(username)
+}
+
+/// 管理端用户变更统一守卫：种子管理员只能通过自身自助接口（改密/登出）维护自己，
+/// 其他管理员（含其他本地管理员）的 禁用/强制下线/重置密码/授权白名单 改动一律 403。
+fn ensure_not_protected(
+    cfg: &crate::config::AppConfig,
+    target: &users::UserRow,
+) -> Result<(), AppError> {
+    if is_protected_admin(cfg, &target.username) {
+        return Err(AppError::Forbidden(
+            "built-in admin account is protected and cannot be modified".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 按用户 id 拒绝对受保护管理员的定向限制（配额 / 限流·并发规则的用户绑定）。
+/// 这些通道绕过用户管理端点，也能锁死唯一管理入口的代理访问。
+pub(crate) async fn ensure_not_protected_by_id(
+    st: &AppState,
+    user_id: i64,
+) -> Result<(), AppError> {
+    if let Some(u) = users::find_by_id(&st.pool, user_id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        ensure_not_protected(&st.cfg, &u)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::aggregate_active_by_user;
+    use super::{aggregate_active_by_user, fill_bucket_gaps_at, BucketPoint};
     use std::collections::HashMap;
 
     /// 在途聚合：同用户跨模型合计、总数降序/同数按 user_id 升序、by_model
@@ -1547,6 +1619,51 @@ mod tests {
             rows[2]["by_model"][0]["model"], "",
             "缺 model 的空串键原样透出"
         );
+
         assert_eq!(rows[2]["by_model"][0]["active"], 3);
+    }
+
+    /// 桶补零：行落在正确下标、空桶补零、行数固定 count、窗口与当前桶对齐
+    #[test]
+    fn fill_bucket_gaps_fills_zeros_and_keeps_rows() {
+        let bp = |ts: i64, calls: i64| BucketPoint {
+            stat_date: chrono::DateTime::from_timestamp(ts, 0).unwrap(),
+            call_count: calls,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+        };
+        let now_ts = 1_800_000_123; // 非整分，检验桶对齐
+        let minute = 60;
+
+        let now_ts: i64 = 1_800_000_123; // 非整分，检验桶对齐
+        let bucket_now = now_ts - now_ts.rem_euclid(minute);
+        let rows = vec![
+            bp(bucket_now - 3 * minute, 7),
+            bp(bucket_now - 1 * minute, 9),
+        ];
+        let out = fill_bucket_gaps_at(rows, now_ts, minute, 5);
+
+        assert_eq!(out.len(), 5, "输出固定 count 点");
+        assert_eq!(
+            out.iter().map(|p| p.call_count).collect::<Vec<_>>(),
+            vec![0, 7, 0, 9, 0],
+            "最老桶为 now 对齐前 4 桶，有数行落在正确下标"
+        );
+        assert_eq!(
+            out[4].stat_date.timestamp(),
+            bucket_now,
+            "最后一点为当前桶起点"
+        );
+
+        // 无数据行 → 全零
+        let out = fill_bucket_gaps_at(vec![], now_ts, minute, 3);
+        assert_eq!(out.iter().map(|p| p.call_count).collect::<Vec<_>>(), vec![0, 0, 0]);
+        // 30 分钟桶常量下窗口 = 48*1800s，与既有 half_hour 行为一致
+        let bucket1800 = now_ts - now_ts.rem_euclid(1800);
+        let out = fill_bucket_gaps_at(vec![bp(bucket1800 - 47 * 1800, 1)], now_ts, 1800, 48);
+        assert_eq!(out.len(), 48);
+        assert_eq!(out[0].call_count, 1, "最老桶命中");
+        assert_eq!(out[47].call_count, 0, "当前桶补零");
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -188,12 +189,21 @@ impl RateLimiter {
 /// 规则匹配（纯函数，便于单测）：作用域（global/user/api_key）× 模型限定 → 桶键列表。
 /// 模型限定的规则仅在请求模型名与之精确相等时命中，桶键附加 `|model:` 后缀独立计量；
 /// 不限模型的规则对所有请求命中（既有行为），两者叠加时最严者先拒。
+pub struct MatchedRule {
+    /// 计量桶键（令牌桶与并发共用）
+    pub key: String,
+    pub rpm: f64,
+    pub burst: f64,
+    /// 并发上限（0 = 不限）
+    pub concurrency: i32,
+}
+
 fn matched_rules(
     rules: &[crate::store::rules::RateRule],
     user_id: Option<i64>,
     key_id: Option<i64>,
     model: &str,
-) -> Vec<(String, f64, f64)> {
+) -> Vec<MatchedRule> {
     rules
         .iter()
         .filter_map(|rule| {
@@ -217,7 +227,12 @@ fn matched_rules(
                 bucket_key.push_str("|model:");
                 bucket_key.push_str(rule_model);
             }
-            Some((bucket_key, rule.rpm as f64, rule.burst as f64))
+            Some(MatchedRule {
+                key: bucket_key,
+                rpm: rule.rpm as f64,
+                burst: rule.burst as f64,
+                concurrency: rule.concurrency,
+            })
         })
         .collect()
 }
@@ -229,9 +244,12 @@ pub fn apply_rate_limits(
     key_id: Option<i64>,
     model: &str,
 ) -> Result<(), AppError> {
-    let matched = {
+    let token_rules: Vec<(String, f64, f64)> = {
         let rules = st.rules.read();
         matched_rules(&rules, user_id, key_id, model)
+            .into_iter()
+            .map(|m| (m.key, m.rpm, m.burst))
+            .collect()
     };
 
     // 主体标识：user+key 联合（同一用户多 key 各自独立豁免，粒度贴合"会话恢复"）
@@ -242,7 +260,7 @@ pub fn apply_rate_limits(
     };
     match st.limiter.check_rules_at(
         now_ts(),
-        &matched,
+        &token_rules,
         identity.as_deref(),
         Duration::from_secs(st.cfg.rate_idle_exempt_secs),
     ) {
@@ -264,6 +282,135 @@ pub fn apply_rate_limits(
     }
 }
 
+/// 进程内并发上限器（单实例语义；多实例需换 Redis 原子计数）。
+/// 桶键与令牌桶同维度复用；计数条目仅在请求在途期间存在（guard 释放归零即移除），
+/// 表大小以「在途请求数 × 命中规则数」为上界，无需驱逐。
+#[derive(Default)]
+pub struct ConcurrencyLimiter {
+    counts: Arc<Mutex<HashMap<String, i64>>>,
+}
+
+/// RAII 并发名额：Drop 时归还全部占用桶。无并发规则命中时 keys 为空，释放为空操作。
+/// 生命周期必须绑定到响应体（bind_guards_to_body）：SSE 流尽或客户端断开才归还，
+/// handler 返回 ≠ 请求结束。
+#[derive(Debug)]
+pub struct ConcurrencyGuard {
+    counts: Arc<Mutex<HashMap<String, i64>>>,
+    keys: Vec<String>,
+}
+
+impl ConcurrencyLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 在途计数观测（测试与管理端 introspection 用）
+    pub fn active_in(&self, key: &str) -> i64 {
+        self.counts.lock().get(key).copied().unwrap_or(0)
+    }
+
+    /// 尝试在全部并发受限（limit > 0）的命中桶各占一个名额。
+    /// 全有或全无：任一桶满即整体拒绝（返回 (桶键, 上限)），不部分占坑——
+    /// 与令牌桶「拒绝路径零扣减」同一原则。limit <= 0 的规则不参与计量。
+    pub fn try_acquire(&self, rules: &[(String, i32)]) -> Result<ConcurrencyGuard, (String, i32)> {
+        let mut counts = self.counts.lock();
+        for (key, limit) in rules {
+            if *limit <= 0 {
+                continue;
+            }
+            if counts.get(key).copied().unwrap_or(0) >= i64::from(*limit) {
+                return Err((key.clone(), *limit));
+            }
+        }
+        let keys: Vec<String> = rules
+            .iter()
+            .filter(|(_, limit)| *limit > 0)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &keys {
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        }
+        Ok(ConcurrencyGuard { counts: self.counts.clone(), keys })
+    }
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let mut counts = self.counts.lock();
+        for key in &self.keys {
+            if let Some(c) = counts.get_mut(key) {
+                *c -= 1;
+            }
+        }
+        // 归零移除：防止表随历史桶键无限增长（与 UserActiveGuard 同策略）
+        counts.retain(|_, c| *c > 0);
+    }
+}
+
+/// 并发桶键去重：同键多条规则取最严（最小）上限。输入顺序无关，输出按键排序。
+fn dedup_min_limit(rules: Vec<(String, i32)>) -> Vec<(String, i32)> {
+    let mut m = std::collections::BTreeMap::new();
+    for (key, limit) in rules {
+        m.entry(key)
+            .and_modify(|e: &mut i32| {
+                if limit < *e {
+                    *e = limit;
+                }
+            })
+            .or_insert(limit);
+    }
+    m.into_iter().collect()
+}
+
+/// 应用并发上限（与 apply_rate_limits 同一匹配维度，scope × 模型精确匹配）。
+/// 返回的 guard 由调用方绑定到响应体生命周期；Err 即整体拒绝、零占坑。
+/// 刻意不参与空闲恢复豁免：并发名额是真实资源占用，豁免会突破上限。
+
+pub fn apply_concurrency_limits(
+    st: &AppState,
+    user_id: Option<i64>,
+    key_id: Option<i64>,
+    model: &str,
+) -> Result<ConcurrencyGuard, AppError> {
+    // DB 不强制 (scope, scope_id, model) 唯一：重复规则会让同一桶键出现多次，
+    // check 阶段读同值、increment 阶段双倍占坑，实际并发上限被副本数稀释。
+    // 按键去重、取最严（最小）上限。
+    let matched: Vec<(String, i32)> = dedup_min_limit({
+        let rules = st.rules.read();
+        matched_rules(&rules, user_id, key_id, model)
+            .into_iter()
+            .filter(|m| m.concurrency > 0)
+            .map(|m| (m.key, m.concurrency))
+            .collect()
+    });
+
+    match st.concurrency.try_acquire(&matched) {
+        Ok(guard) => Ok(guard),
+        Err((key, limit)) => {
+            let identity = match (user_id, key_id) {
+                (Some(u), Some(k)) => Some(format!("u:{u}|k:{k}")),
+                (Some(u), None) => Some(format!("u:{u}")),
+                _ => None,
+            };
+            // 名额何时释放未知（在途请求时长不可知），给 1-2s 短重试提示；
+            // 客户端按 429 常规退避即可，抖动防止重试群整秒对齐挤兑
+            let retry = 1.0 + rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..1.0);
+            tracing::warn!(
+                identity = identity.as_deref().unwrap_or(""),
+                model = %model,
+                bucket = %key,
+                limit,
+                retry_secs = format!("{retry:.1}"),
+                "request concurrency limited"
+            );
+            Err(AppError::ConcurrentLimited(retry))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,11 +424,19 @@ mod tests {
             rpm: 60,
             burst: 10,
             model: model.map(str::to_string),
+            concurrency: 0,
         }
     }
 
-    fn keys(matched: &[(String, f64, f64)]) -> Vec<&str> {
-        matched.iter().map(|(k, _, _)| k.as_str()).collect()
+    fn keys(matched: &[MatchedRule]) -> Vec<&str> {
+        matched.iter().map(|m| m.key.as_str()).collect()
+    }
+
+    fn conc_rules(pairs: &[(&str, i32)]) -> Vec<(String, i32)> {
+        pairs
+            .iter()
+            .map(|(k, l)| (k.to_string(), *l))
+            .collect()
     }
 
     /// 模型限定规则：仅请求模型精确相等时命中，桶键带模型后缀
@@ -318,6 +473,15 @@ mod tests {
         );
         assert!(matched_rules(&rules, Some(8), None, "claude-3").is_empty());
         assert!(matched_rules(&rules, Some(7), None, "gpt-4o").is_empty());
+    }
+
+    /// 重复桶键去重取最严上限：DB 不约束 (scope, scope_id, model) 唯一时，
+    /// 同键多副本不得双倍占坑
+    #[test]
+    fn dedup_concurrency_keys_takes_min_limit() {
+        let out = dedup_min_limit(conc_rules(&[("global", 6), ("global", 3), ("user:7", 2)]));
+        assert_eq!(out, conc_rules(&[("global", 3), ("user:7", 2)]));
+        assert!(dedup_min_limit(conc_rules(&[])).is_empty());
     }
 
     /// 同请求同时命中限模型与不限模型规则 → 两个桶（最严者先拒）
@@ -710,5 +874,88 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let b = now_ts();
         assert!(b > a, "BOOTTIME 时钟必须单调递增");
+    }
+
+    /// 并发占坑与释放：满员拒绝并报出 (桶键, 上限)；释放一个名额即可再进
+    #[test]
+    fn concurrency_acquire_reject_and_release() {
+        let cl = ConcurrencyLimiter::new();
+        let rules = conc_rules(&[("global", 2)]);
+        let g1 = cl.try_acquire(&rules).unwrap();
+        let _g2 = cl.try_acquire(&rules).unwrap();
+        let err = cl.try_acquire(&rules).unwrap_err();
+        assert_eq!(err, ("global".to_string(), 2), "满员拒绝须报出桶键与上限");
+        assert_eq!(cl.active_in("global"), 2);
+        drop(g1);
+        assert_eq!(cl.active_in("global"), 1, "释放一个名额后应可再进");
+        let g3 = cl.try_acquire(&rules).unwrap();
+        assert!(cl.try_acquire(&rules).is_err(), "重新占满后应拒绝");
+        drop(g3);
+    }
+
+    /// 多规则叠加：全有或全无——任一桶满整体拒绝，其余桶不得被部分占坑
+    /// （拒绝路径零占用，与令牌桶「拒绝路径零扣减」同一原则）
+    #[test]
+    fn concurrency_multi_rule_all_or_nothing() {
+        let cl = ConcurrencyLimiter::new();
+        let rules = conc_rules(&[("global", 1), ("user:7", 5)]);
+        let g = cl.try_acquire(&rules).unwrap();
+        assert_eq!(cl.active_in("global"), 1);
+        assert_eq!(cl.active_in("user:7"), 1);
+        assert!(cl.try_acquire(&rules).is_err(), "global 满应整体拒绝");
+        assert_eq!(
+            cl.active_in("user:7"),
+            1,
+            "拒绝路径不得在 user 桶占坑"
+        );
+        drop(g);
+        assert!(cl.try_acquire(&rules).is_ok(), "全部释放后应可重新占满");
+    }
+
+    /// concurrency = 0 的规则不参与并发计量（不会因 0 上限而恒拒）
+    #[test]
+    fn concurrency_zero_limit_unlimited() {
+        let cl = ConcurrencyLimiter::new();
+        let rules = conc_rules(&[("global", 0)]);
+        for _ in 0..100 {
+            drop(cl.try_acquire(&rules).unwrap());
+        }
+        assert!(cl.try_acquire(&rules).is_ok(), "0 上限 = 不限，不得拒绝");
+        assert_eq!(cl.active_in("global"), 0, "0 上限的桶不计数");
+    }
+
+    /// guard 全部释放后计数归零且条目移除（防表随历史桶键膨胀）
+    #[test]
+    fn concurrency_entries_removed_when_all_released() {
+        let cl = ConcurrencyLimiter::new();
+        let rules = conc_rules(&[("global", 3), ("user:7", 3)]);
+        let g = cl.try_acquire(&rules).unwrap();
+        drop(g);
+        assert_eq!(cl.active_in("global"), 0);
+        assert_eq!(cl.active_in("user:7"), 0);
+        assert!(
+            cl.counts.lock().is_empty(),
+            "归零条目应移除而非留 0 值占位"
+        );
+    }
+
+    /// matched_rules 把规则的 concurrency 带入匹配结果（模型限定规则同样生效）
+    #[test]
+    fn matched_rules_carry_concurrency() {
+        let mut user_rule = rule("user", Some(7), Some("gpt-4o"));
+        user_rule.concurrency = 6;
+        let mut global_rule = rule("global", None, None);
+        global_rule.concurrency = 3;
+        let matched = matched_rules(&[user_rule, global_rule], Some(7), None, "gpt-4o");
+        assert_eq!(matched.len(), 2);
+        let by_key: HashMap<&str, i32> = matched
+            .iter()
+            .map(|m| (m.key.as_str(), m.concurrency))
+            .collect();
+        assert_eq!(by_key["user:7|model:gpt-4o"], 6, "模型限定规则的并发上限随匹配透传");
+        assert_eq!(by_key["global"], 3, "不限模型规则的并发上限随匹配透传");
+        // 模型不匹配：模型限定规则不出现
+        let matched_other = matched_rules(&[rule("user", Some(7), Some("gpt-4o"))], Some(7), None, "other");
+        assert!(matched_other.is_empty());
     }
 }

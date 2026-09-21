@@ -61,6 +61,38 @@ async function toggleStatus(u: UserWithUsage) {
   }
 }
 
+async function toggleAdmin(u: UserWithUsage) {
+  const grant = !u.is_admin
+  try {
+    const tip =
+      u.source === 'ldap'
+        ? grant
+          ? 'LDAP 用户的管理员身份会在下次登录时按目录组（memberOf）重新计算，手动授权仅临时生效，确定授权吗？'
+          : 'LDAP 用户下次登录时将按目录组重新计算管理员身份，确定取消吗？'
+        : grant
+          ? `将 ${u.username} 设为管理员？管理员可访问全部管理功能。`
+          : `取消 ${u.username} 的管理员身份？其现有会话的管理权限立即失效。`
+    await ElMessageBox.confirm(tip, grant ? '设为管理员' : '取消管理员', {
+      type: 'warning',
+      confirmButtonText: grant ? '授权' : '取消管理员',
+      cancelButtonText: '返回',
+    })
+  } catch {
+    return // 用户取消
+  }
+  try {
+    await request(`/api/admin/users/${u.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: grant }),
+    })
+    ElMessage.success(grant ? '已设为管理员' : '已取消管理员')
+    await loadUsers()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+  }
+}
+
 async function forceLogout(u: UserWithUsage) {
   try {
     await ElMessageBox.confirm(
@@ -263,10 +295,13 @@ onMounted(loadUsers)
             <el-tag v-else type="success" size="small">本地</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="角色" width="90">
+        <el-table-column label="角色" width="130">
           <template #default="{ row }">
             <el-tag v-if="row.is_admin" type="primary" size="small">管理员</el-tag>
             <el-tag v-else type="info" size="small">成员</el-tag>
+            <el-tooltip v-if="row.protected" content="内置 break-glass 管理员，禁止经管理端修改">
+              <el-tag type="warning" size="small" style="margin-left: 4px">内置</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="80">
@@ -284,29 +319,35 @@ onMounted(loadUsers)
         <el-table-column label="最后登录" min-width="140">
           <template #default="{ row }">{{ fmt(row.last_login_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="250" fixed="right">
+        <el-table-column label="操作" width="330" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" type="primary" plain @click="openAccess(row)">模型授权</el-button>
-            <el-button
-              v-if="row.status === 1"
-              size="small"
-              type="danger"
-              plain
-              @click="toggleStatus(row)"
-            >禁用</el-button>
-            <el-button
-              v-else
-              size="small"
-              type="success"
-              plain
-              @click="toggleStatus(row)"
-            >启用</el-button>
-            <el-button size="small" @click="forceLogout(row)">强制下线</el-button>
-            <el-button
-              v-if="row.source === 'local'"
-              size="small"
-              @click="openReset(row)"
-            >重置密码</el-button>
+            <template v-if="!row.protected">
+              <el-button size="small" type="primary" plain @click="openAccess(row)">模型授权</el-button>
+              <el-button
+                v-if="row.status === 1"
+                size="small"
+                type="danger"
+                plain
+                @click="toggleStatus(row)"
+              >禁用</el-button>
+              <el-button
+                v-else
+                size="small"
+                type="success"
+                plain
+                @click="toggleStatus(row)"
+              >启用</el-button>
+              <el-button size="small" type="warning" plain @click="toggleAdmin(row)">
+                {{ row.is_admin ? '取消管理员' : '设为管理员' }}
+              </el-button>
+              <el-button size="small" @click="forceLogout(row)">强制下线</el-button>
+              <el-button
+                v-if="row.source === 'local'"
+                size="small"
+                @click="openReset(row)"
+              >重置密码</el-button>
+            </template>
+            <span v-else class="sub">内置管理员</span>
           </template>
         </el-table-column>
       </el-table>

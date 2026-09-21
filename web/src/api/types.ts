@@ -198,7 +198,7 @@ export interface UserTrend {
 /** 用量趋势响应 */
 export interface TrendResp {
   days: number
-  granularity: 'day' | 'half_hour'
+  granularity: 'day' | 'half_hour' | 'minute'
   daily: TrendPoint[]
   by_user: UserTrend[]
   /** 本月有调用的模型列表（下拉过滤用） */
@@ -217,6 +217,8 @@ export interface UserWithUsage {
   created_at: string
   month_tokens: number | null
   month_cost: number | null
+  /** break-glass 种子管理员（SEED_ADMIN_USERNAME）：管理端禁止修改 */
+  protected: boolean
 }
 
 export interface UsersResp {
@@ -287,6 +289,8 @@ export interface RateRuleRow {
   model: string | null
   rpm: number
   burst: number
+  /** 并发上限（在途请求数；0 = 不限） */
+  concurrency: number
   enabled: boolean
   updated_at: string
 }
@@ -308,6 +312,8 @@ export interface QuotaRow {
   billing_day: number
   notify_percent: number
   enabled: boolean
+  /** break-glass 种子管理员：配额/定向限流禁止设置 */
+  protected: boolean
 }
 
 export interface QuotasResp {

@@ -141,6 +141,10 @@ async fn do_sync(st: &AppState, group_id: i64, group_name: &str) -> Result<(u64,
     // JIT 建档：目录新增用户先入 users 表（is_admin/status 不受同步影响）
     let mut ids = Vec::with_capacity(entries.len());
     for e in &entries {
+        // 受保护管理员不入同步写路径：目录同名条目不得改写其档案字段
+        if crate::api::console::is_protected_admin(&st.cfg, &e.username) {
+            continue;
+        }
         match groups::upsert_sync_user(
             &st.pool,
             &e.username,
@@ -180,6 +184,10 @@ pub async fn sync_all_ldap_groups(st: &AppState) {
                 let mut ids = Vec::with_capacity(entries.len());
                 let mut failed = 0usize;
                 for e in &entries {
+                    // 受保护管理员不入同步写路径：目录同名条目不得改写其档案字段
+                    if crate::api::console::is_protected_admin(&st.cfg, &e.username) {
+                        continue;
+                    }
                     match groups::upsert_sync_user(
                         &st.pool,
                         &e.username,

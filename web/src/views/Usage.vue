@@ -110,6 +110,7 @@
                 />
               </el-select>
               <el-radio-group v-model="trendDays" size="small" @change="loadData">
+                <el-radio-button :value="-1">近 1 小时（分钟）</el-radio-button>
                 <el-radio-button :value="0">今天（30 分钟）</el-radio-button>
                 <el-radio-button :value="7">7 天</el-radio-button>
                 <el-radio-button :value="30">30 天</el-radio-button>
@@ -227,12 +228,17 @@ const rangeLabel = computed(
     ],
 )
 
-/** 趋势：时间范围（天，0 = 今天每 30 分钟）与用户筛选（0 = 全部用户） */
+/** 趋势：时间范围（-1 = 近 1 小时每分钟，0 = 今天每 30 分钟，N = 近 N 天）与用户筛选（0 = 全部用户） */
 const trendDays = ref(30)
 const trendUser = ref(0)
 
 /** 当前是否半小时粒度（今天视图） */
 const isHalfHour = computed(() => trendDays.value === 0)
+/** 当前是否分钟粒度（近 1 小时视图） */
+const isMinute = computed(() => trendDays.value === -1)
+/** 请求参数：粒度与对应窗口（分钟/半小时视图窗口恒为 1 天内） */
+const trendGran = computed(() => (isMinute.value ? 'minute' : isHalfHour.value ? 'half_hour' : 'day'))
+const trendDaysParam = computed(() => (isMinute.value || isHalfHour.value ? 1 : trendDays.value))
 const trend = ref<TrendResp | null>(null)
 
 const callsChartRef = ref<HTMLDivElement | null>(null)
@@ -313,9 +319,10 @@ function currentSeries(): TrendPoint[] {
   return trend.value.by_user.find((u) => u.user_id === trendUser.value)?.daily ?? []
 }
 
-/** 图表 x 轴标签：按天显示 MM-DD，半小时粒度显示本地 MM-DD HH:mm */
+/** 图表 x 轴标签：按天显示 MM-DD，分钟/半小时粒度显示本地 MM-DD HH:mm */
 function xLabel(d: TrendPoint, gran?: TrendResp['granularity']): string {
-  if ((gran ?? trend.value?.granularity) === 'half_hour') {
+  const g = gran ?? trend.value?.granularity
+  if (g === 'half_hour' || g === 'minute') {
     const t = new Date(d.stat_date)
     const p = (n: number) => String(n).padStart(2, '0')
     return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`
@@ -497,8 +504,8 @@ function handleResize(): void {
 /** 用户请求对比数据：独立按模型过滤请求（与趋势图共享粒度/天数） */
 async function loadCompare(): Promise<void> {
   const base = isAdmin.value ? '/api/admin/usage' : '/api/usage'
-  const gran = isHalfHour.value ? 'half_hour' : 'day'
-  const days = isHalfHour.value ? 1 : trendDays.value
+  const gran = trendGran.value
+  const days = trendDaysParam.value
   const q = new URLSearchParams({ granularity: gran, days: String(days) })
   if (compareModel.value) q.set('model', compareModel.value)
   try {
@@ -513,8 +520,8 @@ async function loadData(): Promise<void> {
   loading.value = true
   try {
     const base = isAdmin.value ? '/api/admin/usage' : '/api/usage'
-    const gran = isHalfHour.value ? 'half_hour' : 'day'
-    const days = isHalfHour.value ? 1 : trendDays.value
+    const gran = trendGran.value
+    const days = trendDaysParam.value
     const [data, t] = await Promise.all([
       request<AdminUsageResp | UsageResp>(base),
       request<TrendResp>(`${base}/trend?granularity=${gran}&days=${days}`),

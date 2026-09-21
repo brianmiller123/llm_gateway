@@ -26,8 +26,13 @@ RUN cargo build --release
 
 # ---- 运行镜像 ----
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# 时区：chrono::Local（Coding Plan 时段窗判定、价格生效日默认值）依赖 TZ +
+# zoneinfo 文件；默认 UTC 会让「每日 08:00-20:00 生效」类配置偏 8 小时
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
+ENV TZ=Asia/Shanghai
 COPY --from=builder /app/target/release/llm_gateway /usr/local/bin/llm_gateway
 COPY --from=web /web/dist /app/web/dist
 ENV GATEWAY_WEB_DIR=/app/web/dist

@@ -571,6 +571,8 @@ impl Drop for UserActiveGuard {
 struct ResponseGuards {
     active: ActiveRequestGuard,
     user_active: Option<UserActiveGuard>,
+    /// 并发上限名额（请求管线下发前占坑，响应体流尽/断开归还；None = 测试调用不限）
+    concurrency: Option<crate::service::ratelimit::ConcurrencyGuard>,
 }
 
 /// 把 guard 绑定到响应体生命周期：逐帧透传，流尽时释放；
@@ -620,9 +622,25 @@ pub async fn proxy(
     let json =
         parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
     let model = requested_model(&json);
+    // 并发上限（先于令牌桶限流占坑）：并发满的 429 不得白烧限流令牌；
+    // 反向序（限流先拒）只会让被拒请求瞬持名额，无害。拒绝时限流未扣减、
+    // 并发未占坑，与「拒绝路径零扣减」原则一致。guard 绑定响应体生命周期。
+    let conc = match crate::service::ratelimit::apply_concurrency_limits(
+        st,
+        user_id,
+        key_id,
+        model.as_deref().unwrap_or_default(),
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            drop(active);
+            return Err(fail_with_request_id(e, request_id));
+        }
+    };
     let guards = ResponseGuards {
         active,
         user_active: user_id.map(|uid| UserActiveGuard::enter(&st.active_by_user, uid, model)),
+        concurrency: Some(conc),
     };
     proxy_authed(
         st, headers, body, json, endpoint, client_ip, user_id, key_id, false, request_id,
@@ -692,6 +710,8 @@ pub async fn proxy_test(
     let guards = ResponseGuards {
         active: ActiveRequestGuard::enter(&st.active_requests),
         user_active: None,
+        // 管理员测试调用不占并发名额（诊断流量，与 user_active 同宽免）
+        concurrency: None,
     };
     let request_id = Uuid::new_v4();
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
@@ -3430,6 +3450,7 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
             ResponseGuards {
                 active,
                 user_active,
+                concurrency: None,
             },
         );
         // body 未消费 → guard 仍持有

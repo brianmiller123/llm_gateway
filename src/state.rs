@@ -38,6 +38,9 @@ pub struct AppState {
     /// M3：进程内每渠道熔断器（连续可重试失败 → 短窗跳过；仅内存态）
     pub breaker: Arc<crate::service::breaker::Breaker>,
     pub limiter: Arc<RateLimiter>,
+    /// 进程内并发上限器：限流规则 concurrency > 0 的桶按在途请求数计数，
+    /// guard 绑定响应体生命周期（与 limiter 同单实例语义；多实例需 Redis）
+    pub concurrency: Arc<crate::service::ratelimit::ConcurrencyLimiter>,
     pub usage: Arc<UsageCache>,
     /// 运行时 LDAP 设置（DB 优先、env 兜底；保存后立即生效）
     pub ldap: Arc<RwLock<crate::service::ldap::LdapSettings>>,
@@ -115,6 +118,7 @@ impl AppState {
             disabled_models: Arc::new(RwLock::new(HashMap::new())),
             breaker: Arc::new(crate::service::breaker::Breaker::new_with(breaker_cfg)),
             limiter: Arc::new(RateLimiter::new()),
+            concurrency: Arc::new(crate::service::ratelimit::ConcurrencyLimiter::new()),
             ldap: Arc::new(RwLock::new(ldap)),
             extra_body_enabled: Arc::new(RwLock::new(true)),
             active_requests: Arc::new(std::sync::atomic::AtomicI64::new(0)),

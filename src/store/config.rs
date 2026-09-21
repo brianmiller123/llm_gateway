@@ -279,13 +279,15 @@ pub struct AdminRateRule {
     pub model: Option<String>,
     pub rpm: i32,
     pub burst: i32,
+    /// 并发上限（0 = 不限）
+    pub concurrency: i32,
     pub enabled: bool,
     pub updated_at: DateTime<Utc>,
 }
 
 pub async fn list_rate_rules(pool: &PgPool) -> Result<Vec<AdminRateRule>, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
-        "SELECT id, scope, scope_id, model, rpm, burst, enabled, updated_at FROM rate_limit_rules ORDER BY id",
+        "SELECT id, scope, scope_id, model, rpm, burst, concurrency, enabled, updated_at FROM rate_limit_rules ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -298,18 +300,20 @@ pub async fn create_rate_rule(
     model: Option<&str>,
     rpm: i32,
     burst: i32,
+    concurrency: i32,
     enabled: bool,
 ) -> Result<AdminRateRule, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
-        "INSERT INTO rate_limit_rules (scope, scope_id, model, rpm, burst, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, scope, scope_id, model, rpm, burst, enabled, updated_at",
+        "INSERT INTO rate_limit_rules (scope, scope_id, model, rpm, burst, concurrency, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, scope, scope_id, model, rpm, burst, concurrency, enabled, updated_at",
     )
     .bind(scope)
     .bind(scope_id)
     .bind(model)
     .bind(rpm)
     .bind(burst)
+    .bind(concurrency)
     .bind(enabled)
     .fetch_one(pool)
     .await
@@ -323,19 +327,21 @@ pub async fn update_rate_rule(
     model: Option<Option<&str>>,
     rpm: Option<i32>,
     burst: Option<i32>,
+    concurrency: Option<i32>,
     enabled: Option<bool>,
 ) -> Result<Option<AdminRateRule>, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
         "UPDATE rate_limit_rules SET \
             scope = COALESCE($2, scope), \
-            scope_id = CASE WHEN $8 THEN $3 ELSE scope_id END, \
-            model = CASE WHEN $9 THEN $4 ELSE model END, \
+            scope_id = CASE WHEN $9 THEN $3 ELSE scope_id END, \
+            model = CASE WHEN $10 THEN $4 ELSE model END, \
             rpm = COALESCE($5, rpm), \
             burst = COALESCE($6, burst), \
-            enabled = COALESCE($7, enabled), \
+            concurrency = COALESCE($7, concurrency), \
+            enabled = COALESCE($8, enabled), \
             updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, scope, scope_id, model, rpm, burst, enabled, updated_at",
+         RETURNING id, scope, scope_id, model, rpm, burst, concurrency, enabled, updated_at",
     )
     .bind(id)
     .bind(scope)
@@ -343,9 +349,10 @@ pub async fn update_rate_rule(
     .bind(model)
     .bind(rpm)
     .bind(burst)
+    .bind(concurrency)
     .bind(enabled)
-    .bind(scope_id.is_some()) // $8：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
-    .bind(model.is_some()) // $9：同上
+    .bind(scope_id.is_some()) // $9：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
+    .bind(model.is_some()) // $10：同上
     .fetch_optional(pool)
     .await
 }
