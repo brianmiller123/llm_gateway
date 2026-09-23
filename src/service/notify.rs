@@ -2,12 +2,13 @@
 //! 邮件（SMTP，收件人 = 用户本人 + 全部管理员）+ webhook（Plan 级 URL）。
 //!
 //! 去重三层：
-//! 1. 进程内 seen 集合（热路径短路，同 [`crate::service::usage`] 的 quota_alerts 模式）
+//! 1. 进程内 seen 集合（热路径短路，同 [`crate::service::plans`] 的进程内去重模式）
 //! 2. plan_alerts UNIQUE(plan_id, user_id, period_key, level)（多实例幂等）
 //! 3. 派发结果回写 delivered JSONB，便于排障
 //!
 //! 告警在记账提交后/请求拦截前异步触发，不阻塞代理热路径。
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::state::AppState;
@@ -34,22 +35,48 @@ pub fn crossed_level(used: i64, limit: i64) -> Option<i16> {
     }
 }
 
-/// 阈值命中检查 + 异步派发入口（记账后与请求拦截前共用）
-pub fn check_and_dispatch(st: &AppState, user_id: i64, plan: &PlanRuntime, used: i64) {
+/// 该 (user, plan) 只保留当前周期条目：旧周期告警对新周期去重无意义，清掉既防
+/// seen 集合无界增长，又让新周期首见阈值可正常触发。其他用户/Plan 条目不动。
+/// 纯函数便于单测。
+fn prune_stale_periods(
+    seen: &mut HashSet<(i64, i64, String, i16)>,
+    user_id: i64,
+    plan_id: i64,
+    period_key: &str,
+) {
+    seen.retain(|(u, p, k, _)| *u != user_id || *p != plan_id || k.as_str() == period_key);
+}
+
+/// 阈值命中检查 + 异步派发入口（记账后与请求拦截前共用）。
+/// `period_key` 由调用方传入：预检查传当前墙钟桶，记账后传账单归属桶——跨桶时刻
+/// 落账的用量挂在旧桶，按墙钟取键会让那笔跨阈值用量永不告警。
+pub fn check_and_dispatch(
+    st: &AppState,
+    user_id: i64,
+    plan: &PlanRuntime,
+    used: i64,
+    period_key: &str,
+) {
     let Some(level) = crossed_level(used, plan.token_limit) else {
         return;
     };
-    let period_key = plan.period_key(chrono::Utc::now());
     {
         let mut seen = st.plan_alerts_seen.lock();
-        if !seen.insert((user_id, plan.plan_id, period_key.clone(), level)) {
+        prune_stale_periods(&mut seen, user_id, plan.plan_id, period_key);
+        if !seen.insert((user_id, plan.plan_id, period_key.to_string(), level)) {
             return;
         }
     }
     let st = st.clone();
     let plan = plan.clone();
+    let period_key = period_key.to_string();
     tokio::spawn(async move {
         if let Err(e) = dispatch(&st, user_id, &plan, &period_key, level, used).await {
+            // 派发失败：撤销 seen 标记，让后续请求/记账重试（DB 层 ON CONFLICT DO
+            // NOTHING 幂等，重试安全）。否则一次瞬时故障会永久短路该周期该级别
+            st.plan_alerts_seen
+                .lock()
+                .remove(&(user_id, plan.plan_id, period_key.clone(), level));
             tracing::warn!(user_id, plan_id = plan.plan_id, level, error = %e, "plan alert dispatch failed");
         }
     });
@@ -291,5 +318,24 @@ pub async fn system_notice(st: &AppState, message: &str) {
     .await;
     if let Err(e) = res {
         tracing::warn!(error = %e, "system notice insert failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_keeps_only_current_period_entries() {
+        let mut seen = HashSet::new();
+        seen.insert((1, 10, "h:111".into(), LEVEL_80));
+        seen.insert((1, 10, "h:222".into(), LEVEL_95));
+        seen.insert((2, 10, "h:111".into(), LEVEL_80)); // 其他用户不动
+        seen.insert((1, 20, "h:111".into(), LEVEL_80)); // 其他 Plan 不动
+        prune_stale_periods(&mut seen, 1, 10, "h:222");
+        assert!(seen.contains(&(1, 10, "h:222".into(), LEVEL_95)));
+        assert!(!seen.contains(&(1, 10, "h:111".into(), LEVEL_80)));
+        assert!(seen.contains(&(2, 10, "h:111".into(), LEVEL_80)));
+        assert!(seen.contains(&(1, 20, "h:111".into(), LEVEL_80)));
     }
 }

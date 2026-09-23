@@ -287,8 +287,6 @@ export interface RateRuleRow {
   scope: string
   scope_id: number | null
   model: string | null
-  rpm: number
-  burst: number
   /** 并发上限（在途请求数；0 = 不限） */
   concurrency: number
   enabled: boolean
@@ -304,21 +302,6 @@ export interface HeaderSettingsResp {
   response_headers: Record<string, string>
 }
 
-export interface QuotaRow {
-  user_id: number
-  username: string
-  monthly_token_quota: number | null
-  monthly_cost_quota: number | null
-  billing_day: number
-  notify_percent: number
-  enabled: boolean
-  /** break-glass 种子管理员：配额/定向限流禁止设置 */
-  protected: boolean
-}
-
-export interface QuotasResp {
-  quotas: QuotaRow[]
-}
 
 export interface PriceRow {
   id: number

@@ -74,7 +74,7 @@ const router = createRouter({
           path: 'limits',
           name: 'limits',
           component: () => import('@/views/Limits.vue'),
-          meta: { title: '限流与配额', admin: true },
+          meta: { title: '限流', admin: true },
         },
         {
           path: 'prices',

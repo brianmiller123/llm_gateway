@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::state::AppState;
-use crate::store::keys::find_by_prefix;
+use crate::store::keys::{ApiKeyRow, find_all_by_prefix};
 
 /// 常数时间字节比较（等长输入）
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -14,6 +14,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// 在同前缀候选中定位哈希匹配的 Key：逐候选常数时间比对，命中即返回。
+/// 前缀碰撞时多行同前缀，只查一行会把另一把合法 Key 永久 401（旧 fetch_optional 行为）
+fn match_candidate<'a>(rows: &'a [ApiKeyRow], key: &str) -> Option<&'a ApiKeyRow> {
+    // 长度固定 64 hex，防时序侧信道；逐候选比对不跨候选共享状态
+    let digest = hex::encode(Sha256::digest(key.as_bytes()));
+    rows.iter()
+        .find(|row| constant_time_eq(digest.as_bytes(), row.key_hash.as_bytes()))
 }
 
 /// 提取并校验 Bearer API Key，返回 (user_id, api_key_id)
@@ -48,22 +57,19 @@ pub async fn authenticate(
         return Err(AppError::Auth("invalid api key".into()));
     }
 
-    // 12 位前缀定位（避免全表哈希扫描）
+    // 12 位前缀定位（避免全表哈希扫描）；前缀仅 12 hex 会碰撞 → 取全部候选逐行比对
     let prefix = &key[..12];
-    let row = find_by_prefix(&st.pool, prefix)
+    let rows = find_all_by_prefix(&st.pool, prefix)
         .await
         .map_err(AppError::internal)?;
-    let Some(row) = row else {
+    if rows.is_empty() {
         tracing::warn!(prefix, "api key not found");
         return Err(AppError::Auth("invalid api key".into()));
-    };
-
-    // 常数时间比较哈希（长度固定 64 hex，防时序侧信道；原 != 为非常数时间）
-    let digest = hex::encode(Sha256::digest(key.as_bytes()));
-    if !constant_time_eq(digest.as_bytes(), row.key_hash.as_bytes()) {
+    }
+    let Some(row) = match_candidate(&rows, key) else {
         tracing::warn!(prefix, "api key hash mismatch");
         return Err(AppError::Auth("invalid api key".into()));
-    }
+    };
     if let Some(exp) = row.expires_at {
         if exp <= chrono::Utc::now() {
             return Err(AppError::Auth("api key expired".into()));
@@ -73,4 +79,38 @@ pub async fn authenticate(
         return Err(AppError::Auth("account disabled".into()));
     }
     Ok((Some(row.user_id), Some(row.id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: i64, key_hash: &str) -> ApiKeyRow {
+        ApiKeyRow {
+            id,
+            user_id: 7,
+            key_hash: key_hash.to_string(),
+            expires_at: None,
+            user_status: 1,
+        }
+    }
+
+    #[test]
+    fn prefix_collision_reaches_second_candidate() {
+        // 两把 Key 同 12 位前缀：第一行哈希不匹配，必须比到第二行
+        // （旧 fetch_optional 只取任意一行，另一把合法 Key 会永久 401）
+        let key = "sk-gateway-0123456789abcdef";
+        let rows = [
+            row(1, &hex::encode(sha2::Sha256::digest(b"another-key"))),
+            row(2, &hex::encode(sha2::Sha256::digest(key.as_bytes()))),
+        ];
+        let matched = match_candidate(&rows, key).expect("second row should match");
+        assert_eq!(matched.id, 2);
+    }
+
+    #[test]
+    fn no_candidate_matches_returns_none() {
+        let rows = [row(1, "deadbeef")];
+        assert!(match_candidate(&rows, "sk-gateway-0123456789abcdef").is_none());
+    }
 }

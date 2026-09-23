@@ -49,9 +49,6 @@ pub struct AppConfig {
     pub seed_provider_base_url: Option<String>,
     pub seed_provider_api_key: Option<String>,
     pub seed_model_pattern: Option<String>,
-    /// 限流恢复豁免：主体（用户×Key）静默 ≥ 该时长后，恢复执行的首请求
-    /// 若被限流规则拒绝则豁免放行（每个空闲间隙至多一次）。0 = 关闭。
-    pub rate_idle_exempt_secs: u64,
     /// 流式首字节超时（秒）：等待首个上游 chunk 的最长时间；0 = 禁用
     pub stream_first_byte_timeout_secs: u64,
     /// 流式静默超时（秒）：相邻 chunk 间最大间隔；0 = 禁用
@@ -137,10 +134,6 @@ impl AppConfig {
             return Err("GATEWAY_ACCESS/REFRESH_TOKEN_TTL must be > 0 seconds".into());
         }
 
-        let rate_idle_exempt_secs: u64 = env("GATEWAY_RATE_IDLE_EXEMPT_SECS", "60")
-            .parse()
-            .map_err(|e| format!("invalid GATEWAY_RATE_IDLE_EXEMPT_SECS: {e}"))?;
-        // cc-switch ProxyConfig 同款：首字节 60s 默认、静默 120s 默认、0 禁用
         let stream_first_byte_timeout_secs: u64 = env("GATEWAY_STREAM_FIRST_BYTE_TIMEOUT", "60")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_STREAM_FIRST_BYTE_TIMEOUT: {e}"))?;
@@ -239,7 +232,8 @@ impl AppConfig {
             access_token_ttl,
             refresh_token_ttl,
             ldap_url: std::env::var("LDAP_URL").ok(),
-            ldap_starttls: env("LDAP_STARTTLS", "false") == "true",
+            // env_bool 而非 =="true"：TRUE/Yes/1 也是合法开——精确匹配会把 StartTLS 静默关掉（bind 密码明文发送）
+            ldap_starttls: env_bool("LDAP_STARTTLS", false)?,
             ldap_bind_dn: std::env::var("LDAP_BIND_DN").ok(),
             ldap_bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
             ldap_base_dn: std::env::var("LDAP_BASE_DN").ok(),
@@ -256,7 +250,6 @@ impl AppConfig {
             seed_provider_base_url: std::env::var("SEED_PROVIDER_BASE_URL").ok(),
             seed_provider_api_key: std::env::var("SEED_PROVIDER_API_KEY").ok(),
             seed_model_pattern: std::env::var("SEED_MODEL_PATTERN").ok(),
-            rate_idle_exempt_secs,
             rectify_enabled,
             anthropic_inject_claude_code_beta,
             breaker_failure_threshold,

@@ -12,15 +12,20 @@ pub struct ApiKeyRow {
     pub user_status: i16,
 }
 
-/// 按 12 位前缀定位启用的 Key（JOIN 用户状态）
-pub async fn find_by_prefix(pool: &PgPool, prefix: &str) -> Result<Option<ApiKeyRow>, sqlx::Error> {
+/// 按 12 位前缀定位启用的 Key（JOIN 用户状态）。
+/// 前缀仅 12 hex 会碰撞：取单行会把另一把合法 Key 永久 401，
+/// 故返回全部候选，由调用方逐行常数时间比对哈希
+pub async fn find_all_by_prefix(
+    pool: &PgPool,
+    prefix: &str,
+) -> Result<Vec<ApiKeyRow>, sqlx::Error> {
     sqlx::query_as::<_, ApiKeyRow>(
         "SELECT k.id, k.user_id, k.key_hash, k.expires_at, u.status AS user_status \
          FROM api_keys k JOIN users u ON u.id = k.user_id \
          WHERE k.key_prefix = $1 AND k.status = 1",
     )
     .bind(prefix)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
 }
 

@@ -166,7 +166,7 @@ fn anthropic_image_part(obj: &Map<String, Value>) -> Option<Value> {
                 if data.is_empty() {
                     return None;
                 }
-                let url = if mime.starts_with("data:") {
+                let url = if data.starts_with("data:") {
                     // data 已是 data:URL 形态则直通（cc-switch 同款）
                     data.to_string()
                 } else {
@@ -259,6 +259,15 @@ fn document_part(obj: &Map<String, Value>) -> Option<Value> {
     }))
 }
 
+/// media_type → OpenAI input_audio.format（期望裸编解码名，如 wav/mp3）：
+/// 剥可选 "audio/" 前缀、去 ";..." 参数、小写归一；未知值剥前缀后原样透传（上游校验）
+fn audio_format(raw: &str) -> String {
+    // 先小写归一（MIME 大小写不敏感），再剥前缀/参数——后剥会漏掉 AUDIO/WAV 这类大写
+    let lower = raw.to_ascii_lowercase();
+    let base = lower.split(';').next().unwrap_or("").trim();
+    base.strip_prefix("audio/").unwrap_or(base).to_string()
+}
+
 /// Anthropic `audio` 块（source.type=base64）→ Chat input_audio part
 fn anthropic_audio_part(obj: &Map<String, Value>) -> Option<Value> {
     let source = obj.get("source")?.as_object()?;
@@ -274,7 +283,8 @@ fn anthropic_audio_part(obj: &Map<String, Value>) -> Option<Value> {
         .or_else(|| source.get("mime_type"))
         .and_then(|m| m.as_str())
         .or_else(|| obj.get("mimeType").and_then(|m| m.as_str()))
-        .unwrap_or("wav");
+        .map(audio_format)
+        .unwrap_or_else(|| "wav".to_string());
     Some(json!({
         "type": "input_audio",
         "input_audio": {"data": data, "format": format}
@@ -598,5 +608,49 @@ mod tests {
     fn clamps_data_url_prefix_text() {
         let text = format!("data:image/png;base64,{}", "Q".repeat(BASE64ISH_MIN_BYTES));
         assert!(clamp_base64ish(&text).starts_with("[gateway:"));
+    }
+
+    #[test]
+    fn anthropic_base64_source_with_data_url_payload_passthrough() {
+        // source.data 已是 data:URL：直通不二次拼前缀（旧 mime.starts_with 判定恒假，
+        // url 会被拼成 data:...,data:... 双前缀）
+        let data_url = "data:image/png;base64,QUJD";
+        let part = chat_media_part(&json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data_url}
+        }))
+        .unwrap();
+        assert_eq!(part["image_url"]["url"], data_url);
+
+        // 工具输出切分：媒体原样抽出；data URL 不以双前缀形态混入文本，邻接 text 保留
+        let split = split_tool_output(&json!([
+            {"type": "text", "text": "chart attached"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data_url}}
+        ]));
+        assert_eq!(split.media.len(), 1);
+        assert_eq!(split.media[0]["image_url"]["url"], data_url);
+        assert!(split.text.contains("chart attached"));
+        assert!(!split.text.contains("data:image/png;base64,data:"));
+    }
+
+    #[test]
+    fn anthropic_audio_media_type_normalized_to_codec() {
+        // source.media_type 是 MIME（audio/wav），input_audio.format 期望裸编解码名
+        let part = chat_media_part(&json!({
+            "type": "audio",
+            "source": {"type": "base64", "media_type": "audio/wav", "data": "QUJD"}
+        }))
+        .unwrap();
+        assert_eq!(part["input_audio"]["format"], "wav");
+    }
+
+    #[test]
+    fn audio_format_strips_prefix_params_case() {
+        assert_eq!(audio_format("audio/wav"), "wav");
+        // 裸编解码名原样透传；不发明 mpeg→mp3 之类映射
+        assert_eq!(audio_format("mp3"), "mp3");
+        assert_eq!(audio_format("audio/mpeg"), "mpeg");
+        assert_eq!(audio_format("AUDIO/WAV"), "wav");
+        assert_eq!(audio_format("audio/wav; rate=16000"), "wav");
     }
 }

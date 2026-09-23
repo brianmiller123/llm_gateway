@@ -10,7 +10,7 @@ use crate::config::AppConfig;
 use crate::service::ratelimit::RateLimiter;
 use crate::service::usage::UsageCache;
 use crate::store::access::{UserAccessRule, load_user_access};
-use crate::store::rules::{ModelPrice, RateRule, UserQuota, load_prices, load_quotas, load_rules};
+use crate::store::rules::{ModelPrice, RateRule, load_prices, load_rules};
 use crate::store::upstream::{ModelRoute, Provider, load_providers, load_routes};
 
 /// 全局应用状态（全部 Clone 廉价）
@@ -22,7 +22,6 @@ pub struct AppState {
     pub providers: Arc<RwLock<Vec<Provider>>>,
     pub routes: Arc<RwLock<Vec<ModelRoute>>>,
     pub rules: Arc<RwLock<Vec<RateRule>>>,
-    pub quotas: Arc<RwLock<HashMap<i64, UserQuota>>>,
     pub prices: Arc<RwLock<HashMap<String, ModelPrice>>>,
     /// 用户访问授权白名单：user_id → 规则列表（空/缺省 = 默认放行）
     pub user_access: Arc<RwLock<HashMap<i64, Vec<UserAccessRule>>>>,
@@ -60,7 +59,6 @@ pub struct AppState {
     /// P0-1：Responses previous_response_id 桥接历史（进程内 LRU；仅转换路径
     /// 记录，原生 openai-responses 透传不记录——上游自身有状态）
     pub responses_history: Arc<crate::service::responses::history::ResponseHistoryStore>,
-    pub quota_alerts: Arc<Mutex<HashSet<(i64, String)>>>,
     /// 状态页主动健康探测缓存：provider_id → 最近一次探测结果（/1/status，
     /// 非结论性时回退 /v1/models；TTL 30s 内复用；api::status 刷新，见 service::health::snapshot）
     pub provider_health: Arc<tokio::sync::Mutex<HashMap<i64, crate::service::health::ProbeResult>>>,
@@ -110,7 +108,6 @@ impl AppState {
             providers: Arc::new(RwLock::new(Vec::new())),
             routes: Arc::new(RwLock::new(Vec::new())),
             rules: Arc::new(RwLock::new(Vec::new())),
-            quotas: Arc::new(RwLock::new(HashMap::new())),
             prices: Arc::new(RwLock::new(HashMap::new())),
             user_access: Arc::new(RwLock::new(HashMap::new())),
             plans: Arc::new(RwLock::new(HashMap::new())),
@@ -134,7 +131,6 @@ impl AppState {
             responses_history: Arc::new(
                 crate::service::responses::history::ResponseHistoryStore::new(),
             ),
-            quota_alerts: Arc::new(Mutex::new(HashSet::new())),
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
@@ -170,7 +166,7 @@ impl AppState {
         Ok(())
     }
 
-    /// 全量热加载：供应商 / 路由 / 限流规则 / 配额 / 单价 / 访问授权 / LDAP。
+    /// 全量热加载：供应商 / 路由 / 限流规则（并发上限）/ 单价 / 访问授权 / LDAP。
     ///
     /// 分节独立应用：任一节加载失败只影响该节（沿用旧值并 error 留痕），不再让
     /// 整体 reload 中途返回、其余节全部冻结——历史上 schema 演进后旧实例的
@@ -199,15 +195,6 @@ impl AppState {
         section!("rules", async {
             let v = load_rules(&self.pool).await?;
             *self.rules.write() = v;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        });
-        section!("quotas", async {
-            let v: HashMap<_, _> = load_quotas(&self.pool)
-                .await?
-                .into_iter()
-                .map(|q| (q.user_id, q))
-                .collect();
-            *self.quotas.write() = v;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("prices", async {
@@ -264,11 +251,11 @@ impl AppState {
         }
     }
 
-    /// 周期热加载 + 月度用量缓存兜底重载
+    /// 周期热加载 + Plan 当期用量缓存兜底重载
     pub fn spawn_reload_tasks(&self) {
         let st = self.clone();
         tokio::spawn(async move {
-            // 启动即引导配额缓存（防重启后配额检查读到 0）
+            // 启动即引导 Plan 当期用量缓存（防重启后周期用量从 0 重算）
             if let Err(e) = st.usage.reload_from_db(&st.pool).await {
                 tracing::warn!(error = %e, "usage cache bootstrap failed");
             }

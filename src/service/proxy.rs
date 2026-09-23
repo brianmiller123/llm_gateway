@@ -133,6 +133,7 @@ where
         interval,
         wait: Box::pin(tokio::time::sleep(interval)),
         done: false,
+        at_line_start: true,
     }
 }
 
@@ -141,6 +142,9 @@ struct PingKeepaliveStream<S> {
     interval: Duration,
     wait: Pin<Box<tokio::time::Sleep>>,
     done: bool,
+    /// 上游最后字节是否收在 '\n'（行边界）。ping 只在行边界注入：SSE 注释行
+    /// 楔进两行之间无害，楔进半行 data 载荷中间会把一条事件撕成两条坏帧
+    at_line_start: bool,
 }
 
 impl<S> Stream for PingKeepaliveStream<S>
@@ -160,6 +164,9 @@ where
                 this.wait
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.interval);
+                if let Ok(b) = &item {
+                    this.at_line_start = b.last() == Some(&b'\n');
+                }
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => {
@@ -171,7 +178,12 @@ where
                     this.wait
                         .as_mut()
                         .reset(tokio::time::Instant::now() + this.interval);
-                    Poll::Ready(Some(Ok(Bytes::from_static(b": ping\n\n"))))
+                    if this.at_line_start {
+                        Poll::Ready(Some(Ok(Bytes::from_static(b": ping\n\n"))))
+                    } else {
+                        // 半行中间不楔入：保留静默，等上游下一字节到边界再发
+                        Poll::Pending
+                    }
                 } else {
                     Poll::Pending
                 }
@@ -622,9 +634,8 @@ pub async fn proxy(
     let json =
         parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
     let model = requested_model(&json);
-    // 并发上限（先于令牌桶限流占坑）：并发满的 429 不得白烧限流令牌；
-    // 反向序（限流先拒）只会让被拒请求瞬持名额，无害。拒绝时限流未扣减、
-    // 并发未占坑，与「拒绝路径零扣减」原则一致。guard 绑定响应体生命周期。
+    // 并发上限（管线唯一的限流维度）：guard 绑定响应体生命周期，SSE 流尽或
+    // 客户端断开才归还。拒绝时并发未占坑（try_acquire 全有或全无）。
     let conc = match crate::service::ratelimit::apply_concurrency_limits(
         st,
         user_id,
@@ -743,7 +754,8 @@ fn apply_extra(body: &mut Value, extra: Option<&Value>) {
     }
 }
 
-/// 已鉴权代理管线：限流 → 配额 → 路由 → 转发（含降级）→ 记账。
+/// 已鉴权代理管线：Plan 配额 → 路由 → 转发（含降级）→ 记账
+/// （并发上限已在入口 proxy 占坑、guard 绑定响应体；proxy_test 不占坑）。
 /// 端点开关检查与请求体解压/解析已在入口（proxy / proxy_test）完成，
 /// `json` 为解析结果、`body` 为原始字节（零改写快路径直传用）。
 async fn proxy_authed(
@@ -793,11 +805,7 @@ async fn proxy_authed(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // 3. 三层限流（模型限定规则按客户端模型名精确匹配，独立桶计量；
-    //    置于模型解析后执行——缺 model 字段/坏 JSON 的请求在上方解析即 400）
-    crate::service::ratelimit::apply_rate_limits(st, user_id, key_id, &model)?;
-
-    // 4b. Coding Plan 配额：超出按策略拦截(429)/降级改写模型/仅告警放行。
+    // 3. Coding Plan 配额：超出按策略拦截(429)/降级改写模型/仅告警放行。
     // 降级改写 json["model"] 并标记 plan_downgraded——零改写快路径直传原始
     // 客户端字节，必须强制走重建路径才能让改写生效。
     // decision.plan 即检查期按当前模型解析出的生效 Plan（模型作用域感知），
@@ -805,7 +813,6 @@ async fn proxy_authed(
     let mut plan_downgraded = false;
     let mut active_plan: Option<crate::store::plans::PlanRuntime> = None;
     if let Some(uid) = user_id {
-        usage::check_quota(st, uid)?;
         let decision = crate::service::plans::check_plan(st, uid, &model)?;
         active_plan = decision.plan;
         if let Some(downgraded) = decision.downgrade_to {
@@ -951,6 +958,10 @@ async fn proxy_authed(
             // cc-switch 无条件收拢的具名动机；其余上游维持路由开关语义）
             apply_system_head(&mut chat, system_head, system_head_merge);
             apply_reasoning_config(&mut chat, &route, &gating_model);
+            // 出站模型名统一在此改写（路由映射 upstream_model / [1m] 剥离）——
+            // transform 只写客户端模型，四个出站分支都必须补写，漏写会把
+            // claude-* 原名发给 Chat 上游（400/404 model-not-found）
+            chat["model"] = serde_json::Value::String(outbound_model.clone());
             return Ok((
                 serde_json::to_vec(&chat).map_err(AppError::internal)?,
                 "/chat/completions",
@@ -1007,7 +1018,14 @@ async fn proxy_authed(
                 let mut json = json.clone();
                 apply_extra(&mut json, extra.as_ref());
                 apply_system_head(&mut json, system_head, system_head_merge);
-                apply_reasoning_config(&mut json, &route, &gating_model);
+                // 原生 anthropic 透传体是 Anthropic 方言：apply_thinking_form 会
+                // 无条件剥 thinking 再按 Chat 形态重造（未配置 form 时不还原），
+                // 客户端的 thinking 配置被静默丢弃——方言改写仅对 Chat 体执行
+                let native_anthropic =
+                    endpoint.anthropic && provider.api_type.eq_ignore_ascii_case("anthropic");
+                if !native_anthropic {
+                    apply_reasoning_config(&mut json, &route, &gating_model);
+                }
                 strip_underscore_fields(&mut json);
                 json["model"] = serde_json::Value::String(outbound_model.clone());
                 Ok((
@@ -1318,6 +1336,41 @@ async fn proxy_authed(
                             continue 'candidates;
                         }
                         None => {
+                            // 上游 200 但忽略 stream 参数直接回了完整 JSON 体（非 SSE）：
+                            // 按「零产出断流」故障转移会白白重放请求并 502 掉一次成功
+                            // 生成（转换路径 1445 同场景已合成处理，透传按 JSON 响应透出）
+                            if !buffered.is_empty() && status.is_success() && !is_sse {
+                                st.breaker.record_success(provider.id);
+                                let mut body = Vec::with_capacity(buffered_bytes);
+                                for chunk in &buffered {
+                                    body.extend_from_slice(chunk);
+                                }
+                                let mut usage = parse_usage(&body);
+                                if endpoint.anthropic
+                                    && provider.api_type.eq_ignore_ascii_case("anthropic")
+                                {
+                                    if let Some(u) = usage.as_mut() {
+                                        u.fold_anthropic_input();
+                                    }
+                                }
+                                let latency = started.elapsed().as_millis() as i64;
+                                usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency)
+                                    .await;
+                                tracing::warn!(
+                                    request_id = %request_id, provider = %provider.name,
+                                    status = %status,
+                                    "stream request: upstream returned JSON body ignoring stream; passing through as non-stream"
+                                );
+                                return Ok(attach_upstream_headers(
+                                    Response::builder()
+                                        .status(status)
+                                        .header(header::CONTENT_TYPE, content_type.clone())
+                                        .header("X-Request-Id", request_id.to_string())
+                                        .body(Body::from(body))
+                                        .map_err(AppError::internal)?,
+                                    &rl,
+                                ));
+                            }
                             let msg = if buffered.is_empty() {
                                 "upstream stream ended before first byte".to_string()
                             } else {
@@ -1799,7 +1852,13 @@ async fn proxy_authed(
                     &rl,
                 ));
             }
-            let usage = parse_usage(&bytes);
+            let mut usage = parse_usage(&bytes);
+            // 原生 anthropic 透传：input 不含缓存桶，先归一为 OpenAI 口径再入账
+            if endpoint.anthropic && provider.api_type.eq_ignore_ascii_case("anthropic") {
+                if let Some(u) = usage.as_mut() {
+                    u.fold_anthropic_input();
+                }
+            }
             usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency).await;
             let mut response_status = status;
             let ctx = error_context(provider, &model, request_id);
@@ -2110,6 +2169,10 @@ async fn send_with_rectify(
                 provider = %provider.name, status = %status.as_u16(),
                 "rectified outbound body (media downgrade / thinking strip); retrying same provider once"
             );
+            // 重试体已被改写：复用客户端 idempotency-key 会命中上游
+            // 「同 key 不同体」冲突拒绝（Anthropic 幂等语义），改写腿必须换键
+            let mut retry_headers = client_headers.clone();
+            retry_headers.remove("idempotency-key");
             let retried = send_upstream(
                 st,
                 provider,
@@ -2118,7 +2181,7 @@ async fn send_with_rectify(
                 endpoint,
                 request_id,
                 streamed,
-                client_headers,
+                &retry_headers,
                 wants_1m,
             )
             .await?;
@@ -2185,8 +2248,13 @@ async fn collect_stream_or_body(
 fn looks_like_sse(bytes: &[u8]) -> bool {
     let trimmed: &[u8] = {
         let mut s = bytes;
+        // 完整 UTF-8 BOM 剥离：只剥首字节 0xEF 会残留 BB BF，后续 SSE/JSON
+        // 判定照旧失败（P1-15 的容忍目标就是 content-type 说谎的上游）
+        if s.starts_with(b"\xEF\xBB\xBF") {
+            s = &s[3..];
+        }
         while let Some((first, rest)) = s.split_first() {
-            if matches!(first, b' ' | b'\t' | b'\r' | b'\n' | 0xEF) {
+            if matches!(first, b' ' | b'\t' | b'\r' | b'\n') {
                 s = rest;
             } else {
                 break;
@@ -2266,8 +2334,13 @@ pub(crate) fn classify_upstream_body(body: &[u8]) -> &'static str {
 fn first_chunk_error(bytes: &[u8]) -> Option<String> {
     let trimmed: &[u8] = {
         let mut s = bytes;
+        // 完整 UTF-8 BOM 剥离（同 looks_like_sse）：残留 BB BF 会让
+        // serde_json 解析失败，错误 envelope 逃过换家判定
+        if s.starts_with(b"\xEF\xBB\xBF") {
+            s = &s[3..];
+        }
         while let Some((first, rest)) = s.split_first() {
-            if matches!(first, b' ' | b'\t' | b'\r' | b'\n' | 0xEF) {
+            if matches!(first, b' ' | b'\t' | b'\r' | b'\n') {
                 s = rest;
             } else {
                 break;
@@ -2786,9 +2859,10 @@ impl Stream for BillingStream {
 }
 
 /// 流式透传 + 流内 usage 捕获与记账：
-/// - capture_usage = true（上游 2xx）：捕获到 usage 或 [DONE] 时立即记账（仅一次），字节流原样透传
+/// - capture_usage = true（上游 2xx）：逐帧合并 usage（后帧非 None 字段覆盖），
+///   终态事件（[DONE]/response.*/message_stop）或流尾兜底记账（仅一次），字节流原样透传
 /// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
-/// - 流异常中断时由 chain 兜底记账（usage 未知）；客户端断开由 BillingOnDrop 兜底
+/// - 流异常中断时由 chain 兜底记账（含 EOF flush 后的 captured）；客户端断开由 BillingOnDrop 兜底
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
@@ -2820,11 +2894,13 @@ fn wrap_stream(
                 } else {
                     (None, false)
                 };
-                let has_usage = usage.is_some();
-                if has_usage {
-                    *captured.lock() = usage;
+                // 合并进 captured（后帧非 None 覆盖），不提前记账——anthropic 流
+                // message_start 桩（output≈0）先于 message_delta 终值到达
+                if let Some(u) = usage {
+                    merge_usage(&mut captured.lock(), u);
                 }
-                if (done || has_usage) && !recorded.swap(true, Ordering::SeqCst) {
+                // 记账只在终态事件（[DONE]/response.*/message_stop）触发一次
+                if done && !recorded.swap(true, Ordering::SeqCst) {
                     let u = captured.lock().take();
                     usage::record(&st, &meta, u.as_ref(), record_status, latency).await;
                 }
@@ -2836,9 +2912,18 @@ fn wrap_stream(
     let tail = once({
         let recorded = recorded.clone();
         let captured = captured.clone();
+        let buf = buf.clone();
         let st = st.clone();
         let meta = meta.clone();
         async move {
+            // EOF flush：流可能终止在未以空行收尾的最后事件（宽松上游不发
+            // 尾空行），追加事件边界强制解析残余 buffer，终态 usage 才不丢
+            if capture_usage {
+                let (usage, _) = feed_sse(&mut buf.lock(), b"\n\n");
+                if let Some(u) = usage {
+                    merge_usage(&mut captured.lock(), u);
+                }
+            }
             // 上游未正常结束（无 [DONE]/usage）时兜底记账
             if !recorded.swap(true, Ordering::SeqCst) {
                 let u = captured.lock().take();
@@ -2868,11 +2953,62 @@ pub fn parse_usage(body: &[u8]) -> Option<Usage> {
     serde_json::from_value(u.clone()).ok()
 }
 
-/// 增量解析 SSE 字节流：返回 (本次捕获的 usage, 是否遇到 [DONE])
-/// 缓冲跨块保留，事件按 "\n\n" 或 "\r\n\r\n" 切分
+/// 从单条 SSE data 帧提取 usage，按事件类型区分方言：
+/// - anthropic（type: message_*）：message_start 嵌在 message.usage，message_delta 在顶层
+/// - Chat：顶层 usage；Responses：response 内 usage
+/// 返回 (usage, 是否 anthropic 口径)——anthropic 的 input_tokens 不含缓存桶，
+/// 调用方须 fold_anthropic_input 归一后再入账。
+fn extract_usage_frame(v: &Value) -> Option<(Usage, bool)> {
+    let anthropic = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|t| t.starts_with("message_"))
+        .unwrap_or(false);
+    let u = if anthropic {
+        v.get("message")
+            .and_then(|m| m.get("usage"))
+            .or_else(|| v.get("usage"))
+    } else {
+        v.get("usage")
+            .or_else(|| v.get("response").and_then(|r| r.get("usage")))
+    }?;
+    serde_json::from_value(u.clone()).ok().map(|u| (u, anthropic))
+}
+
+/// 流式 usage 帧合并：后帧非 None 字段覆盖前帧，缺省字段保留前帧。
+/// anthropic 流 message_start 给 input/缓存桶桩，message_delta 才补终值 output。
+fn merge_usage(dst: &mut Option<Usage>, src: Usage) {
+    match dst {
+        None => *dst = Some(src),
+        Some(d) => {
+            if src.prompt_tokens.is_some() {
+                d.prompt_tokens = src.prompt_tokens;
+            }
+            if src.completion_tokens.is_some() {
+                d.completion_tokens = src.completion_tokens;
+            }
+            if src.input_tokens.is_some() {
+                d.input_tokens = src.input_tokens;
+            }
+            if src.output_tokens.is_some() {
+                d.output_tokens = src.output_tokens;
+            }
+            if src.cache_read_tokens.is_some() {
+                d.cache_read_tokens = src.cache_read_tokens;
+            }
+            if src.cache_write_tokens.is_some() {
+                d.cache_write_tokens = src.cache_write_tokens;
+            }
+        }
+    }
+}
+
+/// 增量解析 SSE 字节流：返回 (本次新解析到的合并 usage, 是否遇到终态)
+/// 缓冲跨块保留，事件按 "\n\n" 或 "\r\n\r\n" 切分。终态 = [DONE] /
+/// response.completed|incomplete|failed|done / message_stop（anthropic 无 [DONE]）。
 pub fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8]) -> (Option<Usage>, bool) {
     buf.extend_from_slice(chunk);
-    let mut usage = None;
+    let mut usage: Option<Usage> = None;
     let mut done = false;
     loop {
         let Some(idx) = find_event_end(buf) else {
@@ -2886,27 +3022,14 @@ pub fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8]) -> (Option<Usage>, bool) {
                 if data == "[DONE]" {
                     done = true;
                 } else if let Ok(v) = serde_json::from_str::<Value>(data) {
-                    if usage.is_none() {
-                        // Chat 流：usage 在顶层
-                        if let Some(u) = v.get("usage") {
-                            usage = serde_json::from_value(u.clone()).ok();
+                    if let Some((mut frame, anthropic)) = extract_usage_frame(&v) {
+                        if anthropic {
+                            // 原生 anthropic 口径归一为 OpenAI（input 含缓存桶），
+                            // 记账/计价/Plan 计数全链路才与 Chat 方言一致
+                            frame.fold_anthropic_input();
                         }
-                        // P1-18：Anthropic message_start 的 usage 嵌在 message 对象内
-                        //（原生 anthropic 透传流）→ 顶层捕获不到、缓存桶丢失
-                        if usage.is_none() {
-                            if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
-                                usage = serde_json::from_value(u.clone()).ok();
-                            }
-                        }
-                        // Responses 终态事件：usage 嵌在 response 对象内
-                        if usage.is_none() {
-                            if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
-                                usage = serde_json::from_value(u.clone()).ok();
-                            }
-                        }
+                        merge_usage(&mut usage, frame);
                     }
-                    // Responses 流无 [DONE] 哨兵：usage 在 response.completed 事件内，
-                    // 以终态事件类型判定结束
                     if let Some(ty) = v.get("type").and_then(|t| t.as_str()) {
                         if matches!(
                             ty,
@@ -2914,6 +3037,7 @@ pub fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8]) -> (Option<Usage>, bool) {
                                 | "response.incomplete"
                                 | "response.failed"
                                 | "response.done"
+                                | "message_stop"
                         ) {
                             done = true;
                         }
@@ -3222,8 +3346,8 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         assert!(done);
     }
 
-    /// P1-18：Anthropic message_start 的 usage 嵌在 message 对象内——原生
-    /// anthropic 透传流的缓存桶不再丢失（此前仅顶层 usage 被捕获）
+    /// P1-18：Anthropic message_start 的 usage 嵌在 message 对象内；原生
+    /// anthropic 口径 input 不含缓存桶 → 捕获侧折算为 OpenAI 口径（input 含桶）
     #[test]
     fn feed_sse_captures_nested_anthropic_message_usage() {
         let mut buf = Vec::new();
@@ -3235,9 +3359,11 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         );
         assert!(!done);
         let u = usage.expect("nested usage captured");
-        assert_eq!(u.input_tokens, Some(10));
+        // 折叠：input = 10 + 5(写) + 7(读) = 22；缓存桶原样保留供分桶计价
+        assert_eq!(u.input_tokens, Some(22));
         assert_eq!(u.cache_write_tokens, Some(5));
         assert_eq!(u.cache_read_tokens, Some(7));
+        assert_eq!(u.total(), 22);
         // 顶层 Chat usage 形态仍优先
         let mut buf2 = Vec::new();
         let (usage2, _) = feed_sse(
@@ -3245,6 +3371,42 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
             b"data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
         );
         assert_eq!(usage2.expect("top-level usage").prompt_tokens, Some(3));
+    }
+
+    /// 原生 anthropic 流：message_start 桩（output≈0）+ message_delta 终值
+    /// → 帧合并后 output 取终值，input/缓存桶保留首帧
+    #[test]
+    fn feed_sse_merges_anthropic_message_delta_final_usage() {
+        let mut buf = Vec::new();
+        let (usage, done) = feed_sse(
+            &mut buf,
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\
+              \"input_tokens\":25000,\"output_tokens\":1}}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3500}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        assert!(done, "message_stop 应判定终态");
+        let u = usage.expect("merged usage");
+        assert_eq!(u.input_tokens, Some(25000));
+        assert_eq!(u.output(), 3500, "终帧 output 覆盖桩值");
+    }
+
+    /// EOF flush：流终止在未以空行收尾的末事件，wrap_stream 尾部追加事件
+    /// 边界后残余帧必须可解析（此前永不解析 → usage 丢成 0）
+    #[test]
+    fn feed_sse_eof_flush_parses_unterminated_tail_event() {
+        let mut buf = Vec::new();
+        let (usage, done) = feed_sse(
+            &mut buf,
+            b"data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}\n",
+        );
+        assert!(!done);
+        assert!(usage.is_none(), "未收尾事件不在解析窗口内");
+        // 尾部兜底：追加事件边界强制解析
+        let (usage, _) = feed_sse(&mut buf, b"\n\n");
+        let u = usage.expect("residual event flushed at EOF");
+        assert_eq!(u.input(), 9);
+        assert_eq!(u.output(), 1);
     }
 
     /// P1-2：include_usage 合并语义——客户端自带 stream_options 时保留兄弟键

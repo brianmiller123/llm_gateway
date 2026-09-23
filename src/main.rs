@@ -51,20 +51,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(worker::aggregator::run(state.pool.clone()));
     tokio::spawn(worker::plan_sync::run(state.clone()));
 
+    // 关停：SIGINT/SIGTERM 统一走 watch 通道（docker stop 发 SIGTERM，只听 ctrl_c 会被硬杀、
+    // 在途 SSE 计费直接丢失）
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl_c handler");
+        tracing::info!("shutdown signal received");
+        let _ = shutdown_tx.send(true);
+    });
+
     // HTTPS 主服务（443）；HTTP（80）：开启重定向时仅 301，关闭时直接服务完整应用
-    let https = tokio::spawn(serve_https(app.clone(), cfg.clone()));
+    let https = tokio::spawn(serve_https(app.clone(), cfg.clone(), shutdown_rx.clone()));
     let http = if cfg.http_redirect_enabled {
-        tokio::spawn(serve_http_redirect(cfg.clone()))
+        tokio::spawn(serve_http_redirect(cfg.clone(), shutdown_rx.clone()))
     } else {
-        tokio::spawn(serve_http_app(app, cfg.clone()))
+        tokio::spawn(serve_http_app(app, cfg.clone(), shutdown_rx.clone()))
     };
 
+    // 服务错误立即传播；信号到达后进入有界排水：等存量请求（含 SSE）收尾再退出
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received");
-        }
         res = https => res??,
         res = http => res??,
+        _ = signal_task => {
+            tracing::info!("draining in-flight requests (up to 15s)");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while state.active_requests.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!("drain timeout; exiting with requests still in flight");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            tracing::info!("drain finished, exiting");
+        }
     }
     Ok(())
 }
@@ -73,52 +106,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn serve_https(
     app: Router,
     cfg: Arc<AppConfig>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = rustls_server_config(PathBuf::from(&cfg.tls_key), PathBuf::from(&cfg.tls_cert))?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(cfg.https_addr).await?;
     tracing::info!("HTTPS listening on {}", cfg.https_addr);
-
     loop {
-        // accept 瞬时错误（EMFILE 等）只告警不退出，避免 HTTPS 服务整体挂掉
-        let (tcp, addr) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept failed");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
+        tokio::select! {
+            // 关停：停止 accept 新连接；已接连接任务继续跑（排水期内自然收尾）
+            _ = shutdown.changed() => break,
+            accepted = listener.accept() => {
+                // accept 瞬时错误（EMFILE 等）只告警不退出，避免 HTTPS 服务整体挂掉
+                let (tcp, addr) = match accepted {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let stream = match acceptor.accept(tcp).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(%addr, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                    };
+                    let stream = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let mut app = app.clone();
+                        let peer = addr;
+                        async move {
+                            let mut req = req;
+                            // ConnectInfo 注入：与 axum::serve(with_connect_info) 对齐，供 v1 代理取客户端 IP
+                            req.extensions_mut()
+                                .insert(axum::extract::ConnectInfo(peer));
+                            app.call(req).await
+                        }
+                    });
+                    if let Err(e) =
+                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(stream, service)
+                            .await
+                    {
+                        tracing::warn!(%addr, error = %e, "connection error");
+                    }
+                });
             }
-        };
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        tokio::spawn(async move {
-            let stream = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(%addr, error = %e, "TLS handshake failed");
-                    return;
-                }
-            };
-            let stream = TokioIo::new(stream);
-            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                let mut app = app.clone();
-                let peer = addr;
-                async move {
-                    let mut req = req;
-                    // ConnectInfo 注入：与 axum::serve(with_connect_info) 对齐，供 v1 代理取客户端 IP
-                    req.extensions_mut()
-                        .insert(axum::extract::ConnectInfo(peer));
-                    app.call(req).await
-                }
-            });
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(stream, service)
-                .await
-            {
-                tracing::warn!(%addr, error = %e, "connection error");
-            }
-        });
+        }
     }
+    Ok(())
 }
 
 fn rustls_server_config(
@@ -140,6 +181,7 @@ fn rustls_server_config(
 async fn serve_http_app(
     app: Router,
     cfg: Arc<AppConfig>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(cfg.http_addr).await?;
     tracing::info!("HTTP serving on {} (redirect disabled)", cfg.http_addr);
@@ -147,6 +189,10 @@ async fn serve_http_app(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        // 收到关停信号：axum 停止 accept，存量连接跑完；整体退出上限由 main 的排水控制
+        let _ = shutdown.changed().await;
+    })
     .await?;
     Ok(())
 }
@@ -154,6 +200,7 @@ async fn serve_http_app(
 /// HTTP：全部 301 到 HTTPS（Location 端口取自 https_addr，而非请求 Host）
 async fn serve_http_redirect(
     cfg: Arc<AppConfig>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port = cfg
         .redirect_https_port
@@ -161,7 +208,11 @@ async fn serve_http_redirect(
     let app = Router::new().fallback(move |req: Request| redirect_to_https(req, https_port));
     let listener = TcpListener::bind(cfg.http_addr).await?;
     tracing::info!("HTTP redirect listening on {}", cfg.http_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await?;
     Ok(())
 }
 

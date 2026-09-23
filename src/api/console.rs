@@ -417,10 +417,13 @@ async fn usage(
     user: ConsoleUser,
 ) -> Result<impl IntoResponse, AppError> {
     let month = Utc::now().format("%Y-%m").to_string();
+    // 月窗按 UTC 截断再锚回 timestamptz（0021 约定：裸 date_trunc('month', now()) 走会话时区，
+    // TZ=Asia/Shanghai 部署下会错切月界，与 Utc::now() 的 month key 桶错位）
     let by_model: Vec<ModelStat> = sqlx::query_as(
         "SELECT model, COUNT(*)::bigint AS call_count, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, \
                 CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost) AS FLOAT8) AS cost \
-         FROM usage_logs WHERE user_id = $1 AND created_at >= date_trunc('month', now()) \
+         FROM usage_logs WHERE user_id = $1 AND created_at >= \
+           (date_trunc('month', now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' \
          GROUP BY model ORDER BY call_count DESC",
     )
     .bind(user.user.id)
@@ -436,10 +439,12 @@ async fn usage(
         output_tokens: i64,
         cost: f64,
     }
+    // stat_date 是 UTC 日桶：窗口按 UTC 当天 -6（精确 7 天，不随会话时区漂移）
     let daily: Vec<DailyStat> = sqlx::query_as(
         "SELECT stat_date, SUM(call_count)::bigint AS call_count, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, \
                 CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost) AS FLOAT8) AS cost \
-         FROM usage_daily WHERE user_id = $1 AND stat_date >= CURRENT_DATE - 7 \
+         FROM usage_daily WHERE user_id = $1 \
+           AND stat_date >= (now() AT TIME ZONE 'UTC')::date - 6 \
          GROUP BY stat_date ORDER BY stat_date",
     )
     .bind(user.user.id)
@@ -461,10 +466,11 @@ struct UsageRangeParams {
     range: Option<String>,
 }
 
-/// 范围 → usage_logs.created_at 时间下界 SQL 片段（固定白名单，非用户拼插）
+/// 范围 → usage_logs.created_at 时间下界 SQL 片段（固定白名单，非用户拼插）；
+/// month 分支按 UTC 截断再锚回（0021 约定）；interval 分支基于 now() 本身，与时区无关
 fn range_since_sql(range: Option<&str>) -> Result<String, AppError> {
     Ok(match range.map(str::trim).filter(|r| !r.is_empty()) {
-        None | Some("month") => "date_trunc('month', now())",
+        None | Some("month") => "(date_trunc('month', now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC'",
         Some("30m") => "now() - interval '30 minutes'",
         Some("1d") => "now() - interval '1 day'",
         Some("7d") => "now() - interval '7 days'",
@@ -487,10 +493,12 @@ async fn admin_usage(
     let since = range_since_sql(params.range.as_deref())?;
     let month = Utc::now().format("%Y-%m").to_string();
 
+    // 与 usage() 同一 UTC 月窗/日桶口径（0021 约定）
     let by_model: Vec<ModelStat> = sqlx::query_as(
         "SELECT model, COUNT(*)::bigint AS call_count, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, \
                 CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost) AS FLOAT8) AS cost \
-         FROM usage_logs WHERE created_at >= date_trunc('month', now()) \
+         FROM usage_logs \
+           WHERE created_at >= (date_trunc('month', now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' \
          GROUP BY model ORDER BY call_count DESC",
     )
     .fetch_all(&st.pool)
@@ -500,7 +508,8 @@ async fn admin_usage(
     let daily: Vec<DailyStat> = sqlx::query_as(
         "SELECT stat_date, SUM(call_count)::bigint AS call_count, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, \
                 CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost) AS FLOAT8) AS cost \
-         FROM usage_daily WHERE stat_date >= CURRENT_DATE - 7 \
+         FROM usage_daily \
+           WHERE stat_date >= (now() AT TIME ZONE 'UTC')::date - 6 \
          GROUP BY stat_date ORDER BY stat_date",
     )
     .fetch_all(&st.pool)
@@ -835,7 +844,8 @@ async fn fetch_trend_bucket(
     Ok(fill_bucket_gaps(rows, bucket_secs, count))
 }
 
-/// 拉取近 N 天按日趋势（补零；user_id 为 Some 时限定单用户；model 为 Some 时限定模型）
+/// 拉取近 N 天按日趋势（补零；user_id 为 Some 时限定单用户；model 为 Some 时限定模型；
+/// 窗口按 UTC 当天对齐，0021 约定）
 async fn fetch_trend_daily(
     pool: &sqlx::PgPool,
     days: i64,
@@ -848,7 +858,8 @@ async fn fetch_trend_daily(
                 COALESCE(SUM(u.input_tokens), 0)::bigint AS input_tokens, \
                 COALESCE(SUM(u.output_tokens), 0)::bigint AS output_tokens, \
                 COALESCE(SUM(u.cost), 0)::float8 AS cost \
-         FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, '1 day') AS d \
+         FROM generate_series((now() AT TIME ZONE 'UTC')::date - ($1::int - 1), \
+                              (now() AT TIME ZONE 'UTC')::date, '1 day') AS d \
          LEFT JOIN usage_daily u ON u.stat_date = d::date AND ($2::bigint IS NULL OR u.user_id = $2) \
                               AND ($3::text IS NULL OR u.model = $3) \
          GROUP BY d::date ORDER BY d::date",
@@ -886,7 +897,7 @@ async fn fetch_trend_by_user(
                 CAST(SUM(u.output_tokens) AS BIGINT) AS output_tokens, \
                 CAST(SUM(u.cost) AS FLOAT8) AS cost \
          FROM usage_daily u JOIN users usr ON usr.id = u.user_id \
-         WHERE u.stat_date >= CURRENT_DATE - ($1::int - 1) \
+         WHERE u.stat_date >= (now() AT TIME ZONE 'UTC')::date - ($1::int - 1) \
            AND ($2::text IS NULL OR u.model = $2) \
          GROUP BY u.user_id, usr.username, usr.display_name, u.stat_date \
          ORDER BY u.user_id, u.stat_date",
@@ -1035,11 +1046,12 @@ async fn fetch_trend_by_user_bucket(
     Ok(users)
 }
 
-/// 本月有调用的模型列表（下拉过滤用；user_id 为 Some 时限定单用户）
+/// 本月有调用的模型列表（下拉过滤用；user_id 为 Some 时限定单用户；月界按 UTC，0021 约定）
 async fn fetch_models(pool: &sqlx::PgPool, user_id: Option<i64>) -> Result<Vec<String>, AppError> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT model FROM usage_logs \
-         WHERE created_at >= date_trunc('month', now()) AND ($1::bigint IS NULL OR user_id = $1) \
+         WHERE created_at >= (date_trunc('month', now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' \
+           AND ($1::bigint IS NULL OR user_id = $1) \
          ORDER BY model",
     )
     .bind(user_id)
@@ -1559,7 +1571,7 @@ fn ensure_not_protected(
     Ok(())
 }
 
-/// 按用户 id 拒绝对受保护管理员的定向限制（配额 / 限流·并发规则的用户绑定）。
+/// 按用户 id 拒绝对受保护管理员的定向限制（限流·并发规则的用户绑定）。
 /// 这些通道绕过用户管理端点，也能锁死唯一管理入口的代理访问。
 pub(crate) async fn ensure_not_protected_by_id(
     st: &AppState,
@@ -1576,7 +1588,7 @@ pub(crate) async fn ensure_not_protected_by_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_active_by_user, fill_bucket_gaps_at, BucketPoint};
+    use super::{BucketPoint, aggregate_active_by_user, fill_bucket_gaps_at};
     use std::collections::HashMap;
 
     /// 在途聚合：同用户跨模型合计、总数降序/同数按 user_id 升序、by_model
@@ -1633,10 +1645,8 @@ mod tests {
             output_tokens: 0,
             cost: 0.0,
         };
-        let now_ts = 1_800_000_123; // 非整分，检验桶对齐
-        let minute = 60;
-
         let now_ts: i64 = 1_800_000_123; // 非整分，检验桶对齐
+        let minute = 60;
         let bucket_now = now_ts - now_ts.rem_euclid(minute);
         let rows = vec![
             bp(bucket_now - 3 * minute, 7),
@@ -1658,7 +1668,10 @@ mod tests {
 
         // 无数据行 → 全零
         let out = fill_bucket_gaps_at(vec![], now_ts, minute, 3);
-        assert_eq!(out.iter().map(|p| p.call_count).collect::<Vec<_>>(), vec![0, 0, 0]);
+        assert_eq!(
+            out.iter().map(|p| p.call_count).collect::<Vec<_>>(),
+            vec![0, 0, 0]
+        );
         // 30 分钟桶常量下窗口 = 48*1800s，与既有 half_hour 行为一致
         let bucket1800 = now_ts - now_ts.rem_euclid(1800);
         let out = fill_bucket_gaps_at(vec![bp(bucket1800 - 47 * 1800, 1)], now_ts, 1800, 48);

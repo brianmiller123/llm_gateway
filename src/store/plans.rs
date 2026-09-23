@@ -52,6 +52,16 @@ pub fn validate_period_config(
     Ok(())
 }
 
+/// 非 hourly 类型 period_hours 无效（DB CHECK 无条件 1..=168），写入前归一为 1：
+/// validate_period_config 只对 hourly 限定范围，其余类型携入越界值会撞 CHECK 500
+pub fn normalize_period_hours(period_type: &str, period_hours: i32) -> i32 {
+    if period_type == PERIOD_HOURLY {
+        period_hours
+    } else {
+        1
+    }
+}
+
 /// "HH:MM"（或 "HH:MM:SS"）→ NaiveTime；API 层入参校验用
 pub fn parse_active_time(raw: &str) -> Result<NaiveTime, String> {
     let t = raw.trim();
@@ -664,6 +674,8 @@ pub async fn list_user_plan_memberships(
 // ---------- CRUD ----------
 
 pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx::Error> {
+    // 当期口径与 CURRENT_PERIOD_PREDICATE 一致；hourly 网格偏移后同窗可能残留旧桶，
+    // 内层 DISTINCT ON 取每 (user, plan) 最新桶（当前网格）再聚合，避免双计
     sqlx::query_as::<_, PlanSummary>(
         "SELECT p.id, p.name, p.description, p.priority, p.token_limit, p.period_type, \
                 p.period_hours, p.period_anchor_mode, \
@@ -680,18 +692,22 @@ pub async fn list_plan_summaries(pool: &PgPool) -> Result<Vec<PlanSummary>, sqlx
                  ) mm) AS member_count \
          FROM coding_plans p \
          LEFT JOIN ( \
-             SELECT pc.plan_id, SUM(pc.tokens) AS used_tokens, COUNT(DISTINCT pc.user_id) AS active_users \
-             FROM plan_usage_counters pc \
-             JOIN coding_plans p2 ON p2.id = pc.plan_id \
-             WHERE (p2.period_type = 'total') \
-                OR (p2.period_type = 'daily' AND pc.period_start = \
-                    date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
-                OR (p2.period_type = 'monthly' AND pc.period_start = \
-                    date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
-                OR (p2.period_type = 'hourly' \
-                    AND pc.period_start > now() - make_interval(hours => p2.period_hours) \
-                    AND pc.period_start <= now()) \
-             GROUP BY pc.plan_id \
+            SELECT t.plan_id, SUM(t.tokens) AS used_tokens, COUNT(DISTINCT t.user_id) AS active_users \
+            FROM ( \
+              SELECT DISTINCT ON (pc.user_id, pc.plan_id) pc.user_id, pc.plan_id, pc.tokens \
+              FROM plan_usage_counters pc \
+              JOIN coding_plans p2 ON p2.id = pc.plan_id \
+              WHERE (p2.period_type = 'total') \
+                 OR (p2.period_type = 'daily' AND pc.period_start = \
+                     date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+                 OR (p2.period_type = 'monthly' AND pc.period_start = \
+                     date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') \
+                 OR (p2.period_type = 'hourly' \
+                     AND pc.period_start > now() - make_interval(hours => p2.period_hours) \
+                     AND pc.period_start <= now()) \
+              ORDER BY pc.user_id, pc.plan_id, pc.period_start DESC \
+            ) t \
+            GROUP BY t.plan_id \
          ) u ON u.plan_id = p.id \
          ORDER BY p.priority DESC, p.id",
     )
@@ -1255,17 +1271,19 @@ pub struct PlanUsageSnapshot {
 
 /// 各启用 Plan 的当期用量快照（缓存重载；只读不清理，与月度缓存同语义）。
 /// 日期/月份界显式按 UTC 计算（CURRENT_DATE/date_trunc 裸用会随会话时区漂移）；
-/// hourly 以「(now - period_hours, now]」开区间窗命中当前桶（桶起点 ≤ now 恒成立，
-/// 上一桶起点 ≤ now - period_hours 被严格大于排除）。
+/// hourly 以「(now - period_hours, now]」开区间窗命中当前桶，但网格偏移（锚点/
+/// period_hours 变更、成员重加）后同窗可能残留旧桶 → DISTINCT ON 取每
+/// (user, plan) period_start 最新的一行（当前网格；非 hourly 窗口为等值谓词
+/// 仅一行，结果不变）。
 pub async fn load_usage_snapshots(pool: &PgPool) -> Result<Vec<PlanUsageSnapshot>, sqlx::Error> {
     sqlx::query_as::<_, PlanUsageSnapshot>(
-        "SELECT pc.user_id, pc.plan_id, \
+        "SELECT DISTINCT ON (pc.user_id, pc.plan_id) pc.user_id, pc.plan_id, \
                 CASE p.period_type \
                   WHEN 'daily' THEN 'd:' || to_char(pc.period_start AT TIME ZONE 'UTC', 'YYYY-MM-DD') \
                   WHEN 'monthly' THEN 'm:' || to_char(pc.period_start AT TIME ZONE 'UTC', 'YYYY-MM') \
                   WHEN 'hourly' THEN 'h:' || (extract(epoch from pc.period_start)::bigint)::text \
                   ELSE 't' END AS period_key, \
-                SUM(pc.tokens)::bigint AS used \
+                pc.tokens AS used \
          FROM plan_usage_counters pc \
          JOIN coding_plans p ON p.id = pc.plan_id AND p.enabled = TRUE \
          WHERE (p.period_type = 'total') \
@@ -1276,7 +1294,7 @@ pub async fn load_usage_snapshots(pool: &PgPool) -> Result<Vec<PlanUsageSnapshot
             OR (p.period_type = 'hourly' \
                 AND pc.period_start > now() - make_interval(hours => p.period_hours) \
                 AND pc.period_start <= now()) \
-         GROUP BY pc.user_id, pc.plan_id, p.period_type, pc.period_start",
+         ORDER BY pc.user_id, pc.plan_id, pc.period_start DESC",
     )
     .fetch_all(pool)
     .await
@@ -1291,7 +1309,8 @@ pub struct DailyUsage {
     pub tokens: i64,
 }
 
-/// Plan 成员逐日用量趋势（usage_daily 按成员聚合；历史回溯）
+/// Plan 成员逐日用量趋势（usage_daily 按成员聚合；历史回溯）。
+/// 近 N 天按 UTC 日界（部署时区非 UTC 时 CURRENT_DATE 会漂移），含今日共 N 天
 pub async fn plan_daily_trend(
     pool: &PgPool,
     plan_id: i64,
@@ -1306,7 +1325,7 @@ pub async fn plan_daily_trend(
              JOIN plan_groups pg ON pg.group_id = m.group_id WHERE pg.plan_id = $1 \
              UNION \
              SELECT pu.user_id FROM plan_users pu WHERE pu.plan_id = $1) \
-           AND d.stat_date >= CURRENT_DATE - $2::int \
+          AND d.stat_date >= (now() AT TIME ZONE 'UTC')::date - ($2::int - 1) \
          GROUP BY d.stat_date ORDER BY d.stat_date",
     )
     .bind(plan_id)
@@ -1369,8 +1388,23 @@ const CURRENT_PERIOD_PREDICATE: &str = "((p.period_type = 'total') \
          AND pc.period_start > now() - make_interval(hours => p.period_hours) \
          AND pc.period_start <= now()))";
 
+/// 当前周期内每 (user, plan) 的最新计数器行（口径见 [`CURRENT_PERIOD_PREDICATE`]）。
+/// hourly 网格偏移后同窗可能残留旧桶，DISTINCT ON 取 period_start 最新一行代表
+/// 当前网格；非 hourly 窗口为等值谓词仅一行，结果不变。plan_id 过滤放在子查询内，
+/// 避免外层过滤时 DISTINCT ON 被迫全表展开。
+fn current_period_latest_rows_sql() -> String {
+    format!(
+        "SELECT DISTINCT ON (pc.user_id, pc.plan_id) pc.user_id, pc.plan_id, pc.tokens \
+         FROM plan_usage_counters pc \
+         JOIN coding_plans p ON p.id = pc.plan_id \
+         WHERE pc.plan_id = $1 AND {CURRENT_PERIOD_PREDICATE} \
+         ORDER BY pc.user_id, pc.plan_id, pc.period_start DESC"
+    )
+}
+
 /// 当前周期（自上次重置）成员按用户用量——plan_usage_counters 权威口径，与配额
-/// 检查/阈值告警同源；按日期回溯请用 [`plan_user_usage`]（usage_daily）。
+/// 检查/阈值告警同源（每 (user, plan) 取当前网格最新桶，见
+/// [`current_period_latest_rows_sql`]）；按日期回溯请用 [`plan_user_usage`]（usage_daily）。
 /// 返回 (分页行, 用户总数, 当期合计 tokens)。
 pub async fn plan_user_usage_current(
     pool: &PgPool,
@@ -1380,28 +1414,24 @@ pub async fn plan_user_usage_current(
 ) -> Result<(Vec<PlanUserCurrentUsage>, i64, i64), sqlx::Error> {
     let rows = sqlx::query_as::<_, PlanUserCurrentUsage>(&format!(
         "SELECT u.id AS user_id, u.username, u.display_name, \
-                SUM(pc.tokens)::bigint AS tokens \
-         FROM plan_usage_counters pc \
-         JOIN coding_plans p ON p.id = pc.plan_id \
-         JOIN users u ON u.id = pc.user_id \
-         WHERE pc.plan_id = $1 AND {CURRENT_PERIOD_PREDICATE} \
+                SUM(t.tokens)::bigint AS tokens \
+         FROM ({}) t \
+         JOIN users u ON u.id = t.user_id \
          GROUP BY u.id, u.username, u.display_name \
          ORDER BY tokens DESC \
          LIMIT $2 OFFSET $3",
+        current_period_latest_rows_sql()
     ))
     .bind(plan_id)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    let (total, used): (i64, i64) = sqlx::query_as(
-        &format!(
-            "SELECT COUNT(DISTINCT pc.user_id)::bigint, COALESCE(SUM(pc.tokens), 0)::bigint \
-         FROM plan_usage_counters pc \
-         JOIN coding_plans p ON p.id = pc.plan_id \
-         WHERE pc.plan_id = $1 AND {CURRENT_PERIOD_PREDICATE}",
-        ),
-    )
+    let (total, used): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT COUNT(DISTINCT t.user_id)::bigint, COALESCE(SUM(t.tokens), 0)::bigint \
+         FROM ({}) t",
+        current_period_latest_rows_sql()
+    ))
     .bind(plan_id)
     .fetch_one(pool)
     .await?;
@@ -1482,6 +1512,20 @@ mod tests {
         assert_eq!(format_token_limit(2_000_000_000_000), "2T");
         assert_eq!(format_token_limit(1_500_000), "1.5M");
         assert_eq!(format_token_limit(999), "999");
+    }
+
+    #[test]
+    fn normalizes_period_hours_for_db_check() {
+        // DB CHECK 无条件 1..=168：hourly 原样透传（含边界），非 hourly 一律归一为 1
+        assert_eq!(normalize_period_hours(PERIOD_HOURLY, 24), 24);
+        assert_eq!(normalize_period_hours(PERIOD_HOURLY, 1), 1);
+        assert_eq!(
+            normalize_period_hours(PERIOD_HOURLY, MAX_PERIOD_HOURS),
+            MAX_PERIOD_HOURS
+        );
+        assert_eq!(normalize_period_hours(PERIOD_DAILY, 168), 1);
+        assert_eq!(normalize_period_hours(PERIOD_MONTHLY, 3), 1);
+        assert_eq!(normalize_period_hours(PERIOD_TOTAL, 24), 1);
     }
 
     fn rt(pt: &str) -> PlanRuntime {
@@ -2280,11 +2324,19 @@ mod tests {
         // 单用户回源与全量加载一致（/api/me/plan 缓存未命中兜底路径）
         for uid in [alice, bob, carol] {
             let scoped = load_plan_runtimes_for_user(&pool, uid).await.unwrap();
-            assert_eq!(resolve(&scoped, uid).map(|p| p.plan_id), resolve(&rt, uid).map(|p| p.plan_id));
+            assert_eq!(
+                resolve(&scoped, uid).map(|p| p.plan_id),
+                resolve(&rt, uid).map(|p| p.plan_id)
+            );
         }
         // 无归属用户回源为空（不误报归属）
         let dave = seed_user(&pool, "dave").await;
-        assert!(load_plan_runtimes_for_user(&pool, dave).await.unwrap().is_empty());
+        assert!(
+            load_plan_runtimes_for_user(&pool, dave)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // 停用 Plan 退出运行时：carol 回退分组通道，bob 无入口 → 不限额
         sqlx::query("UPDATE coding_plans SET enabled = FALSE WHERE id = $1")
@@ -2356,10 +2408,7 @@ mod tests {
             t(23)
         ));
         // 跨零点窗内 23:00 → night 生效（active 无窗口同样生效，priority 2 > 0 择优）
-        assert_eq!(
-            resolve_plan(&rt, u, t(23), None).unwrap().plan_id,
-            night.id
-        );
+        assert_eq!(resolve_plan(&rt, u, t(23), None).unwrap().plan_id, night.id);
 
         // 移除直连成员后归属消失（分组通道行不受影响）
         remove_plan_users(&pool, active.id, &[u]).await.unwrap();

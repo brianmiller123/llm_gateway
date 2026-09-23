@@ -43,7 +43,7 @@ pub fn check_plan(st: &AppState, user_id: i64, model: &str) -> Result<PlanDecisi
         .get_plan(user_id, plan.plan_id, &plan.period_key(now));
 
     // 80/95/100% 阈值告警（进程内 + DB 双层去重，异步派发不阻塞热路径）
-    crate::service::notify::check_and_dispatch(st, user_id, &plan, used);
+    crate::service::notify::check_and_dispatch(st, user_id, &plan, used, &plan.period_key(now));
 
     if used < plan.token_limit {
         return Ok(PlanDecision {
@@ -98,21 +98,20 @@ fn blocked(
 /// 记账事务提交后调用：用量推进可能跨过 80/95/100% 阈值 → 触发告警检查。
 /// `plan_id` 传代理路径解析出的记账 Plan（[`PlanDecision::plan`]）——模型作用域下
 /// 无模型二次解析可能选中另一个 Plan，把告警记到错误的配额上。
-pub fn after_usage_record(st: &AppState, user_id: i64, plan_id: i64) {
+/// `period_key` 由调用方传记账行归属的周期键（`bill.period_key`）：
+/// 告警与扣量同桶，跨桶时刻落账（如 11:58 发起、12:02 记账）不漏告警。
+pub fn after_usage_record_with_key(st: &AppState, user_id: i64, plan_id: i64, period_key: &str) {
     let Some(plan) = st
         .plans
         .read()
         .get(&user_id)
         .and_then(|c| c.iter().find(|p| p.plan_id == plan_id).cloned())
     else {
-        // Plan 已删除/停用（运行时已刷新）→ 无从告警，静默返回
         return;
     };
-    let used = st
-        .usage
-        .get_plan(user_id, plan.plan_id, &plan.period_key(chrono::Utc::now()));
+    let used = st.usage.get_plan(user_id, plan.plan_id, period_key);
     if crate::service::notify::crossed_level(used, plan.token_limit).is_some() {
-        crate::service::notify::check_and_dispatch(st, user_id, &plan, used);
+        crate::service::notify::check_and_dispatch(st, user_id, &plan, used, period_key);
     }
 }
 

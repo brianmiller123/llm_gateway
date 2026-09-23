@@ -277,9 +277,7 @@ pub struct AdminRateRule {
     pub scope_id: Option<i64>,
     /// 模型限定（NULL = 所有模型）
     pub model: Option<String>,
-    pub rpm: i32,
-    pub burst: i32,
-    /// 并发上限（0 = 不限）
+    /// 并发上限（0 = 不限；唯一限制维度，令牌桶 rpm/burst 已随 0027 移除）
     pub concurrency: i32,
     pub enabled: bool,
     pub updated_at: DateTime<Utc>,
@@ -287,7 +285,7 @@ pub struct AdminRateRule {
 
 pub async fn list_rate_rules(pool: &PgPool) -> Result<Vec<AdminRateRule>, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
-        "SELECT id, scope, scope_id, model, rpm, burst, concurrency, enabled, updated_at FROM rate_limit_rules ORDER BY id",
+        "SELECT id, scope, scope_id, model, concurrency, enabled, updated_at FROM rate_limit_rules ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -298,21 +296,17 @@ pub async fn create_rate_rule(
     scope: &str,
     scope_id: Option<i64>,
     model: Option<&str>,
-    rpm: i32,
-    burst: i32,
     concurrency: i32,
     enabled: bool,
 ) -> Result<AdminRateRule, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
-        "INSERT INTO rate_limit_rules (scope, scope_id, model, rpm, burst, concurrency, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         RETURNING id, scope, scope_id, model, rpm, burst, concurrency, enabled, updated_at",
+        "INSERT INTO rate_limit_rules (scope, scope_id, model, concurrency, enabled) \
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id, scope, scope_id, model, concurrency, enabled, updated_at",
     )
     .bind(scope)
     .bind(scope_id)
     .bind(model)
-    .bind(rpm)
-    .bind(burst)
     .bind(concurrency)
     .bind(enabled)
     .fetch_one(pool)
@@ -325,34 +319,28 @@ pub async fn update_rate_rule(
     scope: Option<&str>,
     scope_id: Option<Option<i64>>,
     model: Option<Option<&str>>,
-    rpm: Option<i32>,
-    burst: Option<i32>,
     concurrency: Option<i32>,
     enabled: Option<bool>,
 ) -> Result<Option<AdminRateRule>, sqlx::Error> {
     sqlx::query_as::<_, AdminRateRule>(
         "UPDATE rate_limit_rules SET \
             scope = COALESCE($2, scope), \
-            scope_id = CASE WHEN $9 THEN $3 ELSE scope_id END, \
-            model = CASE WHEN $10 THEN $4 ELSE model END, \
-            rpm = COALESCE($5, rpm), \
-            burst = COALESCE($6, burst), \
-            concurrency = COALESCE($7, concurrency), \
-            enabled = COALESCE($8, enabled), \
+            scope_id = CASE WHEN $7 THEN $3 ELSE scope_id END, \
+            model = CASE WHEN $8 THEN $4 ELSE model END, \
+            concurrency = COALESCE($5, concurrency), \
+            enabled = COALESCE($6, enabled), \
             updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, scope, scope_id, model, rpm, burst, concurrency, enabled, updated_at",
+         RETURNING id, scope, scope_id, model, concurrency, enabled, updated_at",
     )
     .bind(id)
     .bind(scope)
     .bind(scope_id)
     .bind(model)
-    .bind(rpm)
-    .bind(burst)
     .bind(concurrency)
     .bind(enabled)
-    .bind(scope_id.is_some()) // $9：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
-    .bind(model.is_some()) // $10：同上
+    .bind(scope_id.is_some()) // $7：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
+    .bind(model.is_some()) // $8：同上
     .fetch_optional(pool)
     .await
 }
@@ -363,76 +351,6 @@ pub async fn delete_rate_rule(pool: &PgPool, id: i64) -> Result<bool, sqlx::Erro
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
-}
-
-// ---------- 用户配额 ----------
-
-#[derive(Debug, Clone, FromRow, serde::Serialize)]
-pub struct AdminQuota {
-    pub user_id: i64,
-    pub username: String,
-    pub monthly_token_quota: Option<i64>,
-    pub monthly_cost_quota: Option<f64>,
-    pub billing_day: i32,
-    pub notify_percent: i32,
-    pub enabled: bool,
-}
-
-pub async fn list_quotas(pool: &PgPool) -> Result<Vec<AdminQuota>, sqlx::Error> {
-    // 列出全部用户（LEFT JOIN：未配置配额的用户也展示，配额列为空表示不限制）
-    sqlx::query_as::<_, AdminQuota>(
-        "SELECT u.id AS user_id, u.username, q.monthly_token_quota, q.monthly_cost_quota::float8, \
-                COALESCE(q.billing_day, 1) AS billing_day, \
-                COALESCE(q.notify_percent, 80) AS notify_percent, \
-                COALESCE(q.enabled, TRUE) AS enabled \
-         FROM users u LEFT JOIN user_quotas q ON q.user_id = u.id ORDER BY u.id",
-    )
-    .fetch_all(pool)
-    .await
-}
-
-pub async fn upsert_quota(
-    pool: &PgPool,
-    user_id: i64,
-    monthly_token_quota: Option<Option<i64>>,
-    monthly_cost_quota: Option<Option<f64>>,
-    billing_day: Option<i32>,
-    notify_percent: Option<i32>,
-    enabled: Option<bool>,
-) -> Result<Option<AdminQuota>, sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO user_quotas (user_id, monthly_token_quota, monthly_cost_quota, billing_day, notify_percent, enabled) \
-         VALUES ($1, COALESCE($2, NULL), COALESCE($3, NULL), COALESCE($4, 1), COALESCE($5, 80), COALESCE($6, TRUE)) \
-         ON CONFLICT (user_id) DO UPDATE SET \
-            monthly_token_quota = CASE WHEN $9 THEN $7 ELSE user_quotas.monthly_token_quota END, \
-            monthly_cost_quota  = CASE WHEN $10 THEN $8 ELSE user_quotas.monthly_cost_quota END, \
-            billing_day = COALESCE($4, user_quotas.billing_day), \
-            notify_percent = COALESCE($5, user_quotas.notify_percent), \
-            enabled = COALESCE($6, user_quotas.enabled), \
-            updated_at = now()",
-    )
-    .bind(user_id)
-    .bind(monthly_token_quota)
-    .bind(monthly_cost_quota)
-    .bind(billing_day)
-    .bind(notify_percent)
-    .bind(enabled)
-    .bind(monthly_token_quota) // $7
-    .bind(monthly_cost_quota) // $8
-    .bind(monthly_token_quota.is_some()) // $9：字段是否显式提供（None=保留原值；Some(inner)=设置/清空）
-    .bind(monthly_cost_quota.is_some()) // $10
-    .execute(pool)
-    .await?;
-
-    // 再查完整行（带 username）
-    sqlx::query_as::<_, AdminQuota>(
-        "SELECT q.user_id, u.username, q.monthly_token_quota, q.monthly_cost_quota::float8, \
-                q.billing_day, q.notify_percent, q.enabled \
-         FROM user_quotas q JOIN users u ON u.id = q.user_id WHERE q.user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
 }
 
 // ---------- 模型价格 ----------

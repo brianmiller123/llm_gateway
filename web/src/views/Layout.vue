@@ -61,7 +61,7 @@
               <el-icon><MagicStick /></el-icon><span>高级请求配置</span>
             </el-menu-item>
             <el-menu-item index="/limits">
-              <el-icon><Timer /></el-icon><span>限流与配额</span>
+              <el-icon><Timer /></el-icon><span>限流</span>
             </el-menu-item>
             <el-menu-item index="/api-endpoints">
               <el-icon><Link /></el-icon><span>API 端点</span>

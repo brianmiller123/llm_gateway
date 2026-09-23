@@ -9,7 +9,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -55,11 +55,6 @@ pub fn routes(state: AppState) -> Router<AppState> {
             patch(update_rate_limit)
                 .delete(delete_rate_limit)
                 .layer(admin.clone()),
-        )
-        .route("/api/admin/quotas", get(list_quotas).layer(admin.clone()))
-        .route(
-            "/api/admin/quotas/{user_id}",
-            put(upsert_quota).layer(admin.clone()),
         )
         .route(
             "/api/admin/prices",
@@ -166,17 +161,26 @@ async fn fetch_upstream_models(
                         text.chars().take(300).collect::<String>()
                     ));
                 }
-                let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| v.get("data").and_then(|d| d.as_array()).cloned())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| {
-                                m.get("id").and_then(|i| i.as_str()).map(str::to_string)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // 响应形态防御：200 但非 JSON / 非 {"data":[...]} / 非裸数组一律报错——
+                // 空列表会被下游 replace_provider_models 当成“清空模型库”，绝不能静默吞
+                let head: String = text.chars().take(120).collect();
+                let bad_shape = || format!("unexpected /models response shape: {head}");
+                let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                    format!("unexpected /models response shape (invalid JSON: {e}): {head}")
+                })?;
+                let arr: &Vec<serde_json::Value> = match &parsed {
+                    serde_json::Value::Array(arr) => arr,
+                    // 裸数组（部分网关形态）与 {"data":[...]} 均合法；空数组是合法的空结果
+                    serde_json::Value::Object(o) => match o.get("data").and_then(|d| d.as_array()) {
+                        Some(arr) => arr,
+                        None => return Err(bad_shape()),
+                    },
+                    _ => return Err(bad_shape()),
+                };
+                let models: Vec<String> = arr
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                    .collect();
                 return Ok(models);
             }
             Err(e) => {
@@ -990,7 +994,7 @@ struct RoutePatch {
     provider_id: Option<i64>,
     priority: Option<i32>,
     fallback_ids: Option<Vec<i64>>,
-    /// 外层 None = 不改动；内层 None/null = 清空映射；Some = 设置
+    /// Some(v) 设置 / 空串 = 清空映射；外层 None（含 JSON null）= 不改动
     #[serde(default)]
     upstream_model: Option<Option<String>>,
     enabled: Option<bool>,
@@ -1004,13 +1008,13 @@ struct RoutePatch {
     /// strict_system_head 关闭时无效果）
     #[serde(default)]
     system_head_merge: Option<bool>,
-    /// H3：外层 None = 不改动；内层 None/null = 清空回 passthrough；Some = 设置
+    /// H3：Some(v) 设置 / 空串 = 清空回 passthrough；外层 None（含 JSON null）= 不改动
     #[serde(default)]
     reasoning_effort_mode: Option<Option<String>>,
-    /// H3：thinking 形态（外层 None = 不改动；内层 None = 清空）
+    /// H3：thinking 形态（Some(v) 设置 / 空串 = 清空；外层 None/缺省 = 不改动）
     #[serde(default)]
     thinking_form: Option<Option<String>>,
-    /// H2：方言字段透传白名单（外层 None = 不改动；内层 None = 清空）
+    /// H2：方言字段透传白名单（Some(v) 设置 / 空串 = 清空；外层 None/缺省 = 不改动）
     #[serde(default)]
     responses_passthrough_fields: Option<Option<String>>,
 }
@@ -1054,22 +1058,24 @@ async fn update_route(
             }
         }
     }
-    let upstream_model = req
-        .upstream_model
-        .map(|v| normalize_upstream_model(v.as_deref()))
-        .transpose()?;
-    let effort_mode = req
-        .reasoning_effort_mode
-        .map(|v| normalize_effort_mode(v.as_deref()))
-        .transpose()?;
-    let thinking_form = req
-        .thinking_form
-        .map(|v| normalize_thinking_form(v.as_deref()))
-        .transpose()?;
-    let passthrough = req
-        .responses_passthrough_fields
-        .map(|v| normalize_passthrough_fields(v.as_deref()))
-        .transpose()?;
+    // 必须保留外层 Some：空串归一为内层 None 才是“清空”，
+    // .map().transpose() 会把 Some(None) 塌缩成不修改（PATCH 空串静默失效的根因）
+    let upstream_model = match req.upstream_model {
+        None => None,
+        Some(v) => Some(normalize_upstream_model(v.as_deref())?),
+    };
+    let effort_mode = match req.reasoning_effort_mode {
+        None => None,
+        Some(v) => Some(normalize_effort_mode(v.as_deref())?),
+    };
+    let thinking_form = match req.thinking_form {
+        None => None,
+        Some(v) => Some(normalize_thinking_form(v.as_deref())?),
+    };
+    let passthrough = match req.responses_passthrough_fields {
+        None => None,
+        Some(v) => Some(normalize_passthrough_fields(v.as_deref())?),
+    };
     let route = config::update_route(
         &st.pool,
         id,
@@ -1112,10 +1118,6 @@ struct RateLimitReq {
     /// 模型限定（空/缺省 = 所有模型；客户端模型名精确匹配）
     #[serde(default)]
     model: Option<String>,
-    #[serde(default = "default_rpm")]
-    rpm: i32,
-    #[serde(default = "default_burst")]
-    burst: i32,
     /// 并发上限（在途请求数；0 = 不限）
     #[serde(default)]
     concurrency: i32,
@@ -1135,13 +1137,6 @@ fn normalize_rule_model(model: Option<&str>) -> Result<Option<String>, AppError>
         }
     }
     Ok(m)
-}
-
-fn default_rpm() -> i32 {
-    60
-}
-fn default_burst() -> i32 {
-    10
 }
 
 async fn list_rate_limits(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
@@ -1191,11 +1186,10 @@ async fn create_rate_limit(
         ));
     }
     ensure_rule_target_allowed(&st, &scope, req.scope_id).await?;
-    if req.rpm <= 0 || req.burst <= 0 {
-        return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
-    }
     if req.concurrency < 0 {
-        return Err(AppError::BadRequest("concurrency must be >= 0 (0 = unlimited)".into()));
+        return Err(AppError::BadRequest(
+            "concurrency must be >= 0 (0 = unlimited)".into(),
+        ));
     }
     let model = normalize_rule_model(req.model.as_deref())?;
     let rule = config::create_rate_rule(
@@ -1203,8 +1197,6 @@ async fn create_rate_limit(
         &scope,
         req.scope_id,
         model.as_deref(),
-        req.rpm,
-        req.burst,
         req.concurrency,
         req.enabled,
     )
@@ -1227,12 +1219,13 @@ async fn create_rate_limit(
 #[derive(Deserialize)]
 struct RateLimitPatch {
     scope: Option<String>,
-    /// Some(v) 更新 / Some(None) 清空 / None 不变
+    /// Some(v) 设置；JSON 无法表达 Some(None)，清空用 clear_scope_id 或切 scope=global
     scope_id: Option<Option<i64>>,
+    /// true = 清空 scope_id；JSON null 与缺省无法区分，故用显式布尔
+    #[serde(default)]
+    clear_scope_id: Option<bool>,
     /// Some(Some(v)) 设置 / Some(None) 或空串 清空 / None 不变
     model: Option<Option<String>>,
-    rpm: Option<i32>,
-    burst: Option<i32>,
     concurrency: Option<i32>,
     enabled: Option<bool>,
 }
@@ -1243,7 +1236,6 @@ async fn update_rate_limit(
     Path(id): Path<i64>,
     Json(req): Json<RateLimitPatch>,
 ) -> Result<Response, AppError> {
-    // 与 create 一致：更新同样校验（此前缺口可导致 rpm/burst <= 0 → 限流器除零/常拒）
     if let Some(scope) = req.scope.as_deref().map(str::trim) {
         if !matches!(scope, "global" | "user" | "api_key") {
             return Err(AppError::BadRequest(
@@ -1251,8 +1243,13 @@ async fn update_rate_limit(
             ));
         }
     }
-    if req.rpm.is_some_and(|v| v <= 0) || req.burst.is_some_and(|v| v <= 0) {
-        return Err(AppError::BadRequest("rpm and burst must be > 0".into()));
+    // 与 create 一致：负数并发上限拒绝（store 层按 limit > 0 过滤，负数会被静默当作不限）
+    if let Some(c) = req.concurrency {
+        if c < 0 {
+            return Err(AppError::BadRequest(
+                "concurrency must be >= 0 (0 = unlimited)".into(),
+            ));
+        }
     }
     let old = config::list_rate_rules(&st.pool)
         .await
@@ -1266,10 +1263,17 @@ async fn update_rate_limit(
         .map(str::trim)
         .map(str::to_string)
         .unwrap_or_else(|| old.scope.clone());
-    let final_scope_id = match req.scope_id {
-        Some(v) => v,
-        None => old.scope_id,
+    // JSON 出入参构造不出 Some(None)，清空走显式布尔；
+    // scope=global 时 scope_id 无意义，顺手把历史脏值一并清掉
+    let mut scope_id = if req.clear_scope_id == Some(true) {
+        Some(None)
+    } else {
+        req.scope_id
     };
+    if final_scope == "global" {
+        scope_id = Some(None);
+    }
+    let final_scope_id = scope_id.unwrap_or(old.scope_id);
     ensure_rule_target_allowed(&st, &final_scope, final_scope_id).await?;
     let model = match req.model {
         None => None,
@@ -1279,10 +1283,8 @@ async fn update_rate_limit(
         &st.pool,
         id,
         req.scope.as_deref().map(str::trim),
-        req.scope_id,
+        scope_id,
         model.as_ref().map(|m| m.as_deref()),
-        req.rpm,
-        req.burst,
         req.concurrency,
         req.enabled,
     )
@@ -1326,88 +1328,6 @@ async fn delete_rate_limit(
     .await
     .map_err(AppError::internal)?;
     Ok(Json(json!({"ok": true})).into_response())
-}
-
-// ---------- 用户配额 ----------
-
-async fn list_quotas(State(st): State<AppState>, _a: Admin) -> Result<Response, AppError> {
-    let quotas = config::list_quotas(&st.pool)
-        .await
-        .map_err(AppError::internal)?;
-    let quotas: Vec<serde_json::Value> = quotas
-        .into_iter()
-        .map(|q| {
-            let mut v = serde_json::to_value(&q).map_err(AppError::internal)?;
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert(
-                    "protected".into(),
-                    json!(crate::api::console::is_protected_admin(&st.cfg, &q.username)),
-                );
-            }
-            Ok(v)
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
-    Ok(Json(json!({"quotas": quotas})).into_response())
-}
-
-#[derive(Deserialize)]
-struct QuotaReq {
-    /// 缺省清空配额（None 保留原值；null 清空）
-    #[serde(default)]
-    monthly_token_quota: Option<Option<i64>>,
-    #[serde(default)]
-    monthly_cost_quota: Option<Option<f64>>,
-    billing_day: Option<i32>,
-    notify_percent: Option<i32>,
-    enabled: Option<bool>,
-}
-
-async fn upsert_quota(
-    State(st): State<AppState>,
-    admin: Admin,
-    Path(user_id): Path<i64>,
-    Json(req): Json<QuotaReq>,
-) -> Result<Response, AppError> {
-    if let Some(Some(v)) = req.monthly_token_quota {
-        if v < 0 {
-            return Err(AppError::BadRequest("quota must be >= 0".into()));
-        }
-    }
-    if let Some(Some(v)) = req.monthly_cost_quota {
-        if v < 0.0 {
-            return Err(AppError::BadRequest("quota must be >= 0".into()));
-        }
-    }
-    if let Some(d) = req.billing_day {
-        if !(1..=28).contains(&d) {
-            return Err(AppError::BadRequest("billing_day must be 1-28".into()));
-        }
-    }
-    crate::api::console::ensure_not_protected_by_id(&st, user_id).await?;
-    let quota = config::upsert_quota(
-        &st.pool,
-        user_id,
-        req.monthly_token_quota,
-        req.monthly_cost_quota,
-        req.billing_day,
-        req.notify_percent,
-        req.enabled,
-    )
-    .await
-    .map_err(AppError::internal)?
-    .ok_or_else(|| AppError::BadRequest("user not found".into()))?;
-    st.reload().await.map_err(AppError::internal)?;
-    audit::log(
-        &st.pool,
-        Some(admin.0.id),
-        "quota.update",
-        Some("user"),
-        Some(user_id),
-        None,
-    )
-    .await
-    .map_err(AppError::internal)?;
-    Ok(Json(json!({"quota": quota})).into_response())
 }
 
 // ---------- 模型价格 ----------
@@ -1783,6 +1703,20 @@ async fn get_header_settings(State(st): State<AppState>, _a: Admin) -> Result<Re
     .into_response())
 }
 
+/// 头组归一：null/缺省 = 清空（空 map）；对象原样；其余类型 400
+fn header_group_or_clear(
+    v: &serde_json::Value,
+    label: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+    match v {
+        serde_json::Value::Null => Ok(serde_json::Map::new()),
+        serde_json::Value::Object(o) => Ok(o.clone()),
+        _ => Err(AppError::BadRequest(format!(
+            "{label} must be an object or null"
+        ))),
+    }
+}
+
 #[derive(Deserialize)]
 struct HeaderSettingsReq {
     #[serde(default)]
@@ -1798,19 +1732,15 @@ async fn put_header_settings(
     admin: Admin,
     Json(req): Json<HeaderSettingsReq>,
 ) -> Result<Response, AppError> {
-    // null/缺省字段 = 清空该组（非对象值仍 400）
-    let upstream_v = serde_json::Value::Object(
-        req.upstream_headers
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-    );
-    let response_v = serde_json::Value::Object(
-        req.response_headers
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-    );
+    // null/缺省 = 清空该组；对象原样；其余类型 400（此前静默吞成空 map，字符串/数组会误清整组）
+    let upstream_v = serde_json::Value::Object(header_group_or_clear(
+        &req.upstream_headers,
+        "upstream_headers",
+    )?);
+    let response_v = serde_json::Value::Object(header_group_or_clear(
+        &req.response_headers,
+        "response_headers",
+    )?);
     let upstream = validate_header_map(&upstream_v, UPSTREAM_HEADER_BLOCKLIST, "upstream_headers")?;
     let response = validate_header_map(&response_v, RESPONSE_HEADER_BLOCKLIST, "response_headers")?;
     let settings = config::HeaderSettings {
@@ -1961,7 +1891,6 @@ fn app_error_status(e: &AppError) -> u16 {
         AppError::Forbidden(_) => 403,
         AppError::RateLimited(_)
         | AppError::ConcurrentLimited(_)
-        | AppError::QuotaExceeded
         | AppError::PlanQuotaExceeded(..) => 429,
         AppError::BadRequest(_) => 400,
         AppError::Conflict(_) => 409,

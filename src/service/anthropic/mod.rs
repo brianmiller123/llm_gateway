@@ -107,11 +107,6 @@ pub fn error_response(err: &AppError) -> Response {
                 secs.ceil().max(1.0) as u64
             ),
         ),
-        AppError::QuotaExceeded => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "quota exceeded, please contact administrator".into(),
-        ),
         // Plan 配额拦截保留明细（plan 名/周期/用量）——客户端排障需要区分
         // 「限流（短退避可重试）」与「配额耗尽（须等到周期边界）」
         AppError::PlanQuotaExceeded(m, _) => {

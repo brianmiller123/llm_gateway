@@ -37,30 +37,83 @@ pub struct PlanBill {
     pub period_start: DateTime<Utc>,
     pub period_key: String,
 }
-/// Responses API 用 input/output_tokens；缺失字段自动回退为 None（记账按 0 计）。
-/// 缓存桶（cache_read/cache_write）来自 prompt_tokens_details.cached_tokens 等多源
-/// 归一化（详见 responses::dto::Usage），用于按缓存费率计费与明细对账。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct Usage {
-    pub prompt_tokens: Option<i64>,
-    pub completion_tokens: Option<i64>,
+/// 线上格式中间层：多上游 usage 字段名/嵌套差异在此归一（serde alias 只能
+/// 扁平重命名，够不到 prompt_tokens_details 这类嵌套桶）。
+#[derive(Debug, Default, serde::Deserialize)]
+struct UsageWire {
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
     #[serde(default)]
-    pub input_tokens: Option<i64>,
+    input_tokens: Option<i64>,
     #[serde(default)]
-    pub output_tokens: Option<i64>,
-    /// 缓存命中读 token（prompt_tokens 已包含，不重复计入 total）。
-    /// P1-18：原生 Anthropic usage 字段名为 cache_read_input_tokens，
-    /// 别名反序列化——透传请求的缓存桶不再丢失（按 input 全价计）
+    output_tokens: Option<i64>,
+    /// P1-18：原生 Anthropic 字段名 cache_read_input_tokens
     #[serde(default, alias = "cache_read_input_tokens")]
-    pub cache_read_tokens: Option<i64>,
-    /// 缓存写入 token（prompt_tokens 已包含）；Anthropic 名 cache_creation_input_tokens
+    cache_read_tokens: Option<i64>,
+    /// Anthropic 名 cache_creation_input_tokens
     #[serde(
         default,
         alias = "cache_creation_input_tokens",
         alias = "cache_write_input_tokens"
     )]
-    pub cache_write_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    /// DeepSeek：缓存命中为 input 的兄弟字段（非嵌套）
+    #[serde(default, alias = "prompt_cache_hit_tokens")]
+    deepseek_cache_hit: Option<i64>,
+    /// OpenAI Chat：usage.prompt_tokens_details.cached_tokens
+    #[serde(default)]
+    prompt_tokens_details: Option<CachedTokensDetails>,
+    /// Responses：usage.input_tokens_details.cached_tokens
+    #[serde(default)]
+    input_tokens_details: Option<CachedTokensDetails>,
 }
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CachedTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<i64>,
+}
+
+impl From<UsageWire> for Usage {
+    fn from(w: UsageWire) -> Self {
+        let mut u = Usage {
+            prompt_tokens: w.prompt_tokens,
+            completion_tokens: w.completion_tokens,
+            input_tokens: w.input_tokens,
+            output_tokens: w.output_tokens,
+            cache_read_tokens: w.cache_read_tokens,
+            cache_write_tokens: w.cache_write_tokens,
+        };
+        // 缓存读桶多源归一（缺失时回退）：显式/Anthropic 别名 > OpenAI Chat
+        // prompt_tokens_details > Responses input_tokens_details > DeepSeek 兄弟字段
+        if u.cache_read_tokens.is_none() {
+            u.cache_read_tokens = w
+                .prompt_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .or_else(|| w.input_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+                .or(w.deepseek_cache_hit);
+        }
+        u
+    }
+}
+
+ /// Responses API 用 input/output_tokens；缺失字段自动回退为 None（记账按 0 计）。
+ /// 缓存桶（cache_read/cache_write）来自 prompt_tokens_details.cached_tokens 等多源
+ /// 归一化（详见 responses::dto::Usage），用于按缓存费率计费与明细对账。
+ #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(from = "UsageWire")]
+ pub struct Usage {
+     pub prompt_tokens: Option<i64>,
+     pub completion_tokens: Option<i64>,
+     #[serde(default)]
+     pub input_tokens: Option<i64>,
+     #[serde(default)]
+     pub output_tokens: Option<i64>,
+     /// 缓存命中读 token（prompt_tokens 已包含，不重复计入 total）。
+     pub cache_read_tokens: Option<i64>,
+    /// 缓存写入 token（prompt_tokens 已包含）
+     pub cache_write_tokens: Option<i64>,
+ }
 
 impl Usage {
     /// 输入 token：Chat 形态优先，Responses 形态回退
@@ -76,6 +129,22 @@ impl Usage {
     /// 全部 token（输入 + 输出），饱和加法防畸形上游数值回绕
     pub fn total(&self) -> i64 {
         self.input().saturating_add(self.output())
+    }
+
+    /// Anthropic 原生口径 → OpenAI 口径：Anthropic 的 input_tokens 不含缓存
+    /// 桶（OpenAI 的 prompt_tokens 已含），混用同一结构体后 compute_cost 的
+    /// fresh = input − cache_read − cache_write 与 total() 会把缓存桶丢账。
+    /// 捕获侧（原生 anthropic 透传流/响应体）先折算，全链路按 OpenAI 口径一致。
+    pub fn fold_anthropic_input(&mut self) {
+        let buckets = self
+            .cache_read_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_write_tokens.unwrap_or(0));
+        if buckets > 0 {
+            let base = self.prompt_tokens.or(self.input_tokens).unwrap_or(0);
+            self.prompt_tokens = None;
+            self.input_tokens = Some(base.saturating_add(buckets));
+        }
     }
 }
 
@@ -204,4 +273,79 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     tx.commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Usage;
+
+    #[test]
+    fn openai_nested_cache_details_map_to_cache_read() {
+        // OpenAI Chat：缓存命中藏在 prompt_tokens_details.cached_tokens
+        let u: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": { "cached_tokens": 80 }
+        }))
+        .unwrap();
+        assert_eq!(u.cache_read_tokens, Some(80));
+        assert_eq!(u.input(), 100, "prompt 已含缓存桶，不重复计入");
+
+        // Responses：input_tokens_details.cached_tokens
+        let u: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 50,
+            "output_tokens": 3,
+            "input_tokens_details": { "cached_tokens": 20 }
+        }))
+        .unwrap();
+        assert_eq!(u.cache_read_tokens, Some(20));
+    }
+
+    #[test]
+    fn deepseek_cache_hit_sibling_maps_to_cache_read() {
+        let u: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 64,
+            "completion_tokens": 2,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_miss_tokens": 4
+        }))
+        .unwrap();
+        assert_eq!(u.cache_read_tokens, Some(60));
+    }
+
+    #[test]
+    fn anthropic_aliases_win_over_nested_fallbacks() {
+        // 显式/别名桶优先，不做嵌套回退（P1-18 行为保持）
+        let u: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 2000,
+            "cache_read_input_tokens": 100000,
+            "prompt_tokens_details": { "cached_tokens": 7 }
+        }))
+        .unwrap();
+        assert_eq!(u.cache_read_tokens, Some(100000));
+    }
+
+    #[test]
+    fn fold_anthropic_input_adopts_openai_semantics() {
+        // Anthropic 原生：input 不含缓存桶 → 折叠后 compute_cost 的
+        // fresh = input − cache_read − cache_write 恢复为真实新鲜输入
+        let mut u: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 2000,
+            "output_tokens": 500,
+            "cache_read_input_tokens": 100000,
+            "cache_creation_input_tokens": 3000
+        }))
+        .unwrap();
+        u.fold_anthropic_input();
+        assert_eq!(u.input_tokens, Some(105000));
+        assert_eq!(u.total(), 105500);
+        // 无缓存桶 → 折叠为无操作（重复调用也不叠加）
+        let mut u2: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 10
+        }))
+        .unwrap();
+        u2.fold_anthropic_input();
+        u2.fold_anthropic_input();
+        assert_eq!(u2.input_tokens, Some(10));
+    }
 }

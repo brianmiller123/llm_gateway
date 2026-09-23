@@ -1,6 +1,6 @@
 # LLM Gateway
 
-企业内网 LLM API 网关：对外暴露 **OpenAI 兼容接口**（Chat Completions / Responses / Embeddings）与 **Anthropic Messages 接口**（Claude Code / Claude SDK 直连），统一鉴权、限流、配额、路由与用量计费，并提供带管理后台的 Web 控制台和公开服务状态页。
+企业内网 LLM API 网关：对外暴露 **OpenAI 兼容接口**（Chat Completions / Responses / Embeddings）与 **Anthropic Messages 接口**（Claude Code / Claude SDK 直连），统一鉴权、并发限流、Coding Plan 配额、路由与用量计费，并提供带管理后台的 Web 控制台和公开服务状态页。
 
 单二进制部署（Rust + axum），唯一外部依赖 PostgreSQL。定位为 <200 用户、低并发的内部部署，架构预留多实例扩展路径。
 
@@ -13,9 +13,7 @@
 - `POST /v1/messages`（Anthropic Messages API，参照 cc-switch 转换层实现）：上游 `api_type=anthropic` 时透传，其余上游自动做 Anthropic ↔ Chat 降级转换——system（含 Claude Code billing header 剥离）/ tool_use ↔ tool_calls（参数 canonical JSON 保前缀缓存）/ tool_result → tool 消息 / thinking ↔ reasoning_content（DeepSeek 等厂商 tool-call 消息空思考自动补占位符）/ usage 三桶恒等式（input + cache_read + cache_creation == prompt_tokens 双向换算）/ finish_reason ↔ stop_reason / 流式 SSE 状态机（message_start → content_block_* → message_delta/message_stop，多 finish_reason 去重、工具块延迟启动、断流兜底）/ 错误整形为 Anthropic 单错误对象形状
 - Responses ↔ Chat 转换层按 cc-switch 模式加固：usage 多源缓存字段归一化（prompt_tokens_details.cached_tokens / cache_read_input_tokens / DeepSeek prompt_cache_hit_tokens）、无名工具调用护栏（全部丢弃时报 failed 而非伪 completed）、流内错误帧 → response.failed、断流区分 incomplete/failed
 - API Key 鉴权：Key 仅存 SHA-256 哈希 + 12 位前缀定位，明文只在创建时展示一次；可配置为不鉴权（仅本地开发）
-- 三层速率限制（API Key → 用户 → 全局，令牌桶，BOOTTIME 回填时钟），命中返回 429 + `Retry-After` + OpenAI 标准错误体；长时间空闲后恢复的首请求空闲豁免，避免 agent 暂停等待用户确认后恢复即 429（见「限流与长时间空闲恢复」）
-- 并发上限：限流规则可附在途请求数上限（0 = 不限），与令牌桶同维度（scope × 模型精确匹配）叠加；guard 绑定响应体生命周期，流式请求流尽/断开才释放；并发满返回 429（消息区分 "Concurrency limit exceeded"），不白烧令牌桶令牌，也不参与空闲豁免（见「限流与长时间空闲恢复」）
-- 月度配额：按用户限制 Token/成本上限，记账事务内原子扣减，超限 429
+- 并发限流：三层规则（API Key → 用户 → 全局，可选模型限定按客户端模型名精确匹配），限制同时在途的请求数（0 = 不限），满员返回 429 + `Retry-After` + OpenAI 标准错误体；guard 绑定响应体生命周期，流式请求流尽/断开才释放（见「限流（并发上限）」）
 - Coding Plan 周期配额：分组绑定套餐（多分组取优先级最高生效），token 上限 + 统计周期（每日 / 每月 / 总量 / 小时级——每 N 小时（1..168）滚动重置，锚点可选 UTC 整点网格或按开通时间偏移），超额策略（拦截 429 / 降级指定模型 / 仅告警）；可选模型作用域（精确 + 前缀通配、白/黑名单黑名单优先，未配置 = 全模型生效，切换模型即时重评估，见「Coding Plan 周期用量限制与小时级重置」）；80/95/100% 阈值告警（站内 / 邮件 / webhook）。重置由周期键在读取路径推导，无清零定时任务
 - 模型路由：通配 pattern + priority 匹配，支持 `fallback_ids` 降级链（非流式对 429/5xx/超时自动重试；流式不重试避免重复生成）
 - Token 计量：优先解析上游 `usage`（流式自动注入 `include_usage`），usage 双形态（`prompt_tokens` / `input_tokens`）归一化
@@ -27,7 +25,7 @@
 - LDAP 登录（AD / OpenLDAP 配置驱动，memberOf 组映射管理员）+ 本地账号；内置 break-glass 本地管理员
 - JWT 会话（access 15 分钟 / refresh 30 天，可配置），支持强制下线（token 版本吊销）
 - 仪表盘、API Key 自助管理、用量统计（时间段 × 模型维度 + 图表；趋势支持 近 1 小时每分钟 / 今天每 30 分钟 / 近 N 天 三档粒度）、实时监控（5 分钟粒度轮询 + 全站在途请求数 + 每用户实时并发及其模型分布——进程内按 用户×模型 计数，模型为客户端请求的原始 model；guard 绑定响应体生命周期，流式请求流尽/断开才释放）、我的套餐（当前生效 Coding Plan 的余量与用量）
-- 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线；管理员可授权其他用户为管理员 / 取消授权）、供应商配置（Key AES-256-GCM 加密落库，永不回显；`api_type` 区分 openai / openai-responses / anthropic）、路由规则、模型库（按 供应商×模型 启停——禁用后不作路由候选、不在 `/v1/models` 列出，刷新模型库保留启停状态）、限流规则、月度配额、模型价格、Coding Plan 套餐管理、用户分组（批量添加 / LDAP 目录联动同步 / CSV 导出）、Plan 用量监控（趋势图 / 按用户按日期回溯 / 告警流）、LDAP 设置（含连通性测试）、SMTP 告警邮件设置、高级请求配置（extra_body JSON 编辑 + 校验 + 快捷预设 + 最终请求体实时预览）；break-glass 内置管理员（`SEED_ADMIN_USERNAME`）受保护——其他管理员的禁用 / 强制下线 / 重置密码 / 授权白名单 / 定向限流·并发规则 / 用户配额改动一律 403，LDAP 登录与目录同步亦不覆写该账号，防止唯一管理入口被锁死
+- 管理后台：用户生命周期（重置密码 / 禁用 / 强制下线；管理员可授权其他用户为管理员 / 取消授权）、供应商配置（Key AES-256-GCM 加密落库，永不回显；`api_type` 区分 openai / openai-responses / anthropic）、路由规则、模型库（按 供应商×模型 启停——禁用后不作路由候选、不在 `/v1/models` 列出，刷新模型库保留启停状态）、限流规则（并发上限）、模型价格、Coding Plan 套餐管理、用户分组（批量添加 / LDAP 目录联动同步 / CSV 导出）、Plan 用量监控（趋势图 / 按用户按日期回溯 / 告警流）、LDAP 设置（含连通性测试）、SMTP 告警邮件设置、高级请求配置（extra_body JSON 编辑 + 校验 + 快捷预设 + 最终请求体实时预览）；break-glass 内置管理员（`SEED_ADMIN_USERNAME`）受保护——其他管理员的禁用 / 强制下线 / 重置密码 / 授权白名单 / 定向限流·并发规则改动一律 403，LDAP 登录与目录同步亦不覆写该账号，防止唯一管理入口被锁死
 - 管理操作全部写入审计日志，可追溯
 
 **公开状态页（仿 status.openai.com）**
@@ -48,7 +46,7 @@ flowchart LR
     subgraph Box["单机 Docker Compose"]
         subgraph GW["gateway 容器 — Rust 单二进制 (axum)"]
             T["TLS 终结 (rustls)<br/>8443 HTTPS + 8080"]
-            P["/v1/* 代理管线<br/>鉴权 → 限流 → 配额 → 路由 → 转发(SSE) → 记账"]
+            P["/v1/* 代理管线<br/>鉴权 → 并发限流 → Plan 配额 → 路由 → 转发(SSE) → 记账"]
             R["协议转换层<br/>Responses ↔ Chat / Anthropic ↔ Chat"]
             C["控制台 API + 静态资源 (Vue dist)"]
             W["后台任务：usage_daily 聚合 (60s)"]
@@ -65,8 +63,8 @@ flowchart LR
 关键设计决策：
 
 1. **模块化单体**：代理热路径、控制台、后台任务同进程；无 Nginx（TLS 由 rustls 终结，静态资源由 tower-http 托管），无 Redis。
-2. **记账与热路径零组件解耦**：请求完成后同步单事务直写（日志 + 配额计数原子提交），延迟代价 ~1–2ms，相对 LLM 秒级响应不可见。
-3. **内存态仅存在于单实例**：限流令牌桶、配额计数缓存、路由表在进程内，启动 / 30s 周期从 PG 热加载。多实例需换 Redis 实现（接口已封装）。
+2. **记账与热路径零组件解耦**：请求完成后同步单事务直写（日志 + Plan/月度用量计数原子提交），延迟代价 ~1–2ms，相对 LLM 秒级响应不可见。
+3. **内存态仅存在于单实例**：并发限流计数、Plan 用量缓存、路由表在进程内，启动 / 30s 周期从 PG 热加载。多实例需换 Redis 实现（接口已封装）。
 
 ## 技术栈
 
@@ -130,7 +128,6 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GATEWAY_MASTER_KEY` | — | AES-256-GCM 主密钥（64 hex），**必须更换**；缺失时 JWT 密钥由它派生 |
 | `GATEWAY_AUTH_MODE` | `api_key` | `none` = 跳过 API Key 鉴权（仅本地开发） |
 | `GATEWAY_RELOAD_INTERVAL` | `30` | 路由/限流/供应商配置热加载周期（秒） |
-| `GATEWAY_RATE_IDLE_EXEMPT_SECS` | `60` | 限流恢复豁免阈值：主体静默 ≥ 该秒数后恢复的首请求若被限流则豁免放行（每空闲间隙至多一次）；`0` = 关闭。见「限流与长时间空闲恢复」 |
 | `GATEWAY_WEB_DIR` | `web/dist` | 控制台静态资源目录；目录不存在时 `/` 返回服务信息 JSON |
 | `GATEWAY_JWT_SECRET` / `GATEWAY_ACCESS_TOKEN_TTL` / `GATEWAY_REFRESH_TOKEN_TTL` | 派生 / `900` / `2592000` | 控制台会话 |
 | `LDAP_URL` / `LDAP_STARTTLS` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_BASE_DN` / `LDAP_USER_FILTER` / `LDAP_ADMIN_GROUPS` | — | LDAP 登录（AD 默认 `sAMAccountName`，OpenLDAP 用 `uid`；不配置则仅本地账号） |
@@ -148,10 +145,10 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GET /api/status` | 无 | 公开状态：组件状态 + 30 天可用率 + 事故 |
 | `POST /api/auth/login`、`/refresh`、`/logout` | — | 控制台会话（LDAP / 本地账号） |
 | `GET /api/me`、`/api/me/plan`、`/api/keys`、`/api/usage`、`/api/usage/trend` | JWT | 个人资料、我的套餐、Key 管理、用量查询 |
-| `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/quotas`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
+| `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
 | `GET/POST /api/admin/plans`、`/api/admin/groups`、`/api/admin/plan-alerts`、`/api/admin/smtp` 等 | JWT + 管理员 | Coding Plan 套餐 CRUD 与用量回溯、成员管理（直连用户 / 加入分组：列表、候选检索、批量增删）、用户分组（成员管理 / LDAP 同步 / CSV 导出）、阈值告警流、SMTP 设置 |
 
-错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；限流 429 带 `Retry-After`；Coding Plan 配额拦截 429（`insufficient_quota`）同样带 `Retry-After`（距当前统计周期边界的秒数，上限 24h；`total` 周期无边界则不带）——周期内重试必然失败，客户端应等到边界而非空转重试；`/v1/messages` 方言保留 Plan 拦截的明细消息（套餐名/周期/用量），便于区分「限流（短退避可重试）」与「配额耗尽（等到周期边界）」。上游错误透明透传。
+错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；并发限流 429 带 `Retry-After`（短退避可重试）；Coding Plan 配额拦截 429（`insufficient_quota`）同样带 `Retry-After`（距当前统计周期边界的秒数，上限 24h；`total` 周期无边界则不带）——周期内重试必然失败，客户端应等到边界而非空转重试；`/v1/messages` 方言保留 Plan 拦截的明细消息（套餐名/周期/用量），便于区分「并发限流（短退避可重试）」与「配额耗尽（等到周期边界）」。上游错误透明透传。
 
 ## 状态页监测语义
 
@@ -170,43 +167,21 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 - 系统组件（网关/PostgreSQL）只有实时状态，无历史可用率（如实显示）
 
 
-## 限流与长时间空闲恢复
+## 限流（并发上限）
 
-### 策略与空闲期配额语义
+限流规则只限制**同时在途的请求数**（并发）：三层作用域（API Key → 用户 → 全局）× 可选模型限定（按客户端模型名精确匹配，独立计量），`concurrency` 字段为该作用域允许的最大在途请求数（0 = 不限），命中即拒、满员返回 429 + `Retry-After`。
 
-三层规则（API Key → 用户 → 全局）均为**进程内令牌桶**：桶容量 = `burst`，回填速率 = `rpm/60` 每秒，请求消耗 1 个令牌，不足即 429 + `Retry-After`（取全部命中桶中的最大等待秒数，上限 24h，并加 [0,1s) 随机抖动——避免所有被拒客户端按相同报头值整秒对齐重试、互相挤兑每秒唯一回填令牌）。多规则两阶段判定：全部命中桶都足额才统一扣减，拒绝路径**零扣减**（不会白烧其他桶令牌）。空闲期间**没有任何扣减**——桶按真实流逝时间惰性回填直至 `burst`（`rpm=1, burst=5` 时空闲 5 分钟即回满）。回填时钟在 Linux 上取 `CLOCK_BOOTTIME`（含系统挂起/睡眠时间；`std::time::Instant` 的 `CLOCK_MONOTONIC` 在机器睡眠时不前进，会导致睡眠等待后的令牌少回填）。
-
-### 长时间等待后恢复触发 429 的根因
-
-agent 暂停等待用户确认期间，**共享作用域桶（尤其 global）会被其他会话/其他用户的流量耗尽**。恢复执行的首请求撞上已耗尽的桶 → 429，`Retry-After = 60/rpm` 秒——低 rpm 配置下即“额外冷却分钟级才能用”。该主体的 user/key 桶哪怕已回满也无济于事，因为命中即拒作用于任一层。叠加因素：恢复瞬间客户端并发齐发（主循环 + 并行子代理），burst 再大也可能被瞬间打穿。
-
-### 修复：空闲恢复豁免（resume exemption）
-
-网关无法感知客户端“暂停/恢复”，因此不做计时暂停（服务端不可实现），改为**按可观测的空闲间隙豁免**：
-
-- 每个主体（`u:{user_id}|k:{key_id}`）记录最近一次活动时间，**任意结局的请求（含被拒）都刷新活动时间**；
-- 主体静默 ≥ `GATEWAY_RATE_IDLE_EXEMPT_SECS`（默认 60s）后的**首个请求**若被某层规则拒绝，则豁免放行（不扣空桶、不重置任何桶），并记录 `rate limit resume exemption granted` 日志；
-- 每个空闲间隙至多豁免一次；主体首次出现（冷启动）视同长空闲后恢复；
-- 高频请求永远攒不出空闲间隙，豁免零影响——防压制能力不变。
-
-**防滥用边界**：豁免最坏放大 = 每主体每阈值窗口 1 个请求（仅当拒绝桶已耗尽时发生）；N 个主体交替静默可造成聚合速率超出 global 上限 `N/阈值`，阈值即调节旋钮；登录限流（`login:*` 桶）不参与豁免。
-
-**运维要点**：global 层 rpm 决定 429 后每令牌冷却时间（`60/rpm` 秒），面向并行 agent 客户端建议 ≥ 数百 rpm + 百级 burst；本仓演示数据原为 `rpm=1, burst=5`（每分钟 1 请求），已调整为 `600/100`。豁免只解决“恢复首请求”，恢复后的持续速率仍受规则约束——客户端应遵循 `Retry-After` 重试（OpenAI 兼容客户端均支持）。
-
-### 并发上限（在途请求数）
-
-令牌桶限的是**放行速率**，不是同时在途数——低 rpm 下长流式响应仍会累积大量在途请求（稳态在途 ≈ `放行速率 × 平均响应时长 + burst`）。限流规则另附 `concurrency` 字段（0 = 不限）实现真正的并发控制：
-
-- **计数维度**：与令牌桶同桶键（scope × 模型精确匹配），请求进入代理管线（鉴权、解析、端点开关之后）占坑，**响应体流尽或客户端断开才释放**——与实时监控的并发计数同生命周期；管理员测试调用（`proxy_test`）不占坑；
-- **判定顺序**：先占并发名额、后扣令牌桶——并发满的 429 不会白烧令牌；反之被令牌桶拒绝的请求只瞬持名额（微秒级）即释放。多规则叠加时须**全部**命中桶有余量才放行（全有或全无，拒绝路径零占坑）；
-- **拒绝语义**：429，错误消息为 "Concurrency limit exceeded, retry after Ns"（`rate_limit_exceeded` 类型不变，客户端按常规 429 退避；`Retry-After` 给 1-2s 短提示——名额何时释放不可知），`/v1/messages` 方言映射为 `rate_limit_error`；
-- **不参与空闲豁免**：并发名额是真实资源占用，豁免会突破上限；令牌桶空闲豁免语义不变。
+- **计数生命周期**：请求进入代理管线（鉴权、解析、端点开关之后）占坑，**响应体流尽或客户端断开才释放**——流式响应与实时监控的并发计数同生命周期；管理员测试调用（`proxy_test`）不占坑；
+- **多规则叠加**：须全部命中桶有余量才放行（全有或全无，拒绝路径零占坑）；同桶键多条规则取最严（最小）上限；
+- **拒绝语义**：429，错误消息为 "Concurrency limit exceeded, retry after Ns"（`rate_limit_exceeded` 类型，客户端按常规 429 退避；`Retry-After` 给 6s 提示（5.5-6.5s 抖动，向上取整恒为 6）——名额何时释放不可知），`/v1/messages` 方言映射为 `rate_limit_error`；
+- **长度不限**：规则不限制请求速率（RPM）——低频长流式与高频短请求同等对待，只看同时在途数。需要速率级限制时叠加 Coding Plan 周期配额（拦截/降级）实现；
+- 登录接口另有独立的进程内令牌桶防爆破（`login:user:*` / `login:ip:*`），与代理限流无关。
 
 ### 已知边界
 
-- 单实例语义：豁免状态、令牌桶与并发计数均在进程内，重启清零（重启后冷启动豁免兜底）；多实例需 Redis 实现。
+- 单实例语义：并发计数在进程内，重启清零；多实例需 Redis 实现。
 - 上游 429 与网关自身 429 相互独立：非流式按降级链重试上游 429/5xx；流式不重试（防重复生成），上游 429 原样透传。
-- 流式请求在网关自身限流处被拒时同样返回 429 JSON（未建立上游连接，无计费）。
+- 流式请求在网关限流处被拒时同样返回 429 JSON（未建立上游连接，无计费）。
 
 ## Coding Plan 周期用量限制与小时级重置
 
@@ -279,7 +254,7 @@ python3 scripts/mock_upstream.py   # http://127.0.0.1:9001/v1，支持 chat（�
 
 ## 已知限制
 
-1. **单实例语义**：限流令牌桶、配额计数缓存、路由表均在进程内，多实例部署需换 Redis 实现（已封装，接口不变）。
+1. **单实例语义**：并发限流计数、Plan 用量缓存、路由表均在进程内，多实例部署需换 Redis 实现（已封装，接口不变）。
 2. **记账同步写入**：PostgreSQL 不可用时请求失败（内部系统可接受），无丢失窗口。
 3. **`usage_logs` 不分表**：规模增长后需按月 RANGE 分区（`request_id` 唯一约束需配合调整）。
 4. **流式依赖上游 `include_usage`**：不支持的供应商暂走零值兜底（启发式估算未实现）。

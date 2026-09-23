@@ -19,8 +19,6 @@ pub enum AppError {
     /// 并发上限（在途请求数）满：与 RateLimited 同为 429，但消息可区分
     #[error("concurrency limit exceeded, retry after {0}s")]
     ConcurrentLimited(f64),
-    #[error("monthly quota exceeded")]
-    QuotaExceeded,
     /// Coding Plan 周期配额耗尽且策略为拦截（429 insufficient_quota）
     #[error("{0}")]
     PlanQuotaExceeded(String, Option<u64>),
@@ -103,12 +101,6 @@ impl IntoResponse for AppError {
                         Some(retry),
                     )
                 }
-                AppError::QuotaExceeded => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "insufficient_quota",
-                    "Monthly quota exceeded, please contact administrator".to_string(),
-                    None,
-                ),
                 AppError::PlanQuotaExceeded(m, retry) => (
                     StatusCode::TOO_MANY_REQUESTS,
                     "insufficient_quota",

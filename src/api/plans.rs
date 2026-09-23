@@ -13,7 +13,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use chrono::{Datelike, DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -370,7 +370,7 @@ async fn create_plan(
         req.priority,
         limit,
         &req.period_type,
-        req.period_hours,
+        plan_store::normalize_period_hours(&req.period_type, req.period_hours),
         &req.period_anchor_mode,
         &req.overage_action,
         req.downgrade_model.as_deref(),
@@ -461,6 +461,14 @@ async fn update_plan(
         .unwrap_or(&before.period_anchor_mode);
     plan_store::validate_period_config(eff_type, eff_hours, eff_anchor)
         .map_err(AppError::BadRequest)?;
+    // period_hours 归一为写入值：非 hourly 一律 1（DB CHECK 无条件 1..=168）；
+    // 类型切换（如 daily→hourly）或小时数变更都按合并后类型归一。两者皆缺省 →
+    // None，store 层 COALESCE 保留现值
+    let eff_hours_bound = if req.period_hours.is_some() || req.period_type.is_some() {
+        Some(plan_store::normalize_period_hours(eff_type, eff_hours))
+    } else {
+        None
+    };
     // 降级目标三态归一化：absent=保留 / null(或空串)=清空 / 字符串=设置
     let downgrade_model: Option<Option<&str>> = req
         .downgrade_model
@@ -506,12 +514,12 @@ async fn update_plan(
     let updated = plan_store::update_plan(
         &st.pool,
         id,
-        req.name.as_deref().map(str::trim),
+        non_empty(&req.name),
         req.description.as_deref().map(str::trim),
         req.priority,
         limit,
         req.period_type.as_deref(),
-        req.period_hours,
+        eff_hours_bound,
         req.period_anchor_mode.as_deref(),
         req.overage_action.as_deref(),
         downgrade_model,
@@ -604,8 +612,9 @@ struct PlanMemberListParams {
 /// (page, page_size, offset)
 fn member_page(p: &PlanMemberListParams) -> (i64, i64, i64) {
     let page_size = p.page_size.unwrap_or(20).clamp(1, 200);
-    let page = p.page.unwrap_or(1).max(1);
-    (page, page_size, (page - 1) * page_size)
+    // 页码钳上界 + saturating 乘法：crafted 页码（如 i64::MAX）原样进乘法会溢出
+    let page = p.page.unwrap_or(1).clamp(1, 1_000_000);
+    (page, page_size, (page - 1).saturating_mul(page_size))
 }
 
 /// 去重并排序：重复 id 会让 rows_affected < 请求数，误报并发冲突
@@ -1122,7 +1131,7 @@ async fn update_group(
     let updated = groups::update_group(
         &st.pool,
         id,
-        req.name.as_deref().map(str::trim),
+        non_empty(&req.name),
         req.description.as_deref().map(str::trim),
         req.ldap_sync,
     )
@@ -1205,13 +1214,13 @@ async fn list_members(
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
     let page_size = p.page_size.unwrap_or(20).clamp(1, 200);
-    let page = p.page.unwrap_or(1).max(1);
+    let page = p.page.unwrap_or(1).clamp(1, 1_000_000); // 上界钳制防 offset 溢出
     let (rows, total) = groups::list_members(
         &st.pool,
         id,
         non_empty(&p.q),
         page_size,
-        (page - 1) * page_size,
+        (page - 1).saturating_mul(page_size),
     )
     .await
     .map_err(AppError::internal)?;
@@ -1232,7 +1241,23 @@ async fn add_members(
     admin: axum::extract::Extension<users::UserRow>,
     Json(req): Json<MembersAddReq>,
 ) -> Result<impl IntoResponse, AppError> {
-    let added = groups::add_members(&st.pool, id, &req.user_ids)
+    // 与 Plan 成员流同款 400 前置：空参/组不存在/未知用户直接 400，
+    // 否则 user_group_members 的 FK 违规以 500 冒泡不可读
+    let ids = dedup_ids(req.user_ids);
+    if ids.is_empty() {
+        return Err(AppError::BadRequest("user_ids 不能为空".into()));
+    }
+    require_group(&st, id).await?;
+    let missing = plan_store::missing_user_ids(&st.pool, &ids)
+        .await
+        .map_err(AppError::internal)?;
+    if !missing.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "以下用户不存在: {}",
+            ids_csv(&missing)
+        )));
+    }
+    let added = groups::add_members(&st.pool, id, &ids)
         .await
         .map_err(AppError::internal)?;
     st.reload().await.map_err(AppError::internal)?;
@@ -1242,7 +1267,7 @@ async fn add_members(
         "group.members.add",
         Some("user_group"),
         Some(id),
-        Some(json!({"user_ids": req.user_ids, "added": added})),
+        Some(json!({"user_ids": ids, "added": added})),
     )
     .await
     .map_err(AppError::internal)?;
@@ -1298,6 +1323,22 @@ fn opt_str(s: &Option<String>) -> &str {
     s.as_deref().unwrap_or("")
 }
 
+/// RFC 5987 filename* 值的极简百分号编码：仅 unreserved 字符原样保留，其余
+///（非 ASCII/控制符/引号等）按 UTF-8 字节 %XX 转义——HeaderValue 拒绝非 ASCII，
+/// 裸拼文件名会让非 ASCII 分组名的 CSV 导出直接 500
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 async fn export_members(
     State(st): State<AppState>,
     Path(id): Path<i64>,
@@ -1320,13 +1361,18 @@ async fn export_members(
             r.added_at.to_rfc3339()
         ));
     }
-    let disposition = format!("attachment; filename=\"group_{}.csv\"", group.name);
-    Ok(Response::builder()
+    // filename 用数字 id（ASCII 安全）；原始组名走 RFC 5987 filename* 供还原
+    let disposition = format!(
+        "attachment; filename=\"group_{}.csv\"; filename*=UTF-8''{}",
+        group.id,
+        pct_encode(&format!("group_{}.csv", group.name)),
+    );
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
         .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from(body))
-        .map_err(|e| AppError::internal(e.to_string()))?)
+        .map_err(|e| AppError::internal(e.to_string()))
 }
 
 async fn sync_group(
@@ -1374,13 +1420,13 @@ async fn search_users(
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
     let page_size = p.page_size.unwrap_or(20).clamp(1, 200);
-    let page = p.page.unwrap_or(1).max(1);
+    let page = p.page.unwrap_or(1).clamp(1, 1_000_000); // 上界钳制防 offset 溢出
     let (rows, total) = groups::search_users_for_group(
         &st.pool,
         id,
         non_empty(&p.q),
         page_size,
-        (page - 1) * page_size,
+        (page - 1).saturating_mul(page_size),
     )
     .await
     .map_err(AppError::internal)?;
@@ -1569,11 +1615,11 @@ async fn my_plan(
                 .map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
         })
     });
-    // 本人近 30 日逐日消耗（明细）
+    // 本人近 30 日（UTC 日界，含今日）逐日消耗（明细）
     let daily: Vec<DailyRow> = sqlx::query_as(
         "SELECT stat_date, SUM(call_count)::bigint AS call_count, \
                 SUM(input_tokens + output_tokens)::bigint AS tokens \
-         FROM usage_daily WHERE user_id = $1 AND stat_date >= CURRENT_DATE - 30 \
+         FROM usage_daily WHERE user_id = $1 AND stat_date >= (now() AT TIME ZONE 'UTC')::date - 29 \
          GROUP BY stat_date ORDER BY stat_date",
     )
     .bind(uid)
@@ -1591,8 +1637,11 @@ async fn my_plan(
             .filter_map(|m| {
                 let reason = if !m.enabled {
                     "disabled"
-                } else if !plan_store::is_within_active_window(m.active_start, m.active_end, local_now)
-                {
+                } else if !plan_store::is_within_active_window(
+                    m.active_start,
+                    m.active_end,
+                    local_now,
+                ) {
                     "outside_active_window"
                 } else {
                     // 启用且时段内仍不命中：仅带 ?model= 时可能因作用域不命中；
@@ -1689,5 +1738,37 @@ mod tests {
         .unwrap();
         assert_eq!(set.downgrade_model, Some(Some("gpt-4o-mini".into())));
         assert!(matches!(set.model_scope, Some(Some(_))));
+    }
+
+    /// PATCH 空名防护共用 helper：trim 后为空 = 未提供（保留现值），而非写入空白名
+    #[test]
+    fn non_empty_rejects_blank_after_trim() {
+        assert!(non_empty(&None).is_none());
+        assert!(non_empty(&Some("   ".into())).is_none());
+        assert_eq!(non_empty(&Some(" 运维组 ".into())), Some("运维组"));
+    }
+
+    /// 页码上界钳制 + saturating 乘法：crafted 大页码不再溢出 i64（原为乘法 panic）
+    #[test]
+    fn member_page_clamps_overflow() {
+        let p = |page: Option<i64>, size: Option<i64>| PlanMemberListParams {
+            q: None,
+            page,
+            page_size: size,
+        };
+        let (page, page_size, offset) = member_page(&p(Some(i64::MAX), Some(200)));
+        assert_eq!((page, page_size, offset), (1_000_000, 200, 199_999_800));
+        let (page, _, offset) = member_page(&p(Some(-5), None));
+        assert_eq!((page, offset), (1, 0));
+        let (page, page_size, offset) = member_page(&p(None, None));
+        assert_eq!((page, page_size, offset), (1, 20, 0));
+    }
+
+    /// CSV 文件名百分号编码：ASCII 安全字符保留，非 ASCII/引号/空格转义
+    #[test]
+    fn pct_encode_escapes_non_ascii() {
+        assert_eq!(pct_encode("group_1.csv"), "group_1.csv");
+        assert_eq!(pct_encode("平台组"), "%E5%B9%B3%E5%8F%B0%E7%BB%84");
+        assert_eq!(pct_encode("a\"b c"), "a%22b%20c");
     }
 }
