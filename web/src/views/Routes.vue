@@ -68,6 +68,25 @@ async function toggleEnabled(r: RouteRow) {
   }
 }
 
+async function deleteRoute(r: RouteRow) {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除路由「${r.model_pattern}」吗？删除后该模型模式立即不再匹配；若相关供应商的模型库仍含此模型，下次「测试连接」或「刷新模型库」会自动重建直指路由。`,
+      '删除路由',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    await request(`/api/admin/routes/${r.id}`, { method: 'DELETE' })
+    ElMessage.success('路由已删除')
+    await loadData()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+  }
+}
+
 // —— 新建 / 编辑 ——
 interface RouteForm {
   model_pattern: string
@@ -245,7 +264,7 @@ onMounted(loadData)
             <el-tag v-else type="danger" size="small">禁用</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="130" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
             <el-button size="small" @click="openEdit(row)">编辑</el-button>
             <el-button
@@ -262,6 +281,7 @@ onMounted(loadData)
               plain
               @click="toggleEnabled(row)"
             >启用</el-button>
+            <el-button size="small" type="danger" plain @click="deleteRoute(row)">删除</el-button>
           </template>
         </el-table-column>
         <el-table-column label="系统消息置顶" width="120" align="center">

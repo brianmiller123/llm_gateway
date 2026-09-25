@@ -123,6 +123,36 @@ pub async fn update_provider(
     .fetch_optional(pool)
     .await
 }
+/// 删除供应商：其模型经 FK ON DELETE CASCADE 一并清空；同一事务里把该 id 从其他路由的
+/// fallback_ids 中移除，并级联删除直指它的路由规则——模型同步会为每个模型自动建路由
+/// （见 replace_provider_models），路由本身无删除入口，不级联则供应商永远删不掉。
+pub async fn delete_provider(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // 步骤：先清 fallback 引用 → 删直指路由 → 删供应商
+    sqlx::query("UPDATE model_routes SET fallback_ids = array_remove(fallback_ids, $1) WHERE $1 = ANY(fallback_ids)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM model_routes WHERE provider_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let res = sqlx::query("DELETE FROM providers WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// 删除路由规则（无其他表引用，直删即可）；不存在 → false
+pub async fn delete_route(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM model_routes WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
 // ---------- 路由规则 ----------
 
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
@@ -959,5 +989,53 @@ mod tests {
             load_disabled_models(&pool).await.unwrap().is_empty(),
             "禁用行随下架一并清理"
         );
+    }
+
+    /// 供应商删除：模型级联清空；模型同步自动建的直指路由一并删除；
+    /// 其他路由的 fallback_ids 不再保留该 id；不存在 → false
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_provider_cascades_models_routes_and_scrubs_fallbacks(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        let p2 = seed_provider(&pool, "p2").await;
+        // 模型同步副作用：为 p1 的每个模型自动建 直指路由 a→p1、b→p1
+        replace_provider_models(&pool, p1.id, &["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        // 手动路由：直指 p2，p1 仅作为 fallback
+        create_route(
+            &pool,
+            "m-*",
+            p2.id,
+            100,
+            &[p1.id],
+            None,
+            true,
+            &serde_json::json!({}),
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(delete_provider(&pool, p1.id).await.unwrap());
+        assert!(
+            models_of(&list_models(&pool).await.unwrap(), p1.id).is_empty(),
+            "模型随供应商级联清空"
+        );
+        let routes = list_routes(&pool).await.unwrap();
+        assert_eq!(routes.len(), 1, "直指 p1 的自动路由随供应商级联删除");
+        assert_eq!(routes[0].model_pattern, "m-*");
+        assert!(
+            routes[0].fallback_ids.is_empty(),
+            "其他路由的 fallbacks 不保留已删供应商"
+        );
+        assert!(!delete_provider(&pool, p1.id).await.unwrap(), "不存在 → false");
+
+        // m-* 直指 p2 → 删 p2 时该路由一并删除
+        assert!(delete_provider(&pool, p2.id).await.unwrap());
+        assert!(list_routes(&pool).await.unwrap().is_empty());
     }
 }

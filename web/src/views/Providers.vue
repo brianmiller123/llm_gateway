@@ -61,6 +61,25 @@ async function toggleProvider(p: ProviderRow) {
   }
 }
 
+async function deleteProvider(p: ProviderRow) {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除供应商「${p.name}」吗？其模型库条目与指向它的路由规则将一并删除，其他路由的备选（Fallback）引用会被清理。`,
+      '删除供应商',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    await request(`/api/admin/providers/${p.id}`, { method: 'DELETE' })
+    ElMessage.success('供应商已删除')
+    await loadProviders()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+  }
+}
+
 // —— 测试连接（拉取供应商模型列表） ——
 const testing = ref(false)
 const testModels = ref<string[] | null>(null)
@@ -257,7 +276,7 @@ onMounted(loadProviders)
         <el-table-column label="创建时间" min-width="150">
           <template #default="{ row }">{{ fmt(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="130" fixed="right">
+        <el-table-column label="操作" width="185" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button
@@ -272,6 +291,7 @@ onMounted(loadProviders)
               type="success"
               @click="toggleProvider(row)"
             >启用</el-button>
+            <el-button link type="danger" @click="deleteProvider(row)">删除</el-button>
           </template>
         </el-table-column>
         <template #empty>

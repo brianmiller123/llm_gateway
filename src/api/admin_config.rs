@@ -30,7 +30,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/providers/{id}",
-            patch(update_provider).layer(admin.clone()),
+            patch(update_provider)
+                .delete(delete_provider)
+                .layer(admin.clone()),
         )
         .route(
             "/api/admin/providers/test-connection",
@@ -42,7 +44,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/routes/{id}",
-            patch(update_route).layer(admin.clone()),
+            patch(update_route)
+                .delete(delete_route)
+                .layer(admin.clone()),
         )
         .route(
             "/api/admin/rate-limits",
@@ -799,6 +803,33 @@ async fn update_provider(
     Ok(Json(json!({"provider": p})).into_response())
 }
 
+async fn delete_provider(
+    State(st): State<AppState>,
+    admin: Admin,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    // 级联：删除该供应商的模型（FK 级联）与直指它的路由规则（含模型同步自动建的路由），
+    // 并从其他路由的 fallback 引用中清理该 id；详见 store::delete_provider
+    if !config::delete_provider(&st.pool, id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        return Err(AppError::BadRequest("provider not found".into()));
+    }
+    st.reload().await.map_err(AppError::internal)?;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "provider.delete",
+        Some("provider"),
+        Some(id),
+        None,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({ "deleted": true })).into_response())
+}
+
 // ---------- 路由规则 ----------
 
 #[derive(Deserialize)]
@@ -1107,6 +1138,31 @@ async fn update_route(
     .await
     .map_err(AppError::internal)?;
     Ok(Json(json!({"route": route})).into_response())
+}
+
+async fn delete_route(
+    State(st): State<AppState>,
+    admin: Admin,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    if !config::delete_route(&st.pool, id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        return Err(AppError::BadRequest("route not found".into()));
+    }
+    st.reload().await.map_err(AppError::internal)?;
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "route.delete",
+        Some("route"),
+        Some(id),
+        None,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({ "deleted": true })).into_response())
 }
 
 // ---------- 限流规则 ----------
