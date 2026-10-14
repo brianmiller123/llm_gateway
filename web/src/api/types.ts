@@ -350,6 +350,8 @@ export interface ModelRow {
   model_id: string
   /** 启停：false = 该模型在该供应商不作为路由候选、不在 /v1/models 列出 */
   enabled: boolean
+  /** 上下文长度（token）；null = 未设置（/v1/models 不下发该字段） */
+  context_length: number | null
   created_at: string
 }
 

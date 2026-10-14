@@ -184,6 +184,20 @@ async fn embeddings(
 
 /// GET /v1/models：列出全部模型名（模型库 models 表 + 已启用路由的具体 pattern，去重）；
 /// 有 API Key 时按用户授权过滤；通配符 pattern（不可作为模型名提交）不列出。
+/// 模型库中设置了 context_length 的模型同值下发三个别名字段
+/// （context_length / context_window / max_model_len——分别覆盖 one-api /
+/// Anthropic / vLLM 生态客户端的读取约定），未设置则不下发，客户端回落自身默认。
+
+/// 同名模型出现在多个供应商时的上下文长度合并：取已设置值的最小值——
+/// 请求可能路由到任一候选渠道，最小值才是对客户端保证可用的安全上下文。
+fn merge_context_length(acc: Option<i64>, next: Option<i64>) -> Option<i64> {
+    match (acc, next) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
 async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     let uid = crate::service::auth::authenticate(&st, &headers)
         .await
@@ -200,30 +214,46 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
     let mut seen: Vec<String> = Vec::new();
     let mut data: Vec<serde_json::Value> = Vec::new();
-    let mut push = |name: String| {
+    let mut push = |name: String, ctx: Option<i64>| {
         if seen.contains(&name) {
             return;
         }
         seen.push(name.clone());
-        data.push(json!({
+        let mut obj = json!({
             "id": name,
             "object": "model",
             "owned_by": "llm-gateway",
-        }));
+        });
+        if let Some(n) = ctx {
+            obj["context_length"] = json!(n);
+            obj["context_window"] = json!(n);
+            obj["max_model_len"] = json!(n);
+        }
+        data.push(obj);
     };
 
-    // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商下已启用的模型
-    let catalog: Vec<(String, i64)> = sqlx::query_as::<_, (String, i64)>(
-        "SELECT m.model_id, m.provider_id FROM models m \
+    // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商下已启用的模型。
+    //    聚合与授权过滤同集合：只对该用户可路由的供应商取最小值——更精确
+    //    （不因无权渠道的更小设置而低估可用上下文），且仍不高估。
+    let catalog: Vec<(String, i64, Option<i64>)> = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+        "SELECT m.model_id, m.provider_id, m.context_length FROM models m \
          JOIN providers p ON p.id = m.provider_id AND p.enabled \
          WHERE m.enabled",
     )
     .fetch_all(&st.pool)
     .await
     .unwrap_or_default();
-    for (model, provider_id) in catalog {
-        if can_use(provider_id, &model) {
-            push(model);
+    let mut catalog_ctx: std::collections::HashMap<&str, Option<i64>> =
+        std::collections::HashMap::new();
+    for (model, provider_id, ctx) in &catalog {
+        if can_use(*provider_id, model) {
+            let entry = catalog_ctx.entry(model.as_str()).or_insert(None);
+            *entry = merge_context_length(*entry, *ctx);
+        }
+    }
+    for (model, provider_id, _) in &catalog {
+        if can_use(*provider_id, model) {
+            push(model.clone(), catalog_ctx.get(model.as_str()).copied().flatten());
         }
     }
 
@@ -247,7 +277,9 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             continue;
         }
         if providers.iter().any(|p| can_use(p.id, &r.model_pattern)) {
-            push(r.model_pattern.clone());
+            // 路由 pattern 与模型库同名时已在前一步 push（含上下文），此处仅补
+            // 模型库未收录的路由模型——无 DB 行，无上下文可下发
+            push(r.model_pattern.clone(), None);
         }
     }
     (
@@ -255,4 +287,22 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         Json(json!({"object": "list", "data": data})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_context_length;
+
+    #[test]
+    fn merge_context_length_takes_min_of_set_values() {
+        assert_eq!(merge_context_length(None, None), None, "双方未设置 → 不下发");
+        assert_eq!(merge_context_length(None, Some(384_000)), Some(384_000));
+        assert_eq!(merge_context_length(Some(1_000_000), None), Some(1_000_000));
+        assert_eq!(
+            merge_context_length(Some(1_000_000), Some(384_000)),
+            Some(384_000),
+            "取最小：请求可能落到任一候选渠道"
+        );
+        assert_eq!(merge_context_length(Some(128_000), Some(384_000)), Some(128_000));
+    }
 }

@@ -452,10 +452,12 @@ pub struct AdminModel {
     pub model_id: String,
     /// 启停：false = 该模型在该供应商不作为路由候选、不在 /v1/models 列出
     pub enabled: bool,
+    /// 上下文长度（token）：None = 未设置，/v1/models 不下发该字段
+    pub context_length: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
-const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.created_at \
+const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.context_length, m.created_at \
      FROM models m JOIN providers p ON p.id = m.provider_id";
 
 pub async fn list_models(pool: &PgPool) -> Result<Vec<AdminModel>, sqlx::Error> {
@@ -482,6 +484,32 @@ pub async fn set_model_enabled(
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+/// 按 id 取单个模型行（PATCH 多字段后回读最新状态用）
+pub async fn get_model(pool: &PgPool, id: i64) -> Result<Option<AdminModel>, sqlx::Error> {
+    sqlx::query_as::<_, AdminModel>(&format!("{ADMIN_MODEL_SELECT} WHERE m.id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// 设置模型上下文长度（token）；None = 清除。返回更新后的行（不存在 → None）。
+/// 不进 AppState 缓存：/v1/models 每次直查 DB，写后即时生效，无需 reload。
+pub async fn set_model_context_length(
+    pool: &PgPool,
+    id: i64,
+    context_length: Option<i64>,
+) -> Result<Option<AdminModel>, sqlx::Error> {
+    let res = sqlx::query("UPDATE models SET context_length = $2 WHERE id = $1")
+        .bind(id)
+        .bind(context_length)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_model(pool, id).await
 }
 
 /// 已禁用模型：provider_id → 该供应商下已禁用的 model_id 集合——运行时缓存在
@@ -989,6 +1017,64 @@ mod tests {
             load_disabled_models(&pool).await.unwrap().is_empty(),
             "禁用行随下架一并清理"
         );
+    }
+
+    /// 模型上下文长度：默认 NULL；set 落库、刷新保留（仍在上游列表的模型行不动）、
+    /// None 清除；不存在的 id → None
+    #[sqlx::test(migrations = "./migrations")]
+    async fn model_context_length_set_clear_and_survives_refresh(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        let s = |v: &[&str]| v.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        replace_provider_models(&pool, p1.id, &s(&["a", "b"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        assert!(
+            rows.iter().all(|m| m.context_length.is_none()),
+            "入库默认未设置"
+        );
+        let a = rows
+            .iter()
+            .find(|m| m.model_id == "a")
+            .unwrap()
+            .clone();
+
+        let updated = set_model_context_length(&pool, a.id, Some(384_000))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.context_length, Some(384_000));
+        assert!(
+            set_model_context_length(&pool, i64::MAX, Some(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "不存在 → None"
+        );
+
+        // 刷新：a 仍在列表 → 上下文长度保留；c 新增 → 默认 NULL
+        replace_provider_models(&pool, p1.id, &s(&["a", "b", "c"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        let a_after = rows
+            .iter()
+            .find(|m| m.model_id == "a")
+            .unwrap();
+        assert_eq!(
+            a_after.context_length,
+            Some(384_000),
+            "刷新保留已设置的上下文长度"
+        );
+        let c = rows.iter().find(|m| m.model_id == "c").unwrap();
+        assert!(c.context_length.is_none());
+
+        // 清除
+        let cleared = set_model_context_length(&pool, a.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.context_length, None, "None = 清除");
     }
 
     /// 供应商删除：模型级联清空；模型同步自动建的直指路由一并删除；

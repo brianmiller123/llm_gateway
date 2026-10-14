@@ -210,3 +210,15 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 - 验证：cargo test 73/73（新增 merge_deep/effective_extra/apply_extra 3 个单测）、cargo build 零警告、npm run build 零错；E2E（临时 capture 服务器 9002 + 测试 provider/route，已清理）：客户端 chat_template_kwargs.client_field 保留、渠道 thinking:true+top_k 生效、模型级 reasoning_effort 覆盖渠道级、清空模型级回落渠道级、全局开关关闭不合并/恢复即生效、托管字段与非对象 400、/v1/messages 转换路径与流式路径均正确合并、stream_options.include_usage 共存；浏览器：预设应用/保存/表格回显、模型级对话框（标题+覆盖提示）、全局开关 alert 出现与消失、预览区合并输出正确（基础请求校验与 extra_body 校验分离——model 在基础请求中合法）
 - 坑（勿回退）：save_extra_body_enabled 首版 SQL 用 $2 只绑 1 参 → bind 参数错误（已改 $1）；前端预览误用 extra_body 校验函数检查基础请求导致 `// 顶层字段 "model" 由网关管理`（拆 validateBaseJson/validateJson）；edit 工具多 hunk 编辑 Vue SFC 时错位 → 最后整文件重写
 - 运行环境现状：gateway（hub，8443，admin/admin12345）/mock-upstream（hub，9001）/postgres 容器在跑；schema 已迁移到 0009；测试残留已清理（providers/routes extra_body 全空、开关 true）
+
+## P20 模型上下文长度（已交付）
+
+- 问题：`/v1/models` 只返回 id/object/owned_by，无任何上下文信息——384K 等非标上下文模型被客户端按自身默认值（1M）展示/裁剪，实际可用上下文被高估
+- 存储（迁移 0028）：`models.context_length BIGINT`（NULL = 未设置）；刷新模型库保留（仍在上游列表的行不动），新模型默认 NULL
+- API：
+  - `PATCH /api/admin/models/{id}` 扩展：`context_length`（1..=100000000，防手滑钳制）+ `clear_context_length: true` 清除（JSON null 与缺省不可区分，同 model_routes scope_id 显式布尔约定）；`clear` 与 `context_length` 同传 400；两者皆缺 400；audit `model.context_length.update`；启停路径（enabled）行为与 audit 事件不变
+  - `GET /v1/models`：设置了 context_length 的模型同值下发 `context_length`/`context_window`/`max_model_len` 三个别名（分别覆盖 one-api/Anthropic/vLLM 生态客户端读取约定），未设置不下发；同名模型多供应商在**请求者可用供应商集合内**取已设置值的最小值（请求只可能落到该集合内的候选渠道，最小值才保证可用；无权渠道的更小设置不再拉低展示值）；路由 pattern 兜底列出的模型无 DB 行，不下发
+- 前端：Models.vue「上下文长度」列（384K/1M 人性化格式，NULL 显示 —）+ 行内「上下文」按钮弹窗设置（el-input-number `:precision="0"` 防小数入 422、清空=清除）；types.ts ModelRow 增 context_length
+- 评审修复（2026-10-14）：① el-input-number 加 `:precision="0"`（此前 384000.5 可提交 → 服务端 serde i64 拒绝 422 纯文本体，UI 仅显示 "HTTP 422"）；② /v1/models 上下文聚合改为仅对请求者 `can_use` 命中的供应商取 min（双供应商 384K/128K 场景实测：默认放行用户见 128K，限定单渠道用户见 384K）
+- 验证：cargo test 290/290（新增 DB 测试 model_context_length_set_clear_and_survives_refresh + v1 merge_context_length 单测）；E2E（本地 debug 二进制 8443 + PG）：PATCH 384000 → /v1/models 三字段同值 → clear_context_length → 字段消失；0/空/超上限/互斥/不存在 id 均 400；enabled-only PATCH 回归；浏览器：列与弹窗渲染、384000 保存 → 行显示 384K、清空保存 → 恢复 —；测试后 context_length 全部清回 NULL
+- 运行环境现状：评审修复后已重新 `deploy-local-binary.sh`（compose gateway 容器 = 最新 release 二进制 + 最新 web/dist，8443/8080）；postgres 迁移已到 0028；本地 debug 冒烟实例已停

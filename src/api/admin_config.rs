@@ -302,36 +302,96 @@ async fn delete_model(
 
 #[derive(Deserialize)]
 struct ModelPatch {
-    enabled: bool,
+    /// 启停（缺省 = 不修改）
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// 上下文长度（token，缺省 = 不修改）。随 /v1/models 下发供客户端按真实
+    /// 上下文展示（客户端默认 1M 会高估 384K 等非标上下文模型）；网关不据此
+    /// 截断请求。JSON null 与缺省无法区分，清除用 clear_context_length。
+    #[serde(default)]
+    context_length: Option<i64>,
+    /// true = 清空 context_length（同 model_routes scope_id 的显式布尔约定）
+    #[serde(default)]
+    clear_context_length: Option<bool>,
 }
 
-/// 模型启停：禁用后该 (供应商, 模型) 不再作为路由候选、不在 /v1/models 列出；
-/// 路由规则与价格配置不受影响。reload 即时生效。
+/// 模型启停 / 上下文长度维护。禁用后该 (供应商, 模型) 不再作为路由候选、
+/// 不在 /v1/models 列出；路由规则与价格配置不受影响。启停变更 reload 即时生效。
 async fn update_model(
     State(st): State<AppState>,
     admin: Admin,
     Path(id): Path<i64>,
     Json(req): Json<ModelPatch>,
 ) -> Result<Response, AppError> {
-    let model = config::set_model_enabled(&st.pool, id, req.enabled)
+    if req.clear_context_length.is_some() && req.context_length.is_some() {
+        return Err(AppError::BadRequest(
+            "clear_context_length 与 context_length 互斥".into(),
+        ));
+    }
+    let ctx = if req.clear_context_length == Some(true) {
+        Some(None)
+    } else {
+        req.context_length.map(Some)
+    };
+    if req.enabled.is_none() && ctx.is_none() {
+        return Err(AppError::BadRequest(
+            "enabled 与 context_length 至少提供一个".into(),
+        ));
+    }
+    // 防手滑：>1 亿 token 的“上下文”必是录入错误
+    if let Some(Some(n)) = ctx {
+        if !(1..=100_000_000).contains(&n) {
+            return Err(AppError::BadRequest(
+                "context_length 必须在 1..=100000000（token）之间".into(),
+            ));
+        }
+    }
+    if let Some(enabled) = req.enabled {
+        let model = config::set_model_enabled(&st.pool, id, enabled)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
+        st.reload().await.map_err(AppError::internal)?;
+        audit::log(
+            &st.pool,
+            Some(admin.0.id),
+            if enabled {
+                "model.enable"
+            } else {
+                "model.disable"
+            },
+            Some("model"),
+            Some(id),
+            Some(json!({ "provider_id": model.provider_id, "model_id": model.model_id })),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    }
+    if let Some(ctx) = ctx {
+        let model = config::set_model_context_length(&st.pool, id, ctx)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
+        // context_length 不进内存缓存（/v1/models 直查 DB），无需 reload
+        audit::log(
+            &st.pool,
+            Some(admin.0.id),
+            "model.context_length.update",
+            Some("model"),
+            Some(id),
+            Some(json!({
+                "provider_id": model.provider_id,
+                "model_id": model.model_id,
+                "context_length": ctx,
+            })),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    }
+    let model = config::get_model(&st.pool, id)
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
-    st.reload().await.map_err(AppError::internal)?;
-    audit::log(
-        &st.pool,
-        Some(admin.0.id),
-        if req.enabled {
-            "model.enable"
-        } else {
-            "model.disable"
-        },
-        Some("model"),
-        Some(id),
-        Some(json!({ "provider_id": model.provider_id, "model_id": model.model_id })),
-    )
-    .await
-    .map_err(AppError::internal)?;
     Ok(Json(json!({ "model": model })).into_response())
 }
 

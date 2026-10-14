@@ -18,6 +18,51 @@ const togglingId = ref<number | null>(null)
 const resultDialog = ref(false)
 const results = ref<ModelTestResult[]>([])
 
+/** 上下文长度设置弹窗 */
+const ctxDialog = ref(false)
+const ctxSaving = ref(false)
+const ctxRow = ref<ModelRow | null>(null)
+const ctxValue = ref<number | null>(null)
+
+/** token 数人性化：384000 → 384K、1000000 → 1M */
+function fmtCtx(n: number | null): string {
+  if (n == null) return '—'
+  const trim = (v: number) => String(Number(v.toFixed(1)))
+  if (n >= 1_000_000) return `${trim(n / 1_000_000)}M`
+  if (n >= 1_000) return `${trim(n / 1_000)}K`
+  return String(n)
+}
+
+function openCtx(row: ModelRow) {
+  ctxRow.value = row
+  ctxValue.value = row.context_length
+  ctxDialog.value = true
+}
+
+/** 保存上下文长度：清空输入 = 清除设置（clear_context_length: true） */
+async function saveCtx() {
+  if (!ctxRow.value) return
+  ctxSaving.value = true
+  try {
+    const body =
+      ctxValue.value == null
+        ? { clear_context_length: true }
+        : { context_length: ctxValue.value }
+    await request(`/api/admin/models/${ctxRow.value.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    ElMessage.success(`「${ctxRow.value.model_id}」上下文长度已保存`)
+    ctxDialog.value = false
+    await loadModels()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  } finally {
+    ctxSaving.value = false
+  }
+}
+
 function fmt(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '-'
@@ -151,7 +196,7 @@ onMounted(loadModels)
 <template>
   <div class="page">
     <div class="toolbar">
-      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出</span>
+      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出；「上下文」设置的上下文长度随 /v1/models 下发给客户端</span>
       <div class="toolbar-actions">
         <el-button type="primary" :loading="testing" @click="testAll">
           <el-icon style="margin-right: 4px"><Cpu /></el-icon>
@@ -175,6 +220,11 @@ onMounted(loadModels)
         <el-table-column label="供应商" min-width="130" show-overflow-tooltip>
           <template #default="{ row }">{{ row.provider_name }}</template>
         </el-table-column>
+        <el-table-column label="上下文长度" width="110" align="right">
+          <template #default="{ row }">
+            <span :class="{ mono: row.context_length != null }">{{ fmtCtx(row.context_length) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="90" align="center">
           <template #default="{ row }">
             <el-switch
@@ -188,7 +238,7 @@ onMounted(loadModels)
         <el-table-column label="创建时间" min-width="150">
           <template #default="{ row }">{{ fmt(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="215" fixed="right">
           <template #default="{ row }">
             <el-button
               size="small"
@@ -197,6 +247,7 @@ onMounted(loadModels)
               :loading="testingId === row.id"
               @click="testOne(row)"
             >测试</el-button>
+            <el-button size="small" plain @click="openCtx(row)">上下文</el-button>
             <el-button size="small" type="danger" plain @click="deleteModel(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -205,6 +256,31 @@ onMounted(loadModels)
         </template>
       </el-table>
     </el-card>
+
+    <el-dialog v-model="ctxDialog" title="设置上下文长度" width="480px">
+      <div v-if="ctxRow">
+        <div class="mono ctx-model">{{ ctxRow.model_id }}（{{ ctxRow.provider_name }}）</div>
+        <el-input-number
+          v-model="ctxValue"
+          :min="1"
+          :max="100000000"
+          :precision="0"
+          :step="1000"
+          :value-on-clear="null"
+          controls-position="right"
+          placeholder="未设置"
+          style="width: 100%"
+        />
+        <div class="ctx-hint">
+          token 数，如 384K 模型填 384000。随 /v1/models 下发给客户端展示（避免客户端按默认
+          1M 高估可用上下文），网关不据此截断请求；清空表示未设置。
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="ctxDialog = false">取消</el-button>
+        <el-button type="primary" :loading="ctxSaving" @click="saveCtx">保存</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="resultDialog" title="模型测试结果" width="720px">
       <el-table :data="results" stripe max-height="480">
@@ -265,5 +341,17 @@ onMounted(loadModels)
 .mono.disabled {
   color: #a8abb2;
   text-decoration: line-through;
+}
+
+.ctx-model {
+  margin-bottom: 12px;
+  color: #606266;
+}
+
+.ctx-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #909399;
 }
 </style>
