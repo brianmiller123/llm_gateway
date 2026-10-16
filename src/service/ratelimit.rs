@@ -125,6 +125,8 @@ impl RateLimiter {
 /// (并发桶键, 并发上限) 列表。模型限定的规则仅在请求模型名与之精确相等时命中，
 /// 桶键附加 `|model:` 后缀独立计量；不限模型的规则对所有请求命中，
 /// 同键多规则叠加时由 apply_concurrency_limits 去重取最严上限。
+/// user 规则 scope_id 为 NULL 时通配所有用户（桶键仍按 user:{uid} 独立计量，
+/// 一条规则实现「每用户 N 并发」）；指定 scope_id 则仅该用户命中。
 fn matched_rules(
     rules: &[crate::store::rules::RateRule],
     user_id: Option<i64>,
@@ -136,9 +138,16 @@ fn matched_rules(
         .filter_map(|rule| {
             let mut bucket_key = match rule.scope.as_str() {
                 "global" => "global".to_string(),
-                "user" => user_id
-                    .filter(|uid| Some(*uid) == rule.scope_id)
-                    .map(|uid| format!("user:{uid}"))?,
+                "user" => {
+                    // 未鉴权请求（user_id=None）不匹配任何 user 规则
+                    let uid = user_id?;
+                    if let Some(sid) = rule.scope_id {
+                        if uid != sid {
+                            return None;
+                        }
+                    }
+                    format!("user:{uid}")
+                }
                 "api_key" => key_id
                     .filter(|kid| Some(*kid) == rule.scope_id)
                     .map(|kid| format!("key:{kid}"))?,
@@ -346,6 +355,30 @@ mod tests {
         );
         assert!(matched_rules(&rules, Some(8), None, "claude-3").is_empty());
         assert!(matched_rules(&rules, Some(7), None, "gpt-4o").is_empty());
+    }
+
+    /// user 通配规则（scope_id=NULL）：所有用户命中且桶键按 uid 独立；
+    /// 未鉴权不命中；与指定用户规则同键叠加时产出同一桶键（去重后不双计）
+    #[test]
+    fn user_wildcard_rule_matches_any_user_per_uid() {
+        let rules = vec![rule("user", None, None)];
+        assert_eq!(keys(&matched_rules(&rules, Some(7), Some(100), "m")), vec!["user:7"]);
+        assert_eq!(keys(&matched_rules(&rules, Some(8), None, "m")), vec!["user:8"]);
+        assert!(
+            matched_rules(&rules, None, None, "m").is_empty(),
+            "未鉴权请求不匹配 user 规则"
+        );
+        // 通配规则 + 指定用户规则同键：组合层（apply_concurrency_limits 的
+        // dedup_min_limit）合并为单桶取最严，不双倍占坑
+        let stacked = vec![rule("user", None, None), rule("user", Some(7), None)];
+        assert_eq!(
+            keys(&dedup_min_limit(matched_rules(&stacked, Some(7), None, "m"))),
+            vec!["user:7"]
+        );
+        assert_eq!(
+            keys(&dedup_min_limit(matched_rules(&stacked, Some(8), None, "m"))),
+            vec!["user:8"]
+        );
     }
 
     /// 重复桶键去重取最严上限：DB 不约束 (scope, scope_id, model) 唯一时，

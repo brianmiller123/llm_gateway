@@ -15,6 +15,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
+use axum::serve::ListenerExt;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
@@ -57,10 +58,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let signal_task = tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .expect("failed to install SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}
@@ -126,6 +126,11 @@ async fn serve_https(
                         continue;
                     }
                 };
+                // SSE 高频小包写：禁用 Nagle，避免与延迟 ACK 互作用造成
+                // 每 token 数十毫秒级停顿（上游 reqwest 侧默认已开）
+                if let Err(e) = tcp.set_nodelay(true) {
+                    tracing::warn!(%addr, error = %e, "failed to set TCP_NODELAY");
+                }
                 let acceptor = acceptor.clone();
                 let app = app.clone();
                 tokio::spawn(async move {
@@ -186,7 +191,12 @@ async fn serve_http_app(
     let listener = TcpListener::bind(cfg.http_addr).await?;
     tracing::info!("HTTP serving on {} (redirect disabled)", cfg.http_addr);
     axum::serve(
-        listener,
+        // SSE 高频小包写：禁用 Nagle（axum 官方 tap_io 扩展，与 HTTPS 路径对齐）
+        listener.tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::warn!(error = %e, "failed to set TCP_NODELAY");
+            }
+        }),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {

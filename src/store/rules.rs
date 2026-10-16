@@ -1,6 +1,7 @@
 use sqlx::{FromRow, PgPool};
 
 /// 限流规则（scope: global | user | api_key；model 为 Some 时仅限该模型）。
+/// user 作用域 scope_id 为 NULL = 通配所有用户（按用户独立计量）；api_key 须指定 scope_id。
 /// 仅并发上限一个限制维度（令牌桶 rpm/burst 已随 0027 移除）
 #[derive(Debug, Clone, FromRow)]
 pub struct RateRule {

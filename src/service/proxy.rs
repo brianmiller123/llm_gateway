@@ -58,6 +58,18 @@ struct StreamTimeoutStream<S> {
     timed_out: bool,
 }
 
+impl<S> StreamTimeoutStream<S> {
+    /// 窗口切换/重置到 idle：优先 reset 复用既有 Sleep——逐 chunk 重建计时器
+    /// 在 1000 chunk/s 量级即每秒千次堆分配+定时轮注册；语义与重建一致：
+    /// idle 禁用 → 撤销计时器，尚无计时器 → 新建。
+    fn arm_idle(&mut self) {
+        match (self.idle, &mut self.wait) {
+            (Some(d), Some(wait)) => wait.as_mut().reset(tokio::time::Instant::now() + d),
+            (Some(d), None) => self.wait = Some(Box::pin(tokio::time::sleep(d))),
+            (None, _) => self.wait = None,
+        }
+    }
+}
 impl<S> Stream for StreamTimeoutStream<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>>,
@@ -91,12 +103,12 @@ where
             Poll::Ready(Some(Ok(bytes))) => {
                 // 收到数据：首字节窗口关闭，此后重置静默窗口
                 this.first = false;
-                this.wait = this.idle.map(|d| Box::pin(tokio::time::sleep(d)));
+                this.arm_idle();
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(e))) => {
                 this.first = false;
-                this.wait = this.idle.map(|d| Box::pin(tokio::time::sleep(d)));
+                this.arm_idle();
                 Poll::Ready(Some(Err(Box::<dyn Error + Send + Sync>::from(e))))
             }
             Poll::Ready(None) => Poll::Ready(None),
@@ -2871,38 +2883,36 @@ fn wrap_stream(
     record_status: u16,
     capture_usage: bool,
 ) -> BillingStream {
-    let recorded = Arc::new(AtomicBool::new(false));
-    let captured: Arc<parking_lot::Mutex<Option<Usage>>> = Arc::new(parking_lot::Mutex::new(None));
-    let buf: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    // 逐 chunk 共享上下文：流适配器每帧只能克隆一个 Arc，替代此前每帧克隆
+    // AppState（~20 个 Arc 原子操作）+ UsageMeta（String/Vec 堆分配）
+    let ctx = Arc::new(UsageCapture {
+        recorded: Arc::new(AtomicBool::new(false)),
+        captured: Arc::new(parking_lot::Mutex::new(None)),
+        buf: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        st,
+        meta,
+    });
 
     let main = upstream.then({
-        let recorded = recorded.clone();
-        let captured = captured.clone();
-        let buf = buf.clone();
-        let st = st.clone();
-        let meta = meta.clone();
+        let ctx = ctx.clone();
         move |chunk| {
-            let recorded = recorded.clone();
-            let captured = captured.clone();
-            let buf = buf.clone();
-            let st = st.clone();
-            let meta = meta.clone();
+            let ctx = ctx.clone();
             async move {
                 let chunk = chunk?;
                 let (usage, done) = if capture_usage {
-                    feed_sse(&mut buf.lock(), &chunk)
+                    feed_sse(&mut ctx.buf.lock(), &chunk)
                 } else {
                     (None, false)
                 };
                 // 合并进 captured（后帧非 None 覆盖），不提前记账——anthropic 流
                 // message_start 桩（output≈0）先于 message_delta 终值到达
                 if let Some(u) = usage {
-                    merge_usage(&mut captured.lock(), u);
+                    merge_usage(&mut ctx.captured.lock(), u);
                 }
                 // 记账只在终态事件（[DONE]/response.*/message_stop）触发一次
-                if done && !recorded.swap(true, Ordering::SeqCst) {
-                    let u = captured.lock().take();
-                    usage::record(&st, &meta, u.as_ref(), record_status, latency).await;
+                if done && !ctx.recorded.swap(true, Ordering::SeqCst) {
+                    let u = ctx.captured.lock().take();
+                    usage::record(&ctx.st, &ctx.meta, u.as_ref(), record_status, latency).await;
                 }
                 Ok::<Bytes, Box<dyn Error + Send + Sync>>(chunk)
             }
@@ -2910,24 +2920,20 @@ fn wrap_stream(
     });
 
     let tail = once({
-        let recorded = recorded.clone();
-        let captured = captured.clone();
-        let buf = buf.clone();
-        let st = st.clone();
-        let meta = meta.clone();
+        let ctx = ctx.clone();
         async move {
             // EOF flush：流可能终止在未以空行收尾的最后事件（宽松上游不发
             // 尾空行），追加事件边界强制解析残余 buffer，终态 usage 才不丢
             if capture_usage {
-                let (usage, _) = feed_sse(&mut buf.lock(), b"\n\n");
+                let (usage, _) = feed_sse(&mut ctx.buf.lock(), b"\n\n");
                 if let Some(u) = usage {
-                    merge_usage(&mut captured.lock(), u);
+                    merge_usage(&mut ctx.captured.lock(), u);
                 }
             }
             // 上游未正常结束（无 [DONE]/usage）时兜底记账
-            if !recorded.swap(true, Ordering::SeqCst) {
-                let u = captured.lock().take();
-                usage::record(&st, &meta, u.as_ref(), record_status, latency).await;
+            if !ctx.recorded.swap(true, Ordering::SeqCst) {
+                let u = ctx.captured.lock().take();
+                usage::record(&ctx.st, &ctx.meta, u.as_ref(), record_status, latency).await;
             }
             Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::new())
         }
@@ -2936,14 +2942,23 @@ fn wrap_stream(
     BillingStream {
         inner: Box::pin(main.chain(tail)),
         _billing: BillingOnDrop {
-            st,
-            meta,
-            recorded,
-            captured,
+            st: ctx.st.clone(),
+            meta: ctx.meta.clone(),
+            recorded: ctx.recorded.clone(),
+            captured: ctx.captured.clone(),
             status: record_status,
             latency,
         },
     }
+}
+
+/// wrap_stream 逐 chunk 共享的记账上下文（含兜底记账与 BillingOnDrop 所需全部句柄）
+struct UsageCapture {
+    recorded: Arc<AtomicBool>,
+    captured: Arc<parking_lot::Mutex<Option<Usage>>>,
+    buf: Arc<parking_lot::Mutex<Vec<u8>>>,
+    st: AppState,
+    meta: UsageMeta,
 }
 
 /// 从 OpenAI 兼容响应体解析 usage
@@ -2972,7 +2987,9 @@ fn extract_usage_frame(v: &Value) -> Option<(Usage, bool)> {
         v.get("usage")
             .or_else(|| v.get("response").and_then(|r| r.get("usage")))
     }?;
-    serde_json::from_value(u.clone()).ok().map(|u| (u, anthropic))
+    serde_json::from_value(u.clone())
+        .ok()
+        .map(|u| (u, anthropic))
 }
 
 /// 流式 usage 帧合并：后帧非 None 字段覆盖前帧，缺省字段保留前帧。
@@ -3016,6 +3033,11 @@ pub fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8]) -> (Option<Usage>, bool) {
         };
         let event: Vec<u8> = buf.drain(..idx).collect();
         let text = String::from_utf8_lossy(&event);
+        // 帧级预筛：content delta 帧占流中绝对多数且必无 usage/终态，跳过
+        // serde DOM 解析（透传路径每 token 的最大单项开销）
+        if !frame_may_carry_usage_or_terminal(&text) {
+            continue;
+        }
         for line in text.lines() {
             if let Some(data) = line.strip_prefix("data:") {
                 let data = data.trim();
@@ -3063,6 +3085,22 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
         .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
 }
 
+/// feed_sse 帧级预筛：这些标记在序列化 JSON/文本中必以字面子串出现（键名与
+/// 类型值不做转义），缺失 ⇒ 该帧必不含 usage 也不是终态。字符串值偶含同形
+/// 子串只会多解析一次（假阳性无害），漏检不可能——usage 帧必含键 "usage"，
+/// 终态帧必含对应 type 字面量，[DONE] 帧即 "[DONE]"。
+fn frame_may_carry_usage_or_terminal(text: &str) -> bool {
+    const TERMINAL_TYPES: [&str; 5] = [
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+        "response.done",
+        "message_stop",
+    ];
+    text.contains("[DONE]")
+        || text.contains("usage")
+        || TERMINAL_TYPES.iter().any(|t| text.contains(t))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

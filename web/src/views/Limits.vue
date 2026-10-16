@@ -99,8 +99,8 @@ async function submitRate() {
     ElMessage.warning('请选择作用域')
     return
   }
-  if (rateForm.scope !== 'global' && rateForm.scope_id === null) {
-    ElMessage.warning('非 global 作用域必须填写 scope_id')
+  if (rateForm.scope === 'api_key' && rateForm.scope_id === null) {
+    ElMessage.warning('API Key 作用域必须填写 scope_id')
     return
   }
   if (rateForm.concurrency === null || rateForm.concurrency < 0 || !Number.isInteger(rateForm.concurrency)) {
@@ -144,7 +144,11 @@ async function submitRate() {
 
 // —— 删除 ——
 async function removeRate(row: RateRuleRow) {
-  const scopeText = `${scopeLabels[row.scope] ?? row.scope}${row.scope_id !== null ? ` #${row.scope_id}` : ''}`
+  const scopeText = row.scope_id !== null
+    ? `${scopeLabels[row.scope] ?? row.scope} #${row.scope_id}`
+    : row.scope === 'user'
+      ? `${scopeLabels[row.scope] ?? row.scope}（所有用户）`
+      : scopeLabels[row.scope] ?? row.scope
   const modelText = row.model ? `（模型 ${row.model}）` : ''
   try {
     await ElMessageBox.confirm(
@@ -170,7 +174,7 @@ onMounted(loadRules)
 <template>
   <div class="page">
     <div class="toolbar">
-      <span class="desc">并发上限：全局 / 用户 / API Key 三层规则同时生效，任一命中桶在途请求数满员即 429 + Retry-After；可选模型限定（按客户端模型名精确匹配，独立计量）</span>
+      <span class="desc">并发上限：全局 / 用户 / API Key 规则同时生效，任一命中桶在途请求数满员即 429 + Retry-After；用户规则留空 scope_id = 对所有用户按用户独立计量（一条规则限每个用户）；可选模型限定（按客户端模型名精确匹配，独立计量）</span>
       <el-button type="primary" @click="openCreateRate">
         <el-icon><Plus /></el-icon>
         <span>新建规则</span>
@@ -187,7 +191,7 @@ onMounted(loadRules)
           </template>
         </el-table-column>
         <el-table-column label="scope_id" width="100">
-          <template #default="{ row }">{{ row.scope_id ?? '-' }}</template>
+          <template #default="{ row }">{{ row.scope_id ?? (row.scope === 'user' ? '全部用户' : '-') }}</template>
         </el-table-column>
         <el-table-column label="模型" min-width="160">
           <template #default="{ row }">
@@ -248,8 +252,11 @@ onMounted(loadRules)
             placeholder="用户或 API Key 的 ID"
             style="width: 100%"
           />
-          <div v-if="rateForm.scope !== 'global'" class="form-tip">
-            必填；清空保存表示解除绑定（传 null）
+          <div v-if="rateForm.scope === 'user'" class="form-tip">
+            留空 = 对所有用户生效（每个用户独立计量）；填写 = 仅限该用户 ID
+          </div>
+          <div v-else-if="rateForm.scope === 'api_key'" class="form-tip">
+            必填：API Key 的 ID
           </div>
         </el-form-item>
         <el-form-item label="模型">

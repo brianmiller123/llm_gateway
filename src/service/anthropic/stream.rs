@@ -727,45 +727,43 @@ pub fn wrap_chat_stream_to_anthropic(
     message_id: String,
     model: String,
 ) -> BillingStream {
-    let recorded = Arc::new(AtomicBool::new(false));
-    let finished = Arc::new(AtomicBool::new(false));
     let state: Arc<Mutex<ChatToAnthropicState>> =
         Arc::new(Mutex::new(ChatToAnthropicState::new(message_id, model)));
     let parser: Arc<Mutex<ChatSseParser>> = Arc::new(Mutex::new(ChatSseParser::new()));
+    // 逐 chunk 共享上下文：流适配器每帧只克隆一个 Arc，替代此前每帧克隆
+    // 6 项（AppState ~20 个 Arc 原子操作 + UsageMeta String/Vec 堆分配）
+    let ctx = Arc::new(ConvertCtx {
+        st,
+        meta,
+        recorded: Arc::new(AtomicBool::new(false)),
+        finished: Arc::new(AtomicBool::new(false)),
+        state,
+        parser,
+    });
 
     let main = upstream.then({
-        let st = st.clone();
-        let meta = meta.clone();
-        let recorded = recorded.clone();
-        let finished = finished.clone();
-        let state = state.clone();
-        let parser = parser.clone();
+        let ctx = ctx.clone();
         move |chunk| {
-            let st = st.clone();
-            let meta = meta.clone();
-            let recorded = recorded.clone();
-            let finished = finished.clone();
-            let state = state.clone();
-            let parser = parser.clone();
+            let ctx = ctx.clone();
             async move {
                 // H1：上游传输错误/超时 → `event: error` 结构化事件（而非把 Err
                 // 透传进 body 让 hyper 掐断客户端连接；cc-switch :627-642 同款）
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        if !finished.swap(true, Ordering::SeqCst) {
+                        if !ctx.finished.swap(true, Ordering::SeqCst) {
                             let (frames, usage) = {
-                                let mut state = state.lock();
+                                let mut state = ctx.state.lock();
                                 let mut frames = Vec::new();
                                 for frame in &state.transport_error(&e.to_string()) {
                                     frames.extend_from_slice(frame.as_bytes());
                                 }
                                 (frames, state.billing_usage())
                             };
-                            if !recorded.swap(true, Ordering::SeqCst) {
+                            if !ctx.recorded.swap(true, Ordering::SeqCst) {
                                 crate::service::usage::record(
-                                    &st,
-                                    &meta,
+                                    &ctx.st,
+                                    &ctx.meta,
                                     usage.as_ref(),
                                     record_status,
                                     latency,
@@ -779,7 +777,8 @@ pub fn wrap_chat_stream_to_anthropic(
                 };
                 let mut out: Vec<u8> = Vec::new();
                 let (terminal, failed) = {
-                    let mut parser = parser.lock();
+                    let mut parser = ctx.parser.lock();
+                    let mut state = ctx.state.lock();
                     let mut payloads: Vec<SseEvent> = Vec::new();
                     let t = parser.push(&chunk, &mut payloads);
                     let mut failed = false;
@@ -787,7 +786,7 @@ pub fn wrap_chat_stream_to_anthropic(
                         let Some(mut cc) = ChatStreamChunk::from_json_str(&frame.data) else {
                             // JSON 语法非法才丢帧（类型怪癖由宽松解析兜住）；留痕不静默
                             tracing::warn!(
-                                request_id = %meta.request_id,
+                                request_id = %ctx.meta.request_id,
                                 payload_len = frame.data.len(),
                                 "dropping malformed upstream SSE chunk"
                             );
@@ -797,7 +796,6 @@ pub fn wrap_chat_stream_to_anthropic(
                         if cc.error.is_none() && frame.event.as_deref() == Some("error") {
                             cc.error = Some(json!({"message": frame.data}));
                         }
-                        let mut state = state.lock();
                         for frame_str in state.process_chunk(&cc) {
                             out.extend_from_slice(frame_str.as_bytes());
                         }
@@ -805,9 +803,9 @@ pub fn wrap_chat_stream_to_anthropic(
                     }
                     (t, failed)
                 };
-                if (terminal || failed) && !finished.swap(true, Ordering::SeqCst) {
+                if (terminal || failed) && !ctx.finished.swap(true, Ordering::SeqCst) {
                     let (final_frames, usage) = {
-                        let mut state = state.lock();
+                        let mut state = ctx.state.lock();
                         let mut frames = Vec::new();
                         for frame in &state.finalize() {
                             frames.extend_from_slice(frame.as_bytes());
@@ -815,10 +813,10 @@ pub fn wrap_chat_stream_to_anthropic(
                         (frames, state.billing_usage())
                     };
                     out.extend_from_slice(&final_frames);
-                    if !recorded.swap(true, Ordering::SeqCst) {
+                    if !ctx.recorded.swap(true, Ordering::SeqCst) {
                         crate::service::usage::record(
-                            &st,
-                            &meta,
+                            &ctx.st,
+                            &ctx.meta,
                             usage.as_ref(),
                             record_status,
                             latency,
@@ -832,25 +830,21 @@ pub fn wrap_chat_stream_to_anthropic(
     });
 
     let tail = once({
-        let st = st.clone();
-        let meta = meta.clone();
-        let recorded = recorded.clone();
-        let finished = finished.clone();
-        let state = state.clone();
+        let ctx = ctx.clone();
         async move {
-            if !finished.swap(true, Ordering::SeqCst) {
+            if !ctx.finished.swap(true, Ordering::SeqCst) {
                 let (final_frames, usage) = {
-                    let mut state = state.lock();
+                    let mut state = ctx.state.lock();
                     let mut frames = Vec::new();
                     for frame in &state.finalize_truncated() {
                         frames.extend_from_slice(frame.as_bytes());
                     }
                     (frames, state.billing_usage())
                 };
-                if !recorded.swap(true, Ordering::SeqCst) {
+                if !ctx.recorded.swap(true, Ordering::SeqCst) {
                     crate::service::usage::record(
-                        &st,
-                        &meta,
+                        &ctx.st,
+                        &ctx.meta,
                         usage.as_ref(),
                         record_status,
                         latency,
@@ -867,14 +861,24 @@ pub fn wrap_chat_stream_to_anthropic(
     BillingStream {
         inner: Box::pin(main.chain(tail)),
         _billing: BillingOnDrop {
-            st,
-            meta,
-            recorded,
-            state,
+            st: ctx.st.clone(),
+            meta: ctx.meta.clone(),
+            recorded: ctx.recorded.clone(),
+            state: ctx.state.clone(),
             status: record_status,
             latency,
         },
     }
+}
+
+/// wrap_chat_stream_to_anthropic 逐 chunk 共享的转换上下文
+struct ConvertCtx {
+    st: AppState,
+    meta: UsageMeta,
+    recorded: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    state: Arc<Mutex<ChatToAnthropicState>>,
+    parser: Arc<Mutex<ChatSseParser>>,
 }
 
 #[cfg(test)]

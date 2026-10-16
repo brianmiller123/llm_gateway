@@ -5,7 +5,7 @@
 //! 里、以 `<think>` 开头 `</think>` 结尾。直接透传会污染最终答案且计费口径
 //! （text vs reasoning token）失真。本状态机只识别**流首**的 think 块：
 //! - Detecting：开头缓冲，等确证是 <think> 前缀还是普通文本（跨 chunk 部分标签）
-//! - Reasoning：缓冲至 </think> 出现，期间产出 reasoning 增量
+//! - Reasoning：增量下发 reasoning，仅持留可能是 `</think>` 前缀的尾部字节
 //! - Text：普通文本直通（think 块之后或无 think 块）
 //! 非开头的 `<think>`（第二段起）按普通文本处理（cc-switch 同款语义）。
 
@@ -66,6 +66,17 @@ fn split_leading_think_block(buffer: &str) -> Option<(String, String)> {
     ))
 }
 
+/// 缓冲尾部与 `</think>` 前缀的最长匹配字节数（0..=7）。标签为纯 ASCII，
+/// 命中的持留段必为 ASCII 字节，drain 切点必落在字符边界上。
+fn partial_close_suffix_len(buffer: &str) -> usize {
+    let bytes = buffer.as_bytes();
+    let tag = THINK_CLOSE.as_bytes();
+    (1..=tag.len().min(bytes.len()))
+        .rev()
+        .find(|&k| bytes[bytes.len() - k..] == tag[..k])
+        .unwrap_or(0)
+}
+
 /// 非流式一次性分离（M1）：完整文本中的首个 `<think>…</think>` 块拆为
 /// (reasoning, 其后文本)；无完整块（缺闭合标签）时返回 None，调用方按原文本处理。
 pub fn split_leading_think(text: &str) -> Option<(String, String)> {
@@ -88,7 +99,8 @@ impl InlineThinkState {
                     PrefixDecision::NeedMore => (Vec::new(), Vec::new()),
                     PrefixDecision::Reasoning => {
                         self.mode = Mode::Reasoning;
-                        self.drain_complete_think_block()
+                        self.strip_open_tag();
+                        self.emit_reasoning()
                     }
                     PrefixDecision::Text => {
                         self.mode = Mode::Text;
@@ -99,7 +111,7 @@ impl InlineThinkState {
             }
             Mode::Reasoning => {
                 self.buffer.push_str(delta);
-                self.drain_complete_think_block()
+                self.emit_reasoning()
             }
         }
     }
@@ -120,48 +132,53 @@ impl InlineThinkState {
             Mode::Reasoning => {
                 let buffered = std::mem::take(&mut self.buffer);
                 self.mode = Mode::Text;
-                if let Some((reasoning, answer)) = split_leading_think_block(&buffered) {
-                    let mut r = Vec::new();
-                    if !reasoning.is_empty() {
-                        r.push(reasoning);
-                    }
-                    let mut t = Vec::new();
-                    if !answer.is_empty() {
-                        t.push(answer);
-                    }
-                    (r, t)
+                // 未闭合 think 块：全部算 reasoning（开标签迁移时已剥离；
+                // 完整闭合标签出现过则早已迁移，持留的半截标签不会出现）
+                if buffered.is_empty() {
+                    (Vec::new(), Vec::new())
                 } else {
-                    // 未闭合的 think 块：整体算 reasoning（去掉开标签前缀）
-                    let reasoning = buffered
-                        .strip_prefix(THINK_OPEN)
-                        .map(str::to_string)
-                        .unwrap_or(buffered);
-                    if reasoning.is_empty() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        (vec![reasoning], Vec::new())
-                    }
+                    (vec![buffered], Vec::new())
                 }
             }
         }
     }
 
-    /// Reasoning 模式下尝试分离完整 think 块：命中则切换 Text 并产出两段增量
-    fn drain_complete_think_block(&mut self) -> (Vec<String>, Vec<String>) {
-        let Some((reasoning, answer)) = split_leading_think_block(&self.buffer) else {
-            return (Vec::new(), Vec::new());
-        };
-        self.mode = Mode::Text;
-        self.buffer.clear();
-        let mut r = Vec::new();
-        if !reasoning.is_empty() {
-            r.push(reasoning);
+    /// Reasoning 模式增量下发：完整 `</think>` 出现 → 切 Text 并产出
+    /// (剩余 reasoning, 其后 text)；否则除「可能是 `</think>` 前缀的尾部字节」
+    /// 外全部即时下发（跨 chunk 半标签留待后续判定）。缓冲常态 ≤ 7 字节 +
+    /// 当前增量，长思考不再整段滞留、也不再整段重扫。
+    fn emit_reasoning(&mut self) -> (Vec<String>, Vec<String>) {
+        if let Some(end) = self.buffer.find(THINK_CLOSE) {
+            let reasoning = self.buffer.drain(..end).as_str().to_string();
+            self.buffer.drain(..THINK_CLOSE.len());
+            let answer = std::mem::take(&mut self.buffer);
+            self.mode = Mode::Text;
+            let mut r = Vec::new();
+            if !reasoning.is_empty() {
+                r.push(reasoning);
+            }
+            let mut t = Vec::new();
+            if !answer.is_empty() {
+                t.push(answer);
+            }
+            (r, t)
+        } else {
+            let hold = partial_close_suffix_len(&self.buffer);
+            if self.buffer.len() == hold {
+                return (Vec::new(), Vec::new());
+            }
+            let emit = self.buffer.len() - hold;
+            let reasoning = self.buffer.drain(..emit).collect();
+            (vec![reasoning], Vec::new())
         }
-        let mut t = Vec::new();
-        if !answer.is_empty() {
-            t.push(answer);
+    }
+
+    /// 剥离缓冲的前导空白 + `<think>` 开标签（迁移时已确认 trimmed 以
+    /// THINK_OPEN 开头，find 必命中）。
+    fn strip_open_tag(&mut self) {
+        if let Some(pos) = self.buffer.find(THINK_OPEN) {
+            self.buffer.drain(..pos + THINK_OPEN.len());
         }
-        (r, t)
     }
 }
 
@@ -209,23 +226,27 @@ mod tests {
         assert_eq!(r2.concat(), "reasoning");
         assert_eq!(t2.concat(), "done");
     }
-
     #[test]
     fn partial_close_tag_across_chunks() {
         let mut s = InlineThinkState::new();
-        let _ = s.feed("<think>abc</th");
-        let (r, t) = s.feed("ink>tail");
-        assert_eq!(r.concat(), "abc");
-        assert_eq!(t.concat(), "tail");
+        // 半截 </th 持留，abc 先行下发（增量契约）；ink> 补全后产出 text
+        let (r1, t1) = s.feed("<think>abc</th");
+        assert_eq!(r1, vec!["abc".to_string()]);
+        assert!(t1.is_empty());
+        let (r2, t2) = s.feed("ink>tail");
+        assert!(r2.is_empty());
+        assert_eq!(t2, vec!["tail".to_string()]);
     }
 
     #[test]
     fn unterminated_block_flushes_as_reasoning() {
         let mut s = InlineThinkState::new();
-        let _ = s.feed("<think>half thoughts");
-        let (r, t) = s.flush();
-        assert_eq!(r.concat(), "half thoughts");
-        assert!(t.is_empty());
+        let (r_feed, t_feed) = s.feed("<think>half thoughts");
+        let (r_flush, t_flush) = s.flush();
+        let mut r_all = r_feed;
+        r_all.extend(r_flush);
+        assert_eq!(r_all.concat(), "half thoughts");
+        assert!(t_feed.is_empty() && t_flush.is_empty());
     }
 
     #[test]
@@ -243,5 +264,32 @@ mod tests {
         let (r, t) = feed_all(&mut s, &["  <think>r</think>a"]);
         assert_eq!(r.concat(), "r");
         assert_eq!(t.concat(), "a");
+    }
+
+    #[test]
+    fn reasoning_emits_incrementally_before_close() {
+        // 契约：闭合标签未出现期间，除半截闭合标签候选外即时下发，
+        // 不等 </think> 整段滞留（旧行为是全程静默）
+        let mut s = InlineThinkState::new();
+        let (r1, t1) = s.feed("<think>aaa");
+        assert_eq!(r1, vec!["aaa".to_string()]);
+        assert!(t1.is_empty());
+        let (r2, _) = s.feed("bbb");
+        assert_eq!(r2, vec!["bbb".to_string()]);
+        let (r3, t3) = s.flush();
+        assert!(r3.is_empty());
+        assert!(t3.is_empty());
+    }
+
+    #[test]
+    fn multibyte_reasoning_never_splits_chars() {
+        // 多字节 reasoning 跨 chunk：持留判定只匹配 ASCII 标签字节，
+        // 不得把 UTF-8 字符撕开（曾会 panic/乱码的边界）
+        let (r, t) = feed_all(
+            &mut InlineThinkState::new(),
+            &["<think>深度思考", "再想一步</think>", "答案"],
+        );
+        assert_eq!(r.concat(), "深度思考再想一步");
+        assert_eq!(t.concat(), "答案");
     }
 }

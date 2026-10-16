@@ -151,8 +151,8 @@ import type { RealtimeActiveModel, RealtimeCallRow, RealtimeUsageResp, RealtimeU
 
 const data = ref<RealtimeUsageResp | null>(null)
 const loading = ref(false)
-const autoRefresh = ref(true)
-const intervalSec = ref(5)
+const autoRefresh = ref(localStorage.getItem('rt_auto') !== '0')
+const intervalSec = ref(Number(localStorage.getItem('rt_interval')) || 5)
 const lastUpdated = ref<Date | null>(null)
 const users = computed(() => data.value?.users ?? [])
 const recent = computed(() => data.value?.recent ?? [])
@@ -304,6 +304,10 @@ async function load(): Promise<void> {
 watch([autoRefresh, intervalSec], () => {
   if (autoRefresh.value) void load()
   schedule()
+})
+watch([autoRefresh, intervalSec], () => {
+  localStorage.setItem('rt_auto', autoRefresh.value ? '1' : '0')
+  localStorage.setItem('rt_interval', String(intervalSec.value))
 })
 
 onMounted(() => {
