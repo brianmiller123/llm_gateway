@@ -198,6 +198,25 @@ fn merge_context_length(acc: Option<i64>, next: Option<i64>) -> Option<i64> {
     }
 }
 
+/// 同名模型多渠道能力合并：取最弱（未标注 < text < vision < multimodal）——
+/// 请求可能路由到任一候选渠道，最弱才是对客户端保证成立的能力；
+/// 任一候选未标注 → 整体未标注（不下发）。
+fn merge_capability<'a>(acc: Option<&'a str>, next: Option<&'a str>) -> Option<&'a str> {
+    fn rank(c: Option<&str>) -> u8 {
+        match c {
+            None => 0,
+            Some("text") => 1,
+            Some("vision") => 2,
+            Some(_) => 3,
+        }
+    }
+    if rank(acc) <= rank(next) {
+        acc
+    } else {
+        next
+    }
+}
+
 async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     let uid = crate::service::auth::authenticate(&st, &headers)
         .await
@@ -214,7 +233,7 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
     let mut seen: Vec<String> = Vec::new();
     let mut data: Vec<serde_json::Value> = Vec::new();
-    let mut push = |name: String, ctx: Option<i64>| {
+    let mut push = |name: String, ctx: Option<i64>, capability: Option<&str>| {
         if seen.contains(&name) {
             return;
         }
@@ -229,31 +248,42 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             obj["context_window"] = json!(n);
             obj["max_model_len"] = json!(n);
         }
+        if let Some(cap) = capability {
+            obj["capability"] = json!(cap);
+        }
         data.push(obj);
     };
 
     // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商下已启用的模型。
     //    聚合与授权过滤同集合：只对该用户可路由的供应商取最小值——更精确
     //    （不因无权渠道的更小设置而低估可用上下文），且仍不高估。
-    let catalog: Vec<(String, i64, Option<i64>)> = sqlx::query_as::<_, (String, i64, Option<i64>)>(
-        "SELECT m.model_id, m.provider_id, m.context_length FROM models m \
-         JOIN providers p ON p.id = m.provider_id AND p.enabled \
-         WHERE m.enabled",
-    )
-    .fetch_all(&st.pool)
-    .await
-    .unwrap_or_default();
+    let catalog: Vec<(String, i64, Option<i64>, Option<String>)> =
+        sqlx::query_as::<_, (String, i64, Option<i64>, Option<String>)>(
+            "SELECT m.model_id, m.provider_id, m.context_length, m.capability FROM models m \
+             JOIN providers p ON p.id = m.provider_id AND p.enabled \
+             WHERE m.enabled",
+        )
+        .fetch_all(&st.pool)
+        .await
+        .unwrap_or_default();
     let mut catalog_ctx: std::collections::HashMap<&str, Option<i64>> =
         std::collections::HashMap::new();
-    for (model, provider_id, ctx) in &catalog {
+    let mut catalog_cap: std::collections::HashMap<&str, Option<&str>> =
+        std::collections::HashMap::new();
+    for (model, provider_id, ctx, cap) in &catalog {
         if can_use(*provider_id, model) {
             let entry = catalog_ctx.entry(model.as_str()).or_insert(None);
             *entry = merge_context_length(*entry, *ctx);
+            // 种子取首个候选的原始值而非 None：None 在 merge_capability 里是
+            // “未标注=最弱”，作单位元会让首个已标注候选被吞掉（永不下发）
+            let cap_entry = catalog_cap.entry(model.as_str()).or_insert(cap.as_deref());
+            *cap_entry = merge_capability(*cap_entry, cap.as_deref());
         }
     }
-    for (model, provider_id, _) in &catalog {
+    for (model, provider_id, _, _) in &catalog {
         if can_use(*provider_id, model) {
-            push(model.clone(), catalog_ctx.get(model.as_str()).copied().flatten());
+            let cap = catalog_cap.get(model.as_str()).copied().flatten();
+            push(model.clone(), catalog_ctx.get(model.as_str()).copied().flatten(), cap);
         }
     }
 
@@ -277,9 +307,9 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             continue;
         }
         if providers.iter().any(|p| can_use(p.id, &r.model_pattern)) {
-            // 路由 pattern 与模型库同名时已在前一步 push（含上下文），此处仅补
-            // 模型库未收录的路由模型——无 DB 行，无上下文可下发
-            push(r.model_pattern.clone(), None);
+            // 路由 pattern 与模型库同名时已在前一步 push（含上下文/能力），此处仅补
+            // 模型库未收录的路由模型——无 DB 行，无上下文/能力可下发
+            push(r.model_pattern.clone(), None, None);
         }
     }
     (
@@ -291,7 +321,7 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::merge_context_length;
+    use super::{merge_capability, merge_context_length};
 
     #[test]
     fn merge_context_length_takes_min_of_set_values() {
@@ -304,5 +334,37 @@ mod tests {
             "取最小：请求可能落到任一候选渠道"
         );
         assert_eq!(merge_context_length(Some(128_000), Some(384_000)), Some(128_000));
+    }
+
+    #[test]
+    fn merge_capability_takes_weakest_of_candidates() {
+        assert_eq!(merge_capability(None, None), None, "双方未标注 → 不下发");
+        assert_eq!(merge_capability(None, Some("vision")), None, "任一未标注 → 整体未标注");
+        assert_eq!(merge_capability(Some("vision"), Some("vision")), Some("vision"));
+        assert_eq!(
+            merge_capability(Some("vision"), Some("multimodal")),
+            Some("vision"),
+            "取最弱：请求可能落到任一候选渠道"
+        );
+        assert_eq!(merge_capability(Some("multimodal"), Some("text")), Some("text"));
+        assert_eq!(merge_capability(Some("text"), Some("vision")), Some("text"));
+    }
+
+    /// 回归：handler 折叠以首个候选的原始值为种子（而非 None 单位元）——
+    /// 种子用 None 会让首个已标注候选被吞掉，capability 永不下发
+    #[test]
+    fn capability_fold_seeds_with_first_candidate() {
+        fn fold<'a>(caps: &[Option<&'a str>]) -> Option<&'a str> {
+            let mut acc = caps[0];
+            for c in &caps[1..] {
+                acc = merge_capability(acc, *c);
+            }
+            acc
+        }
+        assert_eq!(fold(&[Some("vision")]), Some("vision"), "单渠道已标注 → 下发");
+        assert_eq!(fold(&[None]), None);
+        assert_eq!(fold(&[Some("vision"), Some("multimodal")]), Some("vision"));
+        assert_eq!(fold(&[None, Some("vision")]), None, "任一未标注 → 不下发");
+        assert_eq!(fold(&[Some("vision"), None]), None);
     }
 }

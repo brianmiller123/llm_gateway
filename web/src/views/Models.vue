@@ -63,6 +63,56 @@ async function saveCtx() {
   }
 }
 
+/** 能力标注设置弹窗 */
+const capDialog = ref(false)
+const capSaving = ref(false)
+const capRow = ref<ModelRow | null>(null)
+const capValue = ref<ModelRow['capability']>(null)
+
+const CAP_OPTIONS: { value: 'text' | 'vision' | 'multimodal'; label: string; tag: 'info' | 'primary' | 'success' }[] = [
+  { value: 'text', label: '仅文本', tag: 'info' },
+  { value: 'vision', label: '视觉', tag: 'primary' },
+  { value: 'multimodal', label: '多模态', tag: 'success' },
+]
+
+function capLabel(c: ModelRow['capability']): string {
+  return CAP_OPTIONS.find((o) => o.value === c)?.label ?? '未标注'
+}
+
+function capTag(c: ModelRow['capability']): 'info' | 'primary' | 'success' {
+  return CAP_OPTIONS.find((o) => o.value === c)?.tag ?? 'info'
+}
+
+function openCap(row: ModelRow) {
+  capRow.value = row
+  capValue.value = row.capability
+  capDialog.value = true
+}
+
+/** 保存能力标注：清空选择 = 清除标注（clear_capability: true） */
+async function saveCap() {
+  if (!capRow.value) return
+  capSaving.value = true
+  try {
+    const body =
+      capValue.value == null
+        ? { clear_capability: true }
+        : { capability: capValue.value }
+    await request(`/api/admin/models/${capRow.value.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    ElMessage.success(`「${capRow.value.model_id}」能力标注已保存`)
+    capDialog.value = false
+    await loadModels()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  } finally {
+    capSaving.value = false
+  }
+}
+
 function fmt(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '-'
@@ -196,7 +246,7 @@ onMounted(loadModels)
 <template>
   <div class="page">
     <div class="toolbar">
-      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出；「上下文」设置的上下文长度随 /v1/models 下发给客户端</span>
+      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出；「上下文」设置的上下文长度与「能力」标注（仅文本/视觉/多模态）随 /v1/models 下发给客户端</span>
       <div class="toolbar-actions">
         <el-button type="primary" :loading="testing" @click="testAll">
           <el-icon style="margin-right: 4px"><Cpu /></el-icon>
@@ -225,6 +275,14 @@ onMounted(loadModels)
             <span :class="{ mono: row.context_length != null }">{{ fmtCtx(row.context_length) }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="能力" width="100" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.capability" :type="capTag(row.capability)" size="small">
+              {{ capLabel(row.capability) }}
+            </el-tag>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="90" align="center">
           <template #default="{ row }">
             <el-switch
@@ -238,7 +296,7 @@ onMounted(loadModels)
         <el-table-column label="创建时间" min-width="150">
           <template #default="{ row }">{{ fmt(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="215" fixed="right">
+        <el-table-column label="操作" width="285" fixed="right">
           <template #default="{ row }">
             <el-button
               size="small"
@@ -248,6 +306,7 @@ onMounted(loadModels)
               @click="testOne(row)"
             >测试</el-button>
             <el-button size="small" plain @click="openCtx(row)">上下文</el-button>
+            <el-button size="small" plain @click="openCap(row)">能力</el-button>
             <el-button size="small" type="danger" plain @click="deleteModel(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -279,6 +338,29 @@ onMounted(loadModels)
       <template #footer>
         <el-button @click="ctxDialog = false">取消</el-button>
         <el-button type="primary" :loading="ctxSaving" @click="saveCtx">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="capDialog" title="设置模型能力" width="480px">
+      <div v-if="capRow">
+        <div class="mono ctx-model">{{ capRow.model_id }}（{{ capRow.provider_name }}）</div>
+        <el-select v-model="capValue" clearable placeholder="未标注" style="width: 100%">
+          <el-option
+            v-for="o in CAP_OPTIONS"
+            :key="o.value"
+            :label="o.label"
+            :value="o.value"
+          />
+        </el-select>
+        <div class="ctx-hint">
+          标注该模型是否接受图像输入：仅文本 / 视觉 / 多模态。随 /v1/models 以
+          capability 字段下发给客户端（同名模型多渠道时取最弱标注，任一渠道未标注则不下发）；
+          清空表示未标注。
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="capDialog = false">取消</el-button>
+        <el-button type="primary" :loading="capSaving" @click="saveCap">保存</el-button>
       </template>
     </el-dialog>
 

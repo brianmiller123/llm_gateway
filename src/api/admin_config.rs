@@ -319,6 +319,14 @@ struct ModelPatch {
     /// true = 清空 context_length（同 model_routes scope_id 的显式布尔约定）
     #[serde(default)]
     clear_context_length: Option<bool>,
+    /// 能力标注：text = 仅文本 / vision = 视觉（图像输入）/ multimodal = 多模态
+    /// （缺省 = 不修改）。随 /v1/models 以 capability 下发，供客户端识别模型
+    /// 是否接受图像输入。JSON null 与缺省无法区分，清除用 clear_capability。
+    #[serde(default)]
+    capability: Option<String>,
+    /// true = 清除能力标注（未标注 = /v1/models 不下发）
+    #[serde(default)]
+    clear_capability: Option<bool>,
 }
 
 /// 模型启停 / 上下文长度维护。禁用后该 (供应商, 模型) 不再作为路由候选、
@@ -339,9 +347,26 @@ async fn update_model(
     } else {
         req.context_length.map(Some)
     };
-    if req.enabled.is_none() && ctx.is_none() {
+    if req.clear_capability.is_some() && req.capability.is_some() {
         return Err(AppError::BadRequest(
-            "enabled 与 context_length 至少提供一个".into(),
+            "clear_capability 与 capability 互斥".into(),
+        ));
+    }
+    if let Some(c) = req.capability.as_deref() {
+        if !matches!(c, "text" | "vision" | "multimodal") {
+            return Err(AppError::BadRequest(
+                "capability 仅支持 text / vision / multimodal".into(),
+            ));
+        }
+    }
+    let cap = if req.clear_capability == Some(true) {
+        Some(None)
+    } else {
+        req.capability.as_deref().map(Some)
+    };
+    if req.enabled.is_none() && ctx.is_none() && cap.is_none() {
+        return Err(AppError::BadRequest(
+            "enabled 与 context_length、capability 至少提供一个".into(),
         ));
     }
     // 防手滑：>1 亿 token 的“上下文”必是录入错误
@@ -389,6 +414,27 @@ async fn update_model(
                 "provider_id": model.provider_id,
                 "model_id": model.model_id,
                 "context_length": ctx,
+            })),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    }
+    if let Some(cap) = cap {
+        let model = config::set_model_capability(&st.pool, id, cap)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
+        // capability 不进内存缓存（/v1/models 直查 DB），无需 reload
+        audit::log(
+            &st.pool,
+            Some(admin.0.id),
+            "model.capability.update",
+            Some("model"),
+            Some(id),
+            Some(json!({
+                "provider_id": model.provider_id,
+                "model_id": model.model_id,
+                "capability": cap,
             })),
         )
         .await

@@ -454,10 +454,13 @@ pub struct AdminModel {
     pub enabled: bool,
     /// 上下文长度（token）：None = 未设置，/v1/models 不下发该字段
     pub context_length: Option<i64>,
+    /// 能力标注：text = 仅文本 / vision = 视觉（图像输入）/ multimodal = 多模态；
+    /// None = 未标注，/v1/models 不下发该字段
+    pub capability: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.context_length, m.created_at \
+const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.context_length, m.capability, m.created_at \
      FROM models m JOIN providers p ON p.id = m.provider_id";
 
 pub async fn list_models(pool: &PgPool) -> Result<Vec<AdminModel>, sqlx::Error> {
@@ -504,6 +507,24 @@ pub async fn set_model_context_length(
     let res = sqlx::query("UPDATE models SET context_length = $2 WHERE id = $1")
         .bind(id)
         .bind(context_length)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_model(pool, id).await
+}
+
+/// 设置模型能力标注（text/vision/multimodal）；None = 清除。返回更新后的行
+///（不存在 → None）。不进内存缓存：/v1/models 直查 DB，写后即时生效。
+pub async fn set_model_capability(
+    pool: &PgPool,
+    id: i64,
+    capability: Option<&str>,
+) -> Result<Option<AdminModel>, sqlx::Error> {
+    let res = sqlx::query("UPDATE models SET capability = $2 WHERE id = $1")
+        .bind(id)
+        .bind(capability)
         .execute(pool)
         .await?;
     if res.rows_affected() == 0 {
@@ -1111,6 +1132,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cleared.context_length, None, "None = 清除");
+    }
+
+    /// 模型能力标注：默认 NULL；set 落库、刷新保留、None 清除；不存在的 id → None
+    #[sqlx::test(migrations = "./migrations")]
+    async fn model_capability_set_clear_and_survives_refresh(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        let s = |v: &[&str]| v.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        replace_provider_models(&pool, p1.id, &s(&["a", "b"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        assert!(
+            rows.iter().all(|m| m.capability.is_none()),
+            "入库默认未标注"
+        );
+        let a = rows.iter().find(|m| m.model_id == "a").unwrap().clone();
+
+        let updated = set_model_capability(&pool, a.id, Some("vision"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.capability.as_deref(), Some("vision"));
+        assert!(
+            set_model_capability(&pool, i64::MAX, Some("text"))
+                .await
+                .unwrap()
+                .is_none(),
+            "不存在 → None"
+        );
+
+        // 刷新：a 仍在列表 → 标注保留；c 新增 → 默认 NULL
+        replace_provider_models(&pool, p1.id, &s(&["a", "b", "c"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        let a_after = rows.iter().find(|m| m.model_id == "a").unwrap();
+        assert_eq!(
+            a_after.capability.as_deref(),
+            Some("vision"),
+            "刷新保留已标注的能力"
+        );
+        let c = rows.iter().find(|m| m.model_id == "c").unwrap();
+        assert!(c.capability.is_none());
+
+        // 清除
+        let cleared = set_model_capability(&pool, a.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.capability, None, "None = 清除");
     }
 
     /// 供应商删除：模型级联清空；模型同步自动建的直指路由一并删除；
