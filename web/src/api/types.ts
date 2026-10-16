@@ -399,6 +399,18 @@ export interface ExtraBodySettingsResp {
   enabled: boolean
 }
 
+/** 拒绝文案模板（空串 = 未自定义，服务端渲染时回落默认文案） */
+export interface MessageSettingsResp {
+  /** 并发上限 429 文案模板；{retry} = Retry-After 秒数 */
+  concurrency: string
+  /** 模型无权限 403 文案模板；{model} = 客户端请求的模型名 */
+  model_denied: string
+  /** 内置默认并发文案（「恢复默认」回填用） */
+  default_concurrency: string
+  /** 内置默认无权限文案 */
+  default_model_denied: string
+}
+
 export interface LdapSettingsInput {
   url: string
   starttls: boolean

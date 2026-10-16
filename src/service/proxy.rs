@@ -894,9 +894,9 @@ async fn proxy_authed(
         _ => candidates,
     };
     if candidates.is_empty() {
-        return Err(AppError::Forbidden(format!(
-            "model '{model}' is not permitted for this user"
-        )));
+        return Err(AppError::Forbidden(
+            st.message_templates.read().model_denied(&model),
+        ));
     }
     // H5：方言配对校验 —— 过滤掉客户端×上游不可行的候选；全部不可行 → 显式 400
     let (supported, unsupported): (Vec<_>, Vec<_>) = candidates

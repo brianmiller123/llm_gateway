@@ -684,6 +684,42 @@ pub async fn save_extra_body_enabled(pool: &PgPool, enabled: bool) -> Result<(),
     Ok(())
 }
 
+// ---------- 系统设置（拒绝文案） ----------
+
+/// 内置默认文案：并发上限 429（{retry} = Retry-After 秒数）
+pub const DEFAULT_MSG_CONCURRENCY: &str = "并发请求过高，请稍后重试（{retry} 秒后自动恢复）";
+/// 内置默认文案：模型无权限 403（{model} = 客户端请求的模型名）
+pub const DEFAULT_MSG_MODEL_DENIED: &str =
+    "您的当前订阅套餐尚未包含对模型 {model} 的访问权限，请联系管理员开通";
+
+/// 拒绝文案模板（DB 为空 = 未自定义，回落默认；DB 行不存在同样回落默认）
+pub async fn load_message_templates(
+    pool: &PgPool,
+) -> Result<(String, String), sqlx::Error> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT msg_concurrency, msg_model_denied FROM system_settings WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or_default())
+}
+
+pub async fn save_message_templates(
+    pool: &PgPool,
+    concurrency: &str,
+    model_denied: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE system_settings \
+         SET msg_concurrency = $1, msg_model_denied = $2, updated_at = now() WHERE id = 1",
+    )
+    .bind(concurrency)
+    .bind(model_denied)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---------- 系统设置（自定义 Header） ----------
 
 /// 全局自定义 Header（保存时已验证：合法 HeaderName/HeaderValue、

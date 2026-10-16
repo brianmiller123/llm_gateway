@@ -143,16 +143,46 @@
           </el-form>
         </el-card>
        </el-tab-pane>
+      <el-tab-pane label="拒绝文案" name="messages">
+        <el-card shadow="never" class="panel" v-loading="msgLoading">
+          <el-alert type="info" :closable="false" class="msg-alert">
+            并发超限（429）与模型无权限（403）时返回给客户端的错误文案；留空使用内置默认。
+            占位符：{retry} = Retry-After 秒数、{model} = 客户端请求的模型名。保存后立即生效。
+          </el-alert>
+          <el-form label-position="top" @submit.prevent>
+            <el-form-item label="并发上限 429 文案">
+              <el-input
+                v-model="msgForm.concurrency"
+                :placeholder="msgDefault.concurrency"
+                maxlength="255"
+                show-word-limit
+              />
+            </el-form-item>
+            <el-form-item label="模型无权限 403 文案">
+              <el-input
+                v-model="msgForm.model_denied"
+                :placeholder="msgDefault.model_denied"
+                maxlength="255"
+                show-word-limit
+              />
+            </el-form-item>
+            <div class="actions">
+              <el-button type="primary" :icon="Check" :loading="msgSaving" @click="saveMsgSettings">保存</el-button>
+              <el-button :loading="msgSaving" @click="resetMsgDefaults">恢复默认</el-button>
+            </div>
+          </el-form>
+        </el-card>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Connection, Delete, Plus } from '@element-plus/icons-vue'
 import { request } from '@/api/client'
-import type { HeaderSettingsResp, LdapSettingsResp, SmtpSettingsResp } from '@/api/types'
+import type { HeaderSettingsResp, LdapSettingsResp, MessageSettingsResp, SmtpSettingsResp } from '@/api/types'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -379,6 +409,81 @@ async function doSmtpTest() {
 
 onMounted(loadHeaders)
 onMounted(loadSmtp)
+
+// ============ 拒绝文案（并发 429 / 模型无权限 403） ============
+const msgLoading = ref(false)
+const msgSaving = ref(false)
+const msgForm = reactive({ concurrency: '', model_denied: '' })
+const msgDefault = reactive({ concurrency: '', model_denied: '' })
+
+async function loadMsgSettings() {
+  msgLoading.value = true
+  try {
+    const resp = await request<MessageSettingsResp>('/api/admin/settings/messages')
+    msgForm.concurrency = resp.concurrency
+    msgForm.model_denied = resp.model_denied
+    msgDefault.concurrency = resp.default_concurrency
+    msgDefault.model_denied = resp.default_model_denied
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '加载拒绝文案失败')
+  } finally {
+    msgLoading.value = false
+  }
+}
+
+async function saveMsgSettings() {
+  if (msgForm.concurrency.length > 255 || msgForm.model_denied.length > 255) {
+    ElMessage.warning('文案最长 255 字符')
+    return
+  }
+  msgSaving.value = true
+  try {
+    await request('/api/admin/settings/messages', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        concurrency: msgForm.concurrency.trim(),
+        model_denied: msgForm.model_denied.trim(),
+      }),
+    })
+    ElMessage.success('拒绝文案已保存并生效')
+    await loadMsgSettings()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  } finally {
+    msgSaving.value = false
+  }
+}
+
+/** 恢复内置默认：保存空串（服务端空 = 未自定义，渲染时回落内置默认）；
+ *  回填默认文字再保存会把默认固化成自定义模板，内置默认调整后不再跟随 */
+async function resetMsgDefaults() {
+  try {
+    await ElMessageBox.confirm('将清空自定义文案并恢复内置默认（未自定义状态），是否继续？', '恢复默认', {
+      type: 'warning',
+      confirmButtonText: '恢复',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return // 用户取消
+  }
+  msgSaving.value = true
+  try {
+    await request('/api/admin/settings/messages', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ concurrency: '', model_denied: '' }),
+    })
+    ElMessage.success('已恢复内置默认文案')
+    await loadMsgSettings()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '恢复失败')
+  } finally {
+    msgSaving.value = false
+  }
+}
+
+onMounted(loadMsgSettings)
 </script>
 
 <style scoped>
@@ -423,6 +528,11 @@ onMounted(loadSmtp)
 .actions {
   display: flex;
   gap: 12px;
+}
+
+.msg-alert {
+  margin-bottom: 16px;
+  line-height: 1.7;
 }
 
 .header-row {

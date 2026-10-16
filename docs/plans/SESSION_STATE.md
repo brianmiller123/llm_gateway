@@ -222,3 +222,15 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 - 评审修复（2026-10-14）：① el-input-number 加 `:precision="0"`（此前 384000.5 可提交 → 服务端 serde i64 拒绝 422 纯文本体，UI 仅显示 "HTTP 422"）；② /v1/models 上下文聚合改为仅对请求者 `can_use` 命中的供应商取 min（双供应商 384K/128K 场景实测：默认放行用户见 128K，限定单渠道用户见 384K）
 - 验证：cargo test 290/290（新增 DB 测试 model_context_length_set_clear_and_survives_refresh + v1 merge_context_length 单测）；E2E（本地 debug 二进制 8443 + PG）：PATCH 384000 → /v1/models 三字段同值 → clear_context_length → 字段消失；0/空/超上限/互斥/不存在 id 均 400；enabled-only PATCH 回归；浏览器：列与弹窗渲染、384000 保存 → 行显示 384K、清空保存 → 恢复 —；测试后 context_length 全部清回 NULL
 - 运行环境现状：评审修复后已重新 `deploy-local-binary.sh`（compose gateway 容器 = 最新 release 二进制 + 最新 web/dist，8443/8080）；postgres 迁移已到 0028；本地 debug 冒烟实例已停
+
+## P21 可配置拒绝文案（并发 429 / 模型无权限 403，已交付）
+
+- 需求：拒绝响应按原因区分并支持自定义文案——并发超限 429 携带「并发高」类提示；模型无权限 403 支持订阅式话术（如「您的当前订阅套餐尚未包含对模型 X 的访问权限」）
+- 存储（迁移 0029）：`system_settings.msg_concurrency VARCHAR(255)`、`msg_model_denied TEXT`（'' = 未自定义，渲染时回落内置默认）；默认文案常量 DEFAULT_MSG_CONCURRENCY / DEFAULT_MSG_MODEL_DENIED（store/config.rs）
+- 模板渲染：`state::MessageTemplates { concurrency, model_denied }` 缓存于 AppState（reload 独立分节，保存即生效）；`concurrency(retry_secs)` 替换 `{retry}`、`model_denied(model)` 替换 `{model}`（空串/纯空白回落默认；单测覆盖默认/自定义/空白三态）
+- `AppError::ConcurrentLimited(f64)` → `ConcurrentLimited(String, f64)`（沿用 PlanQuotaExceeded 先例：文案在构造处渲染，渲染层只透传）——OpenAI（error.rs）与 Anthropic（anthropic/mod.rs）两个错误整形层同步改；admin_config app_error_status 改 `ConcurrentLimited(..)`
+- 构造点：ratelimit.rs 并发拒绝（{retry} 与 Retry-After 头同源——同为 ceil 后的值，文案与头部承诺一致）；proxy.rs 模型授权过滤后空候选（403，{model} = 客户端请求的原始模型名）
+- API：GET/PUT `/api/admin/settings/messages`（模板 ≤255 字符校验、audit settings.messages.update；GET 附 default_* 供前端「恢复默认」回填）
+- 前端：Settings.vue 新增「拒绝文案」tab（占位符说明 alert、两个输入框 maxlength 255、保存/恢复默认）；types.ts MessageSettingsResp
+- 验证：cargo test 292/292（新增 MessageTemplates 三态渲染 + ConcurrentLimited 响应体/Retry-After 钳制两个单测）；E2E（本地 debug 8445）：PUT 自定义文案 → 403（OpenAI + Anthropic 双方言均返回「您的当前订阅套餐尚未包含对模型 mock-1 的访问权限，请升级或联系管理员」）→ 429（慢上游 2s + 并发=1 规则，第二请求返回「并发太高啦，请 6 秒后再试」+ Retry-After: 6）→ 清空模板回落默认文案（「并发请求过高，请稍后重试（7 秒后自动恢复）」+ Retry-After: 7）；场景已清理（provider/rule/key/access/密码归位、模板清空）
+- 注：模型无权限在语义上是 403 而非 429；限流令牌桶已随 0027 移除，RateLimited 变体保留但无构造点

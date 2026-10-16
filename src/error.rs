@@ -16,9 +16,10 @@ pub enum AppError {
     Forbidden(String),
     #[error("rate limited, retry after {0}s")]
     RateLimited(f64),
-    /// 并发上限（在途请求数）满：与 RateLimited 同为 429，但消息可区分
-    #[error("concurrency limit exceeded, retry after {0}s")]
-    ConcurrentLimited(f64),
+    /// 并发上限（在途请求数）满：与 RateLimited 同为 429，但消息可区分。
+    /// 文案在构造处按管理员模板渲染（{retry} 已替换）；f64 仅供 Retry-After。
+    #[error("concurrency limit exceeded: {0}")]
+    ConcurrentLimited(String, f64),
     /// Coding Plan 周期配额耗尽且策略为拦截（429 insufficient_quota）
     #[error("{0}")]
     PlanQuotaExceeded(String, Option<u64>),
@@ -91,13 +92,13 @@ impl IntoResponse for AppError {
                         Some(retry),
                     )
                 }
-                AppError::ConcurrentLimited(secs) => {
+                AppError::ConcurrentLimited(msg, secs) => {
                     // 同 RateLimited：钳制 [1, 86400]，防溢出/巨值直达客户端
                     let retry = secs.ceil().max(1.0).min(86400.0) as u64;
                     (
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate_limit_exceeded",
-                        format!("Concurrency limit exceeded, retry after {retry}s"),
+                        msg.clone(),
                         Some(retry),
                     )
                 }
@@ -173,6 +174,30 @@ mod tests {
         let resp = AppError::PlanQuotaExceeded("x".into(), None).into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get("Retry-After").is_none());
+    }
+
+    /// 并发 429 携带构造处渲染的文案（{retry} 已替换），Retry-After 与
+    /// RateLimited 同钳制规则
+    #[tokio::test]
+    async fn concurrency_response_uses_carried_message_and_caps_retry() {
+        let resp = AppError::ConcurrentLimited("并发请求过高，请稍后重试（6 秒后自动恢复）".into(), 6.0)
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "6");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "并发请求过高，请稍后重试（6 秒后自动恢复）"
+        );
+        assert_eq!(v["error"]["code"], "rate_limit_exceeded");
+
+        // 巨值退避钳制与 RateLimited 同规则
+        let resp =
+            AppError::ConcurrentLimited("x".into(), 1e9).into_response();
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "86400");
     }
 
     /// 限流 Retry-After 上限钳制（rpm<=0 产生的巨值不得直达客户端）

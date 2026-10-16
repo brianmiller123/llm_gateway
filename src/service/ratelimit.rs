@@ -284,7 +284,11 @@ pub fn apply_concurrency_limits(
             // 名额何时释放未知（在途请求时长不可知），给 ~6s 重试提示；
             // 客户端按 429 常规退避即可，抖动防止重试群整秒对齐挤兑
             //（5.5-6.5s 区间，向上取整后 Retry-After 恒为 6）
-            let retry = 5.5 + rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..1.0);
+            let retry: f64 = 5.5 + rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..1.0);
+            // 管理员可配置文案（默认中文），{retry} 替换为 Retry-After 秒数；
+            // 与响应头同源（同为 ceil 后的值），文案与头部承诺一致
+            let retry_secs = retry.ceil().max(1.0).min(86400.0) as u64;
+            let message = st.message_templates.read().concurrency(retry_secs);
             tracing::warn!(
                 identity = identity.as_deref().unwrap_or(""),
                 model = %model,
@@ -293,7 +297,7 @@ pub fn apply_concurrency_limits(
                 retry_secs = format!("{retry:.1}"),
                 "request concurrency limited"
             );
-            Err(AppError::ConcurrentLimited(retry))
+            Err(AppError::ConcurrentLimited(message, retry))
         }
     }
 }

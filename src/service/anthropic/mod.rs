@@ -99,13 +99,10 @@ pub fn error_response(err: &AppError) -> Response {
                 secs.ceil().max(1.0) as u64
             ),
         ),
-        AppError::ConcurrentLimited(secs) => (
+        AppError::ConcurrentLimited(msg, _) => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
-            format!(
-                "Concurrency limit exceeded, retry after {}s",
-                secs.ceil().max(1.0) as u64
-            ),
+            msg.clone(),
         ),
         // Plan 配额拦截保留明细（plan 名/周期/用量）——客户端排障需要区分
         // 「限流（短退避可重试）」与「配额耗尽（须等到周期边界）」
@@ -130,7 +127,7 @@ pub fn error_response(err: &AppError) -> Response {
     };
 
     let retry_after: Option<u64> = match err {
-        AppError::RateLimited(secs) | AppError::ConcurrentLimited(secs) => {
+        AppError::RateLimited(secs) | AppError::ConcurrentLimited(_, secs) => {
             Some(secs.ceil().max(1.0).min(86400.0) as u64)
         }
         AppError::PlanQuotaExceeded(_, retry) => *retry,

@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::error::AppError;
 use crate::service::ldap::LdapSettings;
-use crate::state::AppState;
+use crate::state::{AppState, MessageTemplates};
 use crate::store::{audit, config, users};
 
 pub fn routes(state: AppState) -> Router<AppState> {
@@ -87,6 +87,12 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/api/admin/settings/extra-body",
             get(get_extra_body_settings)
                 .put(put_extra_body_settings)
+                .layer(admin.clone()),
+        )
+        .route(
+            "/api/admin/settings/messages",
+            get(get_message_settings)
+                .put(put_message_settings)
                 .layer(admin.clone()),
         )
         .route(
@@ -1729,6 +1735,77 @@ async fn put_extra_body_settings(
     Ok(Json(json!({ "enabled": req.enabled })).into_response())
 }
 
+// ---------- 系统设置（拒绝文案） ----------
+
+/// 拒绝文案模板：并发 429 / 模型无权限 403。空串 = 未自定义（渲染时回落
+/// 内置默认中文文案）；占位符 {retry} / {model} 在错误构造处替换。
+async fn get_message_settings(
+    State(st): State<AppState>,
+    _a: Admin,
+) -> Result<Response, AppError> {
+    let tpl = st.message_templates.read();
+    Ok(Json(json!({
+        "concurrency": tpl.concurrency,
+        "model_denied": tpl.model_denied,
+        "default_concurrency": config::DEFAULT_MSG_CONCURRENCY,
+        "default_model_denied": config::DEFAULT_MSG_MODEL_DENIED,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct MessageSettingsReq {
+    /// 并发 429 文案模板；{retry} 占位；空 = 恢复默认
+    #[serde(default)]
+    concurrency: String,
+    /// 模型无权限 403 文案模板；{model} 占位；空 = 恢复默认
+    #[serde(default)]
+    model_denied: String,
+}
+
+/// 模板长度上限：拒绝消息走客户端可见的错误体，过长徒增排障噪音
+///（与 anthropic/mod.rs 错误 message 1800 字符截断同动机，取更紧的值）
+const MESSAGE_TEMPLATE_MAX_CHARS: usize = 255;
+
+async fn put_message_settings(
+    State(st): State<AppState>,
+    admin: Admin,
+    Json(req): Json<MessageSettingsReq>,
+) -> Result<Response, AppError> {
+    for (label, tpl) in [("concurrency", &req.concurrency), ("model_denied", &req.model_denied)] {
+        if tpl.chars().count() > MESSAGE_TEMPLATE_MAX_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "{label} 文案过长（最多 {MESSAGE_TEMPLATE_MAX_CHARS} 字符）"
+            )));
+        }
+    }
+    config::save_message_templates(&st.pool, &req.concurrency, &req.model_denied)
+        .await
+        .map_err(AppError::internal)?;
+    *st.message_templates.write() = MessageTemplates {
+        concurrency: req.concurrency.clone(),
+        model_denied: req.model_denied.clone(),
+    };
+    audit::log(
+        &st.pool,
+        Some(admin.0.id),
+        "settings.messages.update",
+        Some("settings"),
+        None,
+        Some(json!({
+            "concurrency": req.concurrency,
+            "model_denied": req.model_denied,
+        })),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "concurrency": req.concurrency,
+        "model_denied": req.model_denied,
+    }))
+    .into_response())
+}
+
 // ---------- 系统设置（自定义 Header） ----------
 
 /// 上游请求头黑名单：网关代管的头（认证/方言协商/消息框架），全局设置
@@ -2006,7 +2083,7 @@ fn app_error_status(e: &AppError) -> u16 {
         AppError::Auth(_) | AppError::Unauthorized(_) => 401,
         AppError::Forbidden(_) => 403,
         AppError::RateLimited(_)
-        | AppError::ConcurrentLimited(_)
+        | AppError::ConcurrentLimited(..)
         | AppError::PlanQuotaExceeded(..) => 429,
         AppError::BadRequest(_) => 400,
         AppError::Conflict(_) => 409,

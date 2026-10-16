@@ -13,6 +13,44 @@ use crate::store::access::{UserAccessRule, load_user_access};
 use crate::store::rules::{ModelPrice, RateRule, load_prices, load_rules};
 use crate::store::upstream::{ModelRoute, Provider, load_providers, load_routes};
 
+/// 拒绝文案模板：并发 429 / 模型无权限 403（管理员可配置，系统设置页）。
+/// DB 空串 = 未自定义，渲染时回落 store::config::DEFAULT_MSG_* 内置默认；
+/// 占位符 {retry}（Retry-After 秒数）与 {model}（客户端请求的模型名）
+/// 在错误构造处替换，渲染逻辑集中于此供两条管线复用。
+#[derive(Debug, Clone, Default)]
+pub struct MessageTemplates {
+    pub concurrency: String,
+    pub model_denied: String,
+}
+
+impl MessageTemplates {
+    fn concurrency_tpl(&self) -> &str {
+        if self.concurrency.trim().is_empty() {
+            crate::store::config::DEFAULT_MSG_CONCURRENCY
+        } else {
+            &self.concurrency
+        }
+    }
+
+    fn model_denied_tpl(&self) -> &str {
+        if self.model_denied.trim().is_empty() {
+            crate::store::config::DEFAULT_MSG_MODEL_DENIED
+        } else {
+            &self.model_denied
+        }
+    }
+
+    /// 并发上限 429 文案
+    pub fn concurrency(&self, retry_secs: u64) -> String {
+        self.concurrency_tpl().replace("{retry}", &retry_secs.to_string())
+    }
+
+    /// 模型无权限 403 文案
+    pub fn model_denied(&self, model: &str) -> String {
+        self.model_denied_tpl().replace("{model}", model)
+    }
+}
+
 /// 全局应用状态（全部 Clone 廉价）
 #[derive(Clone)]
 pub struct AppState {
@@ -45,6 +83,9 @@ pub struct AppState {
     pub ldap: Arc<RwLock<crate::service::ldap::LdapSettings>>,
     /// extra_body 合并全局开关（false = 保留配置但不合并进上游请求体）
     pub extra_body_enabled: Arc<RwLock<bool>>,
+    /// 拒绝文案模板：并发 429 / 模型无权限 403（DB 空串 = 未自定义，渲染时
+    /// 回落 DEFAULT_MSG_*；占位符 {retry} / {model} 在构造错误时替换）
+    pub message_templates: Arc<RwLock<MessageTemplates>>,
     /// API 端点运行时开关（Response API × Anthropic Messages API 独立启停/可见性）
     pub api_endpoints: Arc<RwLock<crate::store::config::ApiEndpointSettings>>,
     /// 全局自定义 Header（upstream → 上游请求；response → 客户端响应）
@@ -118,6 +159,7 @@ impl AppState {
             concurrency: Arc::new(crate::service::ratelimit::ConcurrencyLimiter::new()),
             ldap: Arc::new(RwLock::new(ldap)),
             extra_body_enabled: Arc::new(RwLock::new(true)),
+            message_templates: Arc::new(RwLock::new(MessageTemplates::default())),
             active_requests: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             active_by_user: Arc::new(Mutex::new(HashMap::new())),
             api_endpoints: Arc::new(RwLock::new(crate::store::config::ApiEndpointSettings {
@@ -234,6 +276,15 @@ impl AppState {
             *self.extra_body_enabled.write() = v;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
+        section!("message_templates", async {
+            let (concurrency, model_denied) =
+                crate::store::config::load_message_templates(&self.pool).await?;
+            *self.message_templates.write() = MessageTemplates {
+                concurrency,
+                model_denied,
+            };
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
         section!("api_endpoints", async {
             let v = crate::store::config::load_api_endpoint_settings(&self.pool).await?;
             *self.api_endpoints.write() = v;
@@ -281,5 +332,56 @@ fn non_empty(s: String) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageTemplates;
+
+    /// 空模板回落内置默认文案并替换占位符；自定义模板原样替换
+    #[test]
+    fn message_templates_fall_back_to_defaults_and_substitute() {
+        // 默认文案（DB 空串 = 未自定义）
+        let tpl = MessageTemplates::default();
+        assert_eq!(
+            tpl.concurrency(6),
+            crate::store::config::DEFAULT_MSG_CONCURRENCY.replace("{retry}", "6")
+        );
+        assert!(
+            tpl.concurrency(6).contains("6"),
+            "默认并发文案必须携带重试秒数"
+        );
+        assert_eq!(
+            tpl.model_denied("glm-5.3-flashx"),
+            crate::store::config::DEFAULT_MSG_MODEL_DENIED
+                .replace("{model}", "glm-5.3-flashx")
+        );
+        assert!(
+            tpl.model_denied("glm-5.3-flashx").contains("glm-5.3-flashx"),
+            "默认无权限文案必须携带模型名"
+        );
+
+        // 自定义模板：占位符替换，未出现的占位符保留原样
+        let custom = MessageTemplates {
+            concurrency: "并发已满（{retry}s）".into(),
+            model_denied: "升级套餐解锁 {model}".into(),
+        };
+        assert_eq!(custom.concurrency(6), "并发已满（6s）");
+        assert_eq!(custom.model_denied("glm-5.3-flashx"), "升级套餐解锁 glm-5.3-flashx");
+
+        // 空白模板视同未自定义（trim 判定）
+        let blank = MessageTemplates {
+            concurrency: "   ".into(),
+            model_denied: "".into(),
+        };
+        assert_eq!(
+            blank.concurrency(6),
+            crate::store::config::DEFAULT_MSG_CONCURRENCY.replace("{retry}", "6")
+        );
+        assert_eq!(
+            blank.model_denied("m"),
+            crate::store::config::DEFAULT_MSG_MODEL_DENIED.replace("{model}", "m")
+        );
     }
 }
