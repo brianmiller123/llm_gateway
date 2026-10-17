@@ -327,6 +327,14 @@ struct ModelPatch {
     /// true = 清除能力标注（未标注 = /v1/models 不下发）
     #[serde(default)]
     clear_capability: Option<bool>,
+    /// 最大输出长度（token，缺省 = 不修改）。随 /v1/models 以
+    /// max_output_tokens / max_completion_tokens 双别名下发，供客户端设置
+    /// 输出上限；网关不据此截断请求。清除用 clear_max_output_tokens。
+    #[serde(default)]
+    max_output_tokens: Option<i64>,
+    /// true = 清空最大输出长度
+    #[serde(default)]
+    clear_max_output_tokens: Option<bool>,
 }
 
 /// 模型启停 / 上下文长度维护。禁用后该 (供应商, 模型) 不再作为路由候选、
@@ -364,10 +372,28 @@ async fn update_model(
     } else {
         req.capability.as_deref().map(Some)
     };
-    if req.enabled.is_none() && ctx.is_none() && cap.is_none() {
+    if req.clear_max_output_tokens.is_some() && req.max_output_tokens.is_some() {
         return Err(AppError::BadRequest(
-            "enabled 与 context_length、capability 至少提供一个".into(),
+            "clear_max_output_tokens 与 max_output_tokens 互斥".into(),
         ));
+    }
+    let max_out = if req.clear_max_output_tokens == Some(true) {
+        Some(None)
+    } else {
+        req.max_output_tokens.map(Some)
+    };
+    if req.enabled.is_none() && ctx.is_none() && cap.is_none() && max_out.is_none() {
+        return Err(AppError::BadRequest(
+            "enabled 与 context_length、capability、max_output_tokens 至少提供一个".into(),
+        ));
+    }
+    // 防手滑：>1000 万 token 的“输出”必是录入错误
+    if let Some(Some(n)) = max_out {
+        if !(1..=10_000_000).contains(&n) {
+            return Err(AppError::BadRequest(
+                "max_output_tokens 必须在 1..=10000000（token）之间".into(),
+            ));
+        }
     }
     // 防手滑：>1 亿 token 的“上下文”必是录入错误
     if let Some(Some(n)) = ctx {
@@ -435,6 +461,27 @@ async fn update_model(
                 "provider_id": model.provider_id,
                 "model_id": model.model_id,
                 "capability": cap,
+            })),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    }
+    if let Some(max_out) = max_out {
+        let model = config::set_model_max_output_tokens(&st.pool, id, max_out)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::BadRequest("model not found".into()))?;
+        // max_output_tokens 不进内存缓存（/v1/models 直查 DB），无需 reload
+        audit::log(
+            &st.pool,
+            Some(admin.0.id),
+            "model.max_output_tokens.update",
+            Some("model"),
+            Some(id),
+            Some(json!({
+                "provider_id": model.provider_id,
+                "model_id": model.model_id,
+                "max_output_tokens": max_out,
             })),
         )
         .await

@@ -457,10 +457,12 @@ pub struct AdminModel {
     /// 能力标注：text = 仅文本 / vision = 视觉（图像输入）/ multimodal = 多模态；
     /// None = 未标注，/v1/models 不下发该字段
     pub capability: Option<String>,
+    /// 最大输出长度（token）：None = 未设置，/v1/models 不下发该字段
+    pub max_output_tokens: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
-const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.context_length, m.capability, m.created_at \
+const ADMIN_MODEL_SELECT: &str = "SELECT m.id, m.provider_id, p.name AS provider_name, m.model_id, m.enabled, m.context_length, m.capability, m.max_output_tokens, m.created_at \
      FROM models m JOIN providers p ON p.id = m.provider_id";
 
 pub async fn list_models(pool: &PgPool) -> Result<Vec<AdminModel>, sqlx::Error> {
@@ -525,6 +527,24 @@ pub async fn set_model_capability(
     let res = sqlx::query("UPDATE models SET capability = $2 WHERE id = $1")
         .bind(id)
         .bind(capability)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_model(pool, id).await
+}
+
+/// 设置模型最大输出长度（token）；None = 清除。返回更新后的行（不存在 → None）。
+/// 不进内存缓存：/v1/models 直查 DB，写后即时生效，无需 reload。
+pub async fn set_model_max_output_tokens(
+    pool: &PgPool,
+    id: i64,
+    max_output_tokens: Option<i64>,
+) -> Result<Option<AdminModel>, sqlx::Error> {
+    let res = sqlx::query("UPDATE models SET max_output_tokens = $2 WHERE id = $1")
+        .bind(id)
+        .bind(max_output_tokens)
         .execute(pool)
         .await?;
     if res.rows_affected() == 0 {
@@ -1182,6 +1202,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cleared.capability, None, "None = 清除");
+    }
+
+    /// 模型最大输出长度：默认 NULL；set 落库、刷新保留、None 清除；不存在 → None
+    #[sqlx::test(migrations = "./migrations")]
+    async fn model_max_output_tokens_set_clear_and_survives_refresh(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        let s = |v: &[&str]| v.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        replace_provider_models(&pool, p1.id, &s(&["a", "b"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        assert!(
+            rows.iter().all(|m| m.max_output_tokens.is_none()),
+            "入库默认未设置"
+        );
+        let a = rows.iter().find(|m| m.model_id == "a").unwrap().clone();
+
+        let updated = set_model_max_output_tokens(&pool, a.id, Some(163_840))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.max_output_tokens, Some(163_840));
+        assert!(
+            set_model_max_output_tokens(&pool, i64::MAX, Some(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "不存在 → None"
+        );
+
+        // 刷新：a 仍在列表 → 保留；c 新增 → 默认 NULL
+        replace_provider_models(&pool, p1.id, &s(&["a", "b", "c"]))
+            .await
+            .unwrap();
+        let rows = list_models(&pool).await.unwrap();
+        let a_after = rows.iter().find(|m| m.model_id == "a").unwrap();
+        assert_eq!(
+            a_after.max_output_tokens,
+            Some(163_840),
+            "刷新保留已设置的最大输出长度"
+        );
+        let c = rows.iter().find(|m| m.model_id == "c").unwrap();
+        assert!(c.max_output_tokens.is_none());
+
+        // 清除
+        let cleared = set_model_max_output_tokens(&pool, a.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.max_output_tokens, None, "None = 清除");
     }
 
     /// 供应商删除：模型级联清空；模型同步自动建的直指路由一并删除；

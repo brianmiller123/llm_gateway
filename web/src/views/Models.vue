@@ -18,11 +18,12 @@ const togglingId = ref<number | null>(null)
 const resultDialog = ref(false)
 const results = ref<ModelTestResult[]>([])
 
-/** 上下文长度设置弹窗 */
+/** 上下文 / 输出长度设置弹窗 */
 const ctxDialog = ref(false)
 const ctxSaving = ref(false)
 const ctxRow = ref<ModelRow | null>(null)
 const ctxValue = ref<number | null>(null)
+const maxOutValue = ref<number | null>(null)
 
 /** token 数人性化：384000 → 384K、1000000 → 1M */
 function fmtCtx(n: number | null): string {
@@ -36,24 +37,33 @@ function fmtCtx(n: number | null): string {
 function openCtx(row: ModelRow) {
   ctxRow.value = row
   ctxValue.value = row.context_length
+  maxOutValue.value = row.max_output_tokens
   ctxDialog.value = true
 }
 
-/** 保存上下文长度：清空输入 = 清除设置（clear_context_length: true） */
+/** 保存上下文/输出长度：清空输入 = 清除设置（clear_*: true），仅提交有变化的字段 */
 async function saveCtx() {
   if (!ctxRow.value) return
   ctxSaving.value = true
   try {
-    const body =
-      ctxValue.value == null
-        ? { clear_context_length: true }
-        : { context_length: ctxValue.value }
+    const body: Record<string, unknown> = {}
+    if (ctxValue.value !== ctxRow.value.context_length) {
+      Object.assign(body, ctxValue.value == null ? { clear_context_length: true } : { context_length: ctxValue.value })
+    }
+    if (maxOutValue.value !== ctxRow.value.max_output_tokens) {
+      Object.assign(body, maxOutValue.value == null ? { clear_max_output_tokens: true } : { max_output_tokens: maxOutValue.value })
+    }
+    if (Object.keys(body).length === 0) {
+      ElMessage.info('未做任何修改')
+      ctxDialog.value = false
+      return
+    }
     await request(`/api/admin/models/${ctxRow.value.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    ElMessage.success(`「${ctxRow.value.model_id}」上下文长度已保存`)
+    ElMessage.success(`「${ctxRow.value.model_id}」上下文/输出长度已保存`)
     ctxDialog.value = false
     await loadModels()
   } catch (e) {
@@ -246,7 +256,7 @@ onMounted(loadModels)
 <template>
   <div class="page">
     <div class="toolbar">
-      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出；「上下文」设置的上下文长度与「能力」标注（仅文本/视觉/多模态）随 /v1/models 下发给客户端</span>
+      <span class="title">模型库：来自供应商「测试连接」或手动刷新；路由规则与价格页可下拉选择。禁用的模型不参与路由、不在 /v1/models 列出；「长度」设置的上下文/输出长度与「能力」标注（仅文本/视觉/多模态）随 /v1/models 下发给客户端</span>
       <div class="toolbar-actions">
         <el-button type="primary" :loading="testing" @click="testAll">
           <el-icon style="margin-right: 4px"><Cpu /></el-icon>
@@ -273,6 +283,11 @@ onMounted(loadModels)
         <el-table-column label="上下文长度" width="110" align="right">
           <template #default="{ row }">
             <span :class="{ mono: row.context_length != null }">{{ fmtCtx(row.context_length) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="输出长度" width="110" align="right">
+          <template #default="{ row }">
+            <span :class="{ mono: row.max_output_tokens != null }">{{ fmtCtx(row.max_output_tokens) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="能力" width="100" align="center">
@@ -305,7 +320,7 @@ onMounted(loadModels)
               :loading="testingId === row.id"
               @click="testOne(row)"
             >测试</el-button>
-            <el-button size="small" plain @click="openCtx(row)">上下文</el-button>
+            <el-button size="small" plain @click="openCtx(row)">长度</el-button>
             <el-button size="small" plain @click="openCap(row)">能力</el-button>
             <el-button size="small" type="danger" plain @click="deleteModel(row)">删除</el-button>
           </template>
@@ -316,7 +331,7 @@ onMounted(loadModels)
       </el-table>
     </el-card>
 
-    <el-dialog v-model="ctxDialog" title="设置上下文长度" width="480px">
+    <el-dialog v-model="ctxDialog" title="设置上下文 / 输出长度" width="480px">
       <div v-if="ctxRow">
         <div class="mono ctx-model">{{ ctxRow.model_id }}（{{ ctxRow.provider_name }}）</div>
         <el-input-number
@@ -330,9 +345,21 @@ onMounted(loadModels)
           placeholder="未设置"
           style="width: 100%"
         />
+        <div class="ctx-hint" style="margin: 4px 0 12px">上下文长度（token），如 384K 模型填 384000</div>
+        <el-input-number
+          v-model="maxOutValue"
+          :min="1"
+          :max="10000000"
+          :precision="0"
+          :step="1000"
+          :value-on-clear="null"
+          controls-position="right"
+          placeholder="未设置"
+          style="width: 100%"
+        />
         <div class="ctx-hint">
-          token 数，如 384K 模型填 384000。随 /v1/models 下发给客户端展示（避免客户端按默认
-          1M 高估可用上下文），网关不据此截断请求；清空表示未设置。
+          最大输出长度（token），随 /v1/models 以 max_output_tokens /
+          max_completion_tokens 下发给客户端设置输出上限；两者均清空表示未设置，网关不据此截断请求。
         </div>
       </div>
       <template #footer>

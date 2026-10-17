@@ -354,6 +354,8 @@ export interface ModelRow {
   context_length: number | null
   /** 能力标注：text = 仅文本 / vision = 视觉（图像输入）/ multimodal = 多模态；null = 未标注 */
   capability: 'text' | 'vision' | 'multimodal' | null
+  /** 最大输出长度（token）；null = 未设置（/v1/models 不下发该字段） */
+  max_output_tokens: number | null
   created_at: string
 }
 

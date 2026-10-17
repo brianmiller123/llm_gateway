@@ -182,15 +182,16 @@ async fn embeddings(
     .await
 }
 
-/// GET /v1/models：列出全部模型名（模型库 models 表 + 已启用路由的具体 pattern，去重）；
-/// 有 API Key 时按用户授权过滤；通配符 pattern（不可作为模型名提交）不列出。
+/// GET /v1/models：列出全部模型名（模型库 models 表已启用行 + 出站模型在库内
+/// 启用的路由别名 pattern，去重）；有 API Key 时按用户授权过滤；通配符 pattern
+/// （不可作为模型名提交）不列出。
 /// 模型库中设置了 context_length 的模型同值下发三个别名字段
 /// （context_length / context_window / max_model_len——分别覆盖 one-api /
 /// Anthropic / vLLM 生态客户端的读取约定），未设置则不下发，客户端回落自身默认。
 
-/// 同名模型出现在多个供应商时的上下文长度合并：取已设置值的最小值——
-/// 请求可能路由到任一候选渠道，最小值才是对客户端保证可用的安全上下文。
-fn merge_context_length(acc: Option<i64>, next: Option<i64>) -> Option<i64> {
+/// 同名模型出现在多个供应商时的数值合并：取已设置值的最小值——请求可能路由到
+/// 任一候选渠道，最小值才是对客户端保证可用的值（用于上下文长度、最大输出）。
+fn merge_min_opt(acc: Option<i64>, next: Option<i64>) -> Option<i64> {
     match (acc, next) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) => Some(a),
@@ -233,7 +234,7 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
     let mut seen: Vec<String> = Vec::new();
     let mut data: Vec<serde_json::Value> = Vec::new();
-    let mut push = |name: String, ctx: Option<i64>, capability: Option<&str>| {
+    let mut push = |name: String, ctx: Option<i64>, max_out: Option<i64>, capability: Option<&str>| {
         if seen.contains(&name) {
             return;
         }
@@ -248,6 +249,10 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             obj["context_window"] = json!(n);
             obj["max_model_len"] = json!(n);
         }
+        if let Some(n) = max_out {
+            obj["max_output_tokens"] = json!(n);
+            obj["max_completion_tokens"] = json!(n);
+        }
         if let Some(cap) = capability {
             obj["capability"] = json!(cap);
         }
@@ -257,9 +262,9 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
     // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商下已启用的模型。
     //    聚合与授权过滤同集合：只对该用户可路由的供应商取最小值——更精确
     //    （不因无权渠道的更小设置而低估可用上下文），且仍不高估。
-    let catalog: Vec<(String, i64, Option<i64>, Option<String>)> =
-        sqlx::query_as::<_, (String, i64, Option<i64>, Option<String>)>(
-            "SELECT m.model_id, m.provider_id, m.context_length, m.capability FROM models m \
+    let catalog: Vec<(String, i64, Option<i64>, Option<String>, Option<i64>)> =
+        sqlx::query_as::<_, (String, i64, Option<i64>, Option<String>, Option<i64>)>(
+            "SELECT m.model_id, m.provider_id, m.context_length, m.capability, m.max_output_tokens FROM models m \
              JOIN providers p ON p.id = m.provider_id AND p.enabled \
              WHERE m.enabled",
         )
@@ -270,46 +275,53 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         std::collections::HashMap::new();
     let mut catalog_cap: std::collections::HashMap<&str, Option<&str>> =
         std::collections::HashMap::new();
-    for (model, provider_id, ctx, cap) in &catalog {
+    let mut catalog_max_out: std::collections::HashMap<&str, Option<i64>> =
+        std::collections::HashMap::new();
+    for (model, provider_id, ctx, cap, max_out) in &catalog {
         if can_use(*provider_id, model) {
             let entry = catalog_ctx.entry(model.as_str()).or_insert(None);
-            *entry = merge_context_length(*entry, *ctx);
+            *entry = merge_min_opt(*entry, *ctx);
             // 种子取首个候选的原始值而非 None：None 在 merge_capability 里是
             // “未标注=最弱”，作单位元会让首个已标注候选被吞掉（永不下发）
             let cap_entry = catalog_cap.entry(model.as_str()).or_insert(cap.as_deref());
             *cap_entry = merge_capability(*cap_entry, cap.as_deref());
+            let out_entry = catalog_max_out.entry(model.as_str()).or_insert(None);
+            *out_entry = merge_min_opt(*out_entry, *max_out);
         }
     }
-    for (model, provider_id, _, _) in &catalog {
+    for (model, provider_id, _, _, _) in &catalog {
         if can_use(*provider_id, model) {
             let cap = catalog_cap.get(model.as_str()).copied().flatten();
-            push(model.clone(), catalog_ctx.get(model.as_str()).copied().flatten(), cap);
+            let max_out = catalog_max_out.get(model.as_str()).copied().flatten();
+            push(
+                model.clone(),
+                catalog_ctx.get(model.as_str()).copied().flatten(),
+                max_out,
+                cap,
+            );
         }
     }
 
-    // 2) 已启用路由的具体 pattern（通配符仅用于匹配，不对外列出）；
-    //    路由指向的供应商若在模型库中禁用了该（上游侧）模型则不计入
+    // 2) 已启用路由的具体 pattern（通配符仅用于匹配，不对外列出）。
+    //    仅当出站模型（upstream_model，缺省 = pattern 本身）是主供应商模型库
+    //    中已启用的模型时才列出——模型库启停是网关的模型白名单，库里没有或
+    //    已禁用的模型不因挂了路由就对外暴露；命中时别名继承该模型的
+    //    上下文/输出/能力标注（同一上游模型，能力一致）。
+    //    与模型库同名的 pattern 已在前一步 push，此处 push 因 seen 去重跳过。
     let routes = st.routes.read();
     for r in routes.iter() {
         if r.model_pattern.ends_with('*') {
             continue;
         }
         let upstream_model = r.upstream_model.as_deref().unwrap_or(&r.model_pattern);
-        let providers = st
-            .providers
-            .read()
+        let Some((_, _, ctx, cap, max_out)) = catalog
             .iter()
-            .filter(|p| p.id == r.provider_id || r.fallback_ids.contains(&p.id))
-            .filter(|p| !crate::service::routing::model_disabled(&st, p.id, upstream_model))
-            .cloned()
-            .collect::<Vec<_>>();
-        if providers.is_empty() {
+            .find(|(m, pid, ..)| *pid == r.provider_id && m == upstream_model)
+        else {
             continue;
-        }
-        if providers.iter().any(|p| can_use(p.id, &r.model_pattern)) {
-            // 路由 pattern 与模型库同名时已在前一步 push（含上下文/能力），此处仅补
-            // 模型库未收录的路由模型——无 DB 行，无上下文/能力可下发
-            push(r.model_pattern.clone(), None, None);
+        };
+        if can_use(r.provider_id, &r.model_pattern) {
+            push(r.model_pattern.clone(), *ctx, *max_out, cap.as_deref());
         }
     }
     (
@@ -321,19 +333,19 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_capability, merge_context_length};
+    use super::{merge_capability, merge_min_opt};
 
     #[test]
-    fn merge_context_length_takes_min_of_set_values() {
-        assert_eq!(merge_context_length(None, None), None, "双方未设置 → 不下发");
-        assert_eq!(merge_context_length(None, Some(384_000)), Some(384_000));
-        assert_eq!(merge_context_length(Some(1_000_000), None), Some(1_000_000));
+    fn merge_min_opt_takes_min_of_set_values() {
+        assert_eq!(merge_min_opt(None, None), None, "双方未设置 → 不下发");
+        assert_eq!(merge_min_opt(None, Some(384_000)), Some(384_000));
+        assert_eq!(merge_min_opt(Some(1_000_000), None), Some(1_000_000));
         assert_eq!(
-            merge_context_length(Some(1_000_000), Some(384_000)),
+            merge_min_opt(Some(1_000_000), Some(384_000)),
             Some(384_000),
             "取最小：请求可能落到任一候选渠道"
         );
-        assert_eq!(merge_context_length(Some(128_000), Some(384_000)), Some(128_000));
+        assert_eq!(merge_min_opt(Some(128_000), Some(384_000)), Some(128_000));
     }
 
     #[test]
