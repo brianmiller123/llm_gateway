@@ -10,8 +10,26 @@ const routes = ref<RouteRow[]>([])
 const providers = ref<ProviderRow[]>([])
 const models = ref<ModelRow[]>([])
 
-/** 模型库去重后的模型 id（下拉选项；仍可手输自定义模式） */
+/** 模型库去重后的模型 id（候选建议；输入框本身可自由编辑） */
 const modelOptions = computed(() => [...new Set(models.value.map((m) => m.model_id))].sort())
+
+/**
+ * 模型匹配候选：随输入过滤模型库，空查询给全量（聚焦即可浏览）。
+ * 仅作建议，输入内容始终可自由编辑（含 * 通配），不需要回车确认。
+ */
+function queryModelSuggestions(
+  query: string,
+  cb: (items: Array<Record<string, unknown>>) => void,
+): void {
+  const q = query.trim().toLowerCase()
+  const matched = q
+    ? modelOptions.value.filter((m) => m.toLowerCase().includes(q))
+    : modelOptions.value
+  // 自定义 pattern（如 mock-*）或无匹配时回退全量候选：下拉不应为空，
+  // 否则容易被误读为“不能选择”，输入内容本身始终保留
+  const list = matched.length ? matched : modelOptions.value
+  cb(list.map((value) => ({ value })))
+}
 
 /** 供应商 id → 名称；找不到时回退显示 id */
 function providerName(id: number): string {
@@ -195,6 +213,7 @@ async function submit() {
       provider_id: form.provider_id,
       priority: form.priority,
       fallback_ids: form.fallback_ids,
+      upstream_model: form.upstream_model.trim(),
       enabled: form.enabled,
       strict_system_head: form.strict_system_head,
       system_head_merge: form.system_head_merge,
@@ -306,17 +325,21 @@ onMounted(loadData)
     >
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="模型匹配" prop="model_pattern">
-          <el-select
-            v-model="form.model_pattern"
-            filterable
-            allow-create
-            default-first-option
-            clearable
-            placeholder="选择模型库中的模型，或输入自定义模式（支持 * 通配）"
-            style="width: 100%"
-          >
-            <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" />
-          </el-select>
+          <div style="width: 100%">
+            <el-autocomplete
+              v-model="form.model_pattern"
+              :fetch-suggestions="queryModelSuggestions"
+              :trigger-on-focus="true"
+              :debounce="0"
+              clearable
+              maxlength="128"
+              placeholder="选择模型库中的模型，或直接输入自定义模式（支持 * 通配）"
+              style="width: 100%"
+            />
+            <div class="field-hint" style="margin-top: 4px">
+              可直接键入任意 pattern（如 claude-3-5-*），无需回车；下拉列表仅作候选，输入内容保存即生效
+            </div>
+          </div>
         </el-form-item>
         <el-form-item label="供应商" prop="provider_id">
           <el-select v-model="form.provider_id" placeholder="选择供应商" style="width: 100%">
