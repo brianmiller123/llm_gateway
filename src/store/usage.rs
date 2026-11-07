@@ -19,6 +19,9 @@ pub struct UsageMeta {
     pub session_id: Option<String>,
     /// L3：流式请求首个上游 chunk 到达耗时（ms；非流式 None）
     pub first_token_ms: Option<i64>,
+    /// 请求开始时刻：记账时据此计算生成阶段耗时 gen_ms（流式扣除首 token
+    /// 等待；流质终端/客户端断开两种收尾都能拿到真实生成长度）
+    pub started: std::time::Instant,
     /// 管理员测试调用：跳过用量记账（不写 usage_logs，不污染状态页错误率）
     pub test_call: bool,
     /// 计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
@@ -155,6 +158,8 @@ pub async fn record_usage(
     usage: Option<&Usage>,
     status: u16,
     latency_ms: i64,
+    // 生成阶段耗时（ms；见 migrations/0032_usage_gen_ms.sql）
+    gen_ms: i64,
     cost: f64,
 ) -> Result<(), sqlx::Error> {
     let (input, output) = usage
@@ -170,8 +175,8 @@ pub async fn record_usage(
         "INSERT INTO usage_logs
            (request_id, user_id, api_key_id, model, provider_id, endpoint, streamed,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            latency_ms, status, cost, client_ip, session_id, first_token_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17)",
+            latency_ms, status, cost, client_ip, session_id, first_token_ms, gen_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17,$18)",
     )
     .bind(meta.request_id)
     .bind(meta.user_id)
@@ -190,6 +195,7 @@ pub async fn record_usage(
     .bind(meta.client_ip.map(|ip| ip.to_string()))
     .bind(meta.session_id.as_deref())
     .bind(meta.first_token_ms)
+    .bind(gen_ms)
     .execute(&mut *tx)
     .await?;
 

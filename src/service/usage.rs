@@ -58,6 +58,34 @@ impl UsageCache {
     }
 }
 
+/// 生成阶段耗时（纯函数，便于单测）：
+/// - 有首 token：elapsed − first（流式真实生成长度）；
+/// - 首块即末块 / 亚毫秒流（差值 ≤ 0）：回退总耗时下界；
+/// - 无首 token（非流式/缓冲路径）：总耗时（含预填充，下界）。
+/// 结果最小 1ms：0 会被速度 SQL 的 `gen_ms > 0` 过滤，整行样本丢失。
+fn gen_ms_from(first_token_ms: Option<i64>, elapsed_ms: i64, latency_ms: i64) -> i64 {
+    match first_token_ms {
+        Some(first) => {
+            let span = elapsed_ms - first;
+            if span > 0 {
+                span
+            } else {
+                latency_ms.max(1)
+            }
+        }
+        None => latency_ms.max(1),
+    }
+}
+
+/// 记账时点的生成阶段耗时（客户端断开兜底也用它，避免 spawn 调度延迟计入）
+pub fn gen_ms_at(meta: &UsageMeta, latency_ms: i64) -> i64 {
+    gen_ms_from(
+        meta.first_token_ms,
+        meta.started.elapsed().as_millis() as i64,
+        latency_ms,
+    )
+}
+
 /// 记账执行器：同步事务直写 + 更新缓存
 pub async fn record(
     st: &AppState,
@@ -66,7 +94,20 @@ pub async fn record(
     status: u16,
     latency_ms: i64,
 ) {
-    // 管理员测试调用不记账：不写 usage_logs，不污染状态页/用量统计
+    let gen_ms = gen_ms_at(meta, latency_ms);
+    record_with_gen_ms(st, meta, usage, status, latency_ms, gen_ms).await;
+}
+
+/// 带显式生成阶段耗时的记账（客户端断开兜底在断开时点先算好 gen_ms）。
+pub async fn record_with_gen_ms(
+    st: &AppState,
+    meta: &UsageMeta,
+    usage: Option<&Usage>,
+    status: u16,
+    latency_ms: i64,
+    gen_ms: i64,
+) {
+    // 管理员测试调用不记账：不写 usage_logs，不污染状态页/错误率
     if meta.test_call {
         return;
     }
@@ -109,7 +150,7 @@ pub async fn record(
             "no price configured for model; cost recorded as 0"
         );
     }
-    match record_usage(&st.pool, meta, usage, status, latency_ms, cost).await {
+    match record_usage(&st.pool, meta, usage, status, latency_ms, gen_ms, cost).await {
         Ok(()) => {
             if let Some(user_id) = meta.user_id {
                 let tokens = usage.map(|u| u.total()).unwrap_or(0);
@@ -142,5 +183,29 @@ pub async fn record(
             // 记账失败不回滚客户端响应，仅告警（request_id 保证可对账）
             tracing::error!(request_id = %meta.request_id, error = %e, "usage record failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gen_ms_from;
+
+    #[test]
+    fn gen_ms_stream_uses_post_first_token_duration() {
+        assert_eq!(gen_ms_from(Some(800), 5_800, 900), 5_000);
+    }
+
+    #[test]
+    fn gen_ms_non_stream_uses_total_latency() {
+        assert_eq!(gen_ms_from(None, 9_999, 4_200), 4_200);
+    }
+
+    #[test]
+    fn gen_ms_zero_duration_falls_back_to_latency_floor() {
+        // 首块即末块（上游忽略 stream）或亚毫秒流：差值 0/负，回退总耗时
+        assert_eq!(gen_ms_from(Some(1), 1, 250), 250);
+        assert_eq!(gen_ms_from(Some(10), 5, 120), 120);
+        // 非流式 0ms：仍取 1ms 下限，避免 gen_ms > 0 过滤丢样本
+        assert_eq!(gen_ms_from(None, 0, 0), 1);
     }
 }

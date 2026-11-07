@@ -1401,10 +1401,20 @@ impl Drop for BillingOnDrop {
             let usage = self.state.lock().billing_usage();
             let status = self.status;
             let latency = self.latency;
+            // 断开时点即锁定 gen_ms，避免 spawn 调度延迟被计入生成长度
+            let gen_ms = crate::service::usage::gen_ms_at(&meta, latency);
             // 尽力而为：客户端中断后按已累积的 usage 记账
             tokio::spawn(async move {
                 tracing::warn!(request_id = %meta.request_id, "responses stream dropped before completion; billing best-effort");
-                crate::service::usage::record(&st, &meta, usage.as_ref(), status, latency).await;
+                crate::service::usage::record_with_gen_ms(
+                    &st,
+                    &meta,
+                    usage.as_ref(),
+                    status,
+                    latency,
+                    gen_ms,
+                )
+                .await;
             });
         }
     }

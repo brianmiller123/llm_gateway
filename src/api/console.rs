@@ -606,6 +606,11 @@ struct RealtimeSummary {
     output_tokens: i64,
     avg_latency_ms: i64,
     cost: f64,
+    /// 流式生成速度（token/s）：仅 streamed 成功行，Σ输出 token / Σgen_ms；
+    /// 分母已扣除首 token 等待，与模型真实生成速度同口径
+    stream_tps: f64,
+    /// 全量吞吐（token/s，下界）：含非流式（分母为总耗时，含预填充/排队）
+    throughput_tps: f64,
 }
 
 /// 实时监控：单个用户窗口统计（近 60 分钟内有过调用的用户）
@@ -623,6 +628,10 @@ struct RealtimeUserStat {
     cost: f64,
     avg_latency_ms: i64,
     last_call_at: chrono::DateTime<Utc>,
+    /// 流式生成速度（token/s，近 60 分钟；仅 streamed 成功行）
+    stream_tps: f64,
+    /// 全量吞吐（token/s，下界；含非流式）
+    throughput_tps: f64,
 }
 
 /// 实时监控：最近请求明细行
@@ -637,6 +646,10 @@ struct RealtimeCallRow {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     latency_ms: Option<i32>,
+    /// 流式首 token 延迟（ms；非流式 NULL）
+    first_token_ms: Option<i64>,
+    /// 单次请求输出速度（token/s）：流式扣首 token 延迟，非流式按总延迟
+    tokens_per_sec: Option<f64>,
     status: Option<i16>,
     cost: Option<f64>,
     created_at: chrono::DateTime<Utc>,
@@ -656,7 +669,15 @@ async fn admin_usage_realtime(
                 COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens, \
                 COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens, \
                 COALESCE(AVG(latency_ms), 0)::bigint AS avg_latency_ms, \
-                COALESCE(SUM(cost), 0)::float8 AS cost \
+                COALESCE(SUM(cost), 0)::float8 AS cost, \
+                COALESCE( \
+                  SUM(output_tokens) FILTER (WHERE streamed AND status < 400 AND output_tokens > 0 AND gen_ms > 0) \
+                  / NULLIF(SUM(gen_ms) FILTER (WHERE streamed AND status < 400 AND output_tokens > 0 AND gen_ms > 0), 0) \
+                  * 1000.0, 0)::float8 AS stream_tps, \
+                COALESCE( \
+                  SUM(output_tokens) FILTER (WHERE status < 400 AND output_tokens > 0 AND gen_ms > 0) \
+                  / NULLIF(SUM(gen_ms) FILTER (WHERE status < 400 AND output_tokens > 0 AND gen_ms > 0), 0) \
+                  * 1000.0, 0)::float8 AS throughput_tps \
          FROM usage_logs WHERE created_at >= now() - interval '5 minutes'",
     )
     .fetch_one(&st.pool)
@@ -673,7 +694,15 @@ async fn admin_usage_realtime(
                 COALESCE(SUM(l.output_tokens), 0)::bigint AS output_tokens, \
                 COALESCE(SUM(l.cost), 0)::float8 AS cost, \
                 COALESCE(AVG(l.latency_ms), 0)::bigint AS avg_latency_ms, \
-                MAX(l.created_at) AS last_call_at \
+                MAX(l.created_at) AS last_call_at, \
+                COALESCE( \
+                  SUM(l.output_tokens) FILTER (WHERE l.streamed AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0) \
+                  / NULLIF(SUM(l.gen_ms) FILTER (WHERE l.streamed AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0), 0) \
+                  * 1000.0, 0)::float8 AS stream_tps, \
+                COALESCE( \
+                  SUM(l.output_tokens) FILTER (WHERE l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0) \
+                  / NULLIF(SUM(l.gen_ms) FILTER (WHERE l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0), 0) \
+                  * 1000.0, 0)::float8 AS throughput_tps \
          FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id \
          WHERE l.created_at >= now() - interval '60 minutes' \
          GROUP BY u.id, u.username, u.display_name \
@@ -685,7 +714,11 @@ async fn admin_usage_realtime(
 
     let recent: Vec<RealtimeCallRow> = sqlx::query_as(
         "SELECT l.id, CAST(l.request_id AS TEXT) AS request_id, u.username, l.model, l.endpoint, l.streamed, \
-                l.input_tokens, l.output_tokens, l.latency_ms, l.status, CAST(l.cost AS FLOAT8) AS cost, l.created_at \
+                l.input_tokens, l.output_tokens, l.latency_ms, l.first_token_ms, \
+                CASE WHEN l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0 \
+                     THEN (l.output_tokens * 1000.0 / l.gen_ms)::float8 \
+                END AS tokens_per_sec, \
+                l.status, CAST(l.cost AS FLOAT8) AS cost, l.created_at \
          FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id \
          ORDER BY l.id DESC LIMIT 50",
     )

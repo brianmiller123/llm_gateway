@@ -121,6 +121,10 @@ export interface RealtimeSummary {
   output_tokens: number
   avg_latency_ms: number
   cost: number
+  /** 流式生成速度（token/s）：近 5 分钟仅 streamed 成功行，Σ输出 token ÷ Σgen_ms */
+  stream_tps: number
+  /** 全量吞吐（token/s，下界）：含非流式（分母为总耗时，含预填充/排队） */
+  throughput_tps: number
 }
 
 /** 实时监控：单用户窗口统计（近 60 分钟内有调用的用户） */
@@ -137,6 +141,10 @@ export interface RealtimeUserStat {
   cost: number
   avg_latency_ms: number
   last_call_at: string
+  /** 流式生成速度（token/s，近 60 分钟；仅 streamed 成功行） */
+  stream_tps: number
+  /** 全量吞吐（token/s，下界；含非流式） */
+  throughput_tps: number
 }
 
 /** 实时监控：最近请求明细行 */
@@ -150,6 +158,10 @@ export interface RealtimeCallRow {
   input_tokens: number | null
   output_tokens: number | null
   latency_ms: number | null
+  /** 流式首 token 延迟（ms；非流式 null） */
+  first_token_ms: number | null
+  /** 单次输出速度（token/s）：输出 token ÷ gen_ms（流式扣首 token 等待，非流式按总延迟） */
+  tokens_per_sec: number | null
   status: number | null
   cost: number | null
   created_at: string

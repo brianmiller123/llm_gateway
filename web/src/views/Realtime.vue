@@ -21,7 +21,7 @@
     <el-row :gutter="16" class="cards" v-loading="loading && !data">
       <el-col :span="3" v-for="card in cards" :key="card.label">
         <el-card shadow="never" class="stat-card">
-          <div class="stat-title">{{ card.label }}</div>
+          <div class="stat-title" :title="card.hint">{{ card.label }}</div>
           <div class="stat-value" :class="{ danger: card.danger }">{{ card.value }}</div>
         </el-card>
       </el-col>
@@ -80,6 +80,17 @@
         <el-table-column label="平均延迟" align="right" width="100">
           <template #default="{ row }">{{ row.avg_latency_ms }} ms</template>
         </el-table-column>
+        <el-table-column label="输出速度" align="right" width="120">
+          <template #default="{ row }">
+            <span
+              :title="row.stream_tps > 0
+                ? '流式生成速度：Σ输出 token ÷ Σ生成阶段耗时（已扣首 token 等待）'
+                : (row.throughput_tps > 0 ? '无流式样本，显示≈全量吞吐下界（含非流式预填充/排队）' : '')"
+            >
+              {{ fmtSpeed(row.stream_tps, row.throughput_tps) }}
+            </span>
+          </template>
+        </el-table-column>
         <el-table-column label="最近调用" width="130">
           <template #default="{ row }">
             <span :title="fmtDateTime(row.last_call_at)">{{ fmtAgo(row.last_call_at) }}</span>
@@ -124,7 +135,18 @@
           </template>
         </el-table-column>
         <el-table-column label="延迟" width="100" align="right">
-          <template #default="{ row }">{{ row.latency_ms != null ? row.latency_ms + ' ms' : '-' }}</template>
+          <template #default="{ row }">
+            <span :title="row.first_token_ms != null ? `首 token ${row.first_token_ms} ms` : ''">
+              {{ row.latency_ms != null ? row.latency_ms + ' ms' : '-' }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="输出速度" width="110" align="right">
+          <template #default="{ row }">
+            <span :title="row.streamed ? '' : '非流式：分母为总耗时，此为下界（≈）'">
+              {{ fmtTps(row.tokens_per_sec, !row.streamed) }}
+            </span>
+          </template>
         </el-table-column>
         <el-table-column label="Token 入/出" width="140" align="right">
           <template #default="{ row }">
@@ -184,13 +206,44 @@ const cards = computed(() => {
   const s = data.value?.summary
   const rate = s && s.calls > 0 ? Math.round(((s.calls - s.errors) / s.calls) * 100) + '%' : '-'
   return [
-    { label: '5 分钟调用', value: s ? fmt(s.calls) : '-', danger: false },
-    { label: '5 分钟错误', value: s ? fmt(s.errors) : '-', danger: !!s && s.errors > 0 },
-    { label: '成功率', value: rate, danger: false },
-    { label: '在途请求', value: data.value ? fmt(data.value.active_total) : '-', danger: !!data.value && data.value.active_total > 50 },
-    { label: 'Token 入/出', value: s ? `${fmt(s.input_tokens)} / ${fmt(s.output_tokens)}` : '-', danger: false },
-    { label: '平均延迟', value: s ? `${s.avg_latency_ms} ms` : '-', danger: false },
-    { label: '成本', value: s ? fmtCost(s.cost) : '-', danger: false },
+    {
+      label: '5 分钟调用',
+      value: s ? fmt(s.calls) : '-',
+      danger: false,
+      hint: '最近 5 分钟的调用次数',
+    },
+    {
+      label: '5 分钟错误',
+      value: s ? fmt(s.errors) : '-',
+      danger: !!s && s.errors > 0,
+      hint: '最近 5 分钟状态码 ≥ 400 的调用次数',
+    },
+    { label: '成功率', value: rate, danger: false, hint: '最近 5 分钟成功率' },
+    {
+      label: '在途请求',
+      value: data.value ? fmt(data.value.active_total) : '-',
+      danger: !!data.value && data.value.active_total > 50,
+      hint: '当前进行中的请求数（含流式未结束）',
+    },
+    {
+      label: 'Token 入/出',
+      value: s ? `${fmt(s.input_tokens)} / ${fmt(s.output_tokens)}` : '-',
+      danger: false,
+      hint: '最近 5 分钟输入 / 输出 token',
+    },
+    {
+      label: '输出速度',
+      value: s ? fmtSpeed(s.stream_tps, s.throughput_tps) : '-',
+      danger: false,
+      hint: '流式生成速度 = 近 5 分钟 Σ输出 token ÷ Σ生成阶段耗时（已扣首 token 等待）；无流式样本时以 ≈ 显示含非流式的下界吞吐',
+    },
+    {
+      label: '平均延迟',
+      value: s ? `${s.avg_latency_ms} ms` : '-',
+      danger: false,
+      hint: '最近 5 分钟平均请求耗时',
+    },
+    { label: '成本', value: s ? fmtCost(s.cost) : '-', danger: false, hint: '最近 5 分钟成本' },
   ]
 })
 
@@ -238,6 +291,18 @@ function fmt(n: number | null | undefined): string {
 
 function fmtCost(n: number | null | undefined): string {
   return '¥' + (n ?? 0).toFixed(2)
+}
+
+/** 单请求速度：无有效样本显示 '-'；非流式为下界，加 ≈ 前缀 */
+function fmtTps(n: number | null | undefined, approx = false): string {
+  return n != null && n > 0 ? `${approx ? '≈' : ''}${n.toFixed(1)} tok/s` : '-'
+}
+
+/** 聚合速度：优先流式生成速度；无流式样本时以 ≈ 显示全量下界吞吐 */
+function fmtSpeed(stream: number | null | undefined, all: number | null | undefined): string {
+  if (stream != null && stream > 0) return `${stream.toFixed(1)} tok/s`
+  if (all != null && all > 0) return `≈${all.toFixed(1)} tok/s`
+  return '-'
 }
 
 /** 本地时间 YYYY-MM-DD HH:mm:ss */

@@ -1087,6 +1087,7 @@ async fn proxy_authed(
         session_id: extract_session_id(&headers)
             .or_else(|| session_id_from_metadata(&json, endpoint.anthropic)),
         first_token_ms: None,
+        started,
         test_call,
         // M33：计价候选 = 客户端模型名 → 上游映射模型名（依次查价）
         pricing_models: std::iter::once(model.clone())
@@ -2842,10 +2843,12 @@ impl Drop for BillingOnDrop {
             let usage = self.captured.lock().take();
             let status = self.status;
             let latency = self.latency;
+            // 断开时点即锁定 gen_ms，避免 spawn 调度延迟被计入生成长度
+            let gen_ms = usage::gen_ms_at(&meta, latency);
             // 尽力而为：客户端中断后无法确认上游实际消耗，按已捕获 usage 记账
             tokio::spawn(async move {
                 tracing::warn!(request_id = %meta.request_id, "stream dropped before completion; billing best-effort");
-                usage::record(&st, &meta, usage.as_ref(), status, latency).await;
+                usage::record_with_gen_ms(&st, &meta, usage.as_ref(), status, latency, gen_ms).await;
             });
         }
     }
