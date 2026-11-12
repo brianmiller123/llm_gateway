@@ -208,6 +208,14 @@ impl AppState {
         Ok(())
     }
 
+    /// 仅刷新管理员 id 缓存（代理路径的管理员旁路判定）。权限变更后即时调用，
+    /// 不必等待周期 reload；控制台中间件每请求查库，天然即时。
+    pub async fn reload_admin_ids(&self) -> Result<(), sqlx::Error> {
+        let v = crate::store::users::load_admin_ids(&self.pool).await?;
+        *self.admin_ids.write() = v;
+        Ok(())
+    }
+
     /// 全量热加载：供应商 / 路由 / 限流规则（并发上限）/ 单价 / 访问授权 / LDAP。
     ///
     /// 分节独立应用：任一节加载失败只影响该节（沿用旧值并 error 留痕），不再让
@@ -257,8 +265,7 @@ impl AppState {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("admin_ids", async {
-            let v: HashSet<i64> = crate::store::users::load_admin_ids(&self.pool).await?;
-            *self.admin_ids.write() = v;
+            self.reload_admin_ids().await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("disabled_models", async {

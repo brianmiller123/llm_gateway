@@ -1206,6 +1206,7 @@ async fn list_users(
                 "display_name": u.display_name,
                 "source": u.source,
                 "is_admin": u.is_admin,
+                "admin_source": users::admin_source(u.admin_override),
                 "status": u.status,
                 "last_login_at": u.last_login_at,
                 "created_at": u.created_at,
@@ -1284,10 +1285,11 @@ async fn create_user(
 struct UpdateUserReq {
     /// 1 = 启用, 0 = 禁用
     status: Option<i16>,
-    /// Some(true) = 授权管理员, Some(false) = 取消管理员;None = 不变更。
-    /// 变更后 reload 刷新 admin_ids 缓存（代理路径授权即时生效）；
-    /// 控制台中间件每请求查库，天然即时。
+    /// Some(true) = 授权管理员（写手动覆盖）, Some(false) = 取消管理员（写手动覆盖）;
+    /// None = 不变更。覆盖写入后 LDAP 登录不再改写它。与 reset_admin_source 互斥。
     is_admin: Option<bool>,
+    /// true = 恢复目录同步：清除手动覆盖，权限回到目录真值。与 is_admin 互斥。
+    reset_admin_source: Option<bool>,
 }
 
 async fn update_user(
@@ -1297,6 +1299,11 @@ async fn update_user(
     Json(req): Json<UpdateUserReq>,
 ) -> Result<impl IntoResponse, AppError> {
     let actor = admin.id;
+    if req.is_admin.is_some() && req.reset_admin_source.is_some() {
+        return Err(AppError::BadRequest(
+            "is_admin and reset_admin_source are mutually exclusive".into(),
+        ));
+    }
     let Some(target) = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
@@ -1328,28 +1335,50 @@ async fn update_user(
         .await
         .map_err(AppError::internal)?;
     }
-    if let Some(grant) = req.is_admin {
-        if target.is_admin != grant {
+    // 权限变更：is_admin 写手动覆盖（LDAP 登录不再改写）；reset_admin_source
+    // 清除覆盖回到目录真值。写入后只做轻量 admin_ids 刷新——变更已提交，
+    // 刷新失败仅告警，不得把成功的 PATCH 变成 500。
+    let admin_action = if let Some(grant) = req.is_admin {
+        if target.is_admin == grant {
+            None
+        } else {
             users::set_is_admin(&st.pool, id, grant)
                 .await
                 .map_err(AppError::internal)?;
-            st.reload().await.map_err(AppError::internal)?;
-            audit::log(
-                &st.pool,
-                Some(actor),
-                "user.is_admin",
-                Some("user"),
-                Some(id),
-                Some(json!({"is_admin": grant, "username": target.username})),
-            )
+            Some("user.is_admin")
+        }
+    } else if req.reset_admin_source == Some(true) {
+        users::reset_admin_source(&st.pool, id)
             .await
             .map_err(AppError::internal)?;
-        }
-    }
+        Some("user.admin_source.reset")
+    } else {
+        None
+    };
     let updated = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Internal("user vanished".into()))?;
+    if let Some(action) = admin_action {
+        if let Err(e) = st.reload_admin_ids().await {
+            tracing::warn!(user_id = id, error = %e, "admin_ids refresh failed after admin change");
+        }
+        audit::log(
+            &st.pool,
+            Some(actor),
+            action,
+            Some("user"),
+            Some(id),
+            Some(json!({
+                "is_admin": updated.is_admin,
+                "admin_source": users::admin_source(updated.admin_override),
+                "directory_admin": updated.admin_ldap,
+                "username": updated.username,
+            })),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    }
     Ok(Json(json!({"user": user_json(&st, &updated)})))
 }
 
@@ -1578,6 +1607,7 @@ fn user_json(st: &AppState, u: &users::UserRow) -> serde_json::Value {
         "source": u.source,
         "ldap_dn": u.ldap_dn,
         "is_admin": u.is_admin,
+        "admin_source": users::admin_source(u.admin_override),
         "status": u.status,
         "last_login_at": u.last_login_at,
         "created_at": u.created_at,
