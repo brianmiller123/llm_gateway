@@ -49,12 +49,16 @@ pub struct AppConfig {
     pub seed_provider_base_url: Option<String>,
     pub seed_provider_api_key: Option<String>,
     pub seed_model_pattern: Option<String>,
-    /// 流式首字节超时（秒）：等待首个上游 chunk 的最长时间；0 = 禁用
+    /// 流式首字节超时（秒）：提交前等待首个上游 chunk 的最长时间；0 = 禁用。
+    /// 对 SSE 响应它是 **PRIME 之后的兜底**——PRIME 先到期就提交（见下）
     pub stream_first_byte_timeout_secs: u64,
-    /// 流式静默超时（秒）：相邻 chunk 间最大间隔；0 = 禁用
+    /// 流式静默超时（秒）：相邻 chunk 间最大间隔；0 = 禁用。提交后生效，
+    /// 与首字节窗口默认同值（300/300）
     pub stream_idle_timeout_secs: u64,
     /// 流式 priming 墙钟上限（毫秒）：上游 2xx 后到点即提交响应并进入流式
-    ///（客户端立刻拿到响应头与心跳）；0 = 不限。仅 SSE 响应生效
+    ///（客户端立刻拿到响应头与心跳）；0 = 不限。仅 SSE 响应生效。
+    /// 优先级：PRIME（提交前）< FIRST_BYTE（兜底）≈ IDLE（提交后）；
+    /// PRIME ≥ FIRST_BYTE 时 FIRST_BYTE 对 SSE 退化为兜底，加载期告警
     pub stream_prime_timeout_ms: u64,
     /// L29：出站上游代理（http/https/socks5 URL，如 http://127.0.0.1:7890）；
     /// 未配置时不启用（需经代理出海的部署使用）
@@ -148,6 +152,23 @@ impl AppConfig {
         let stream_prime_timeout_ms: u64 = env("GATEWAY_STREAM_PRIME_TIMEOUT_MS", "2000")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_STREAM_PRIME_TIMEOUT_MS: {e}"))?;
+        // W3：超时优先级——SSE 预提交阶段由 PRIME 决定，FIRST_BYTE 只在 PRIME=0
+        // 或响应体非 SSE 时才有独立可观测效果。PRIME ≥ FIRST_BYTE 是静默失效
+        // 配置（运维调大 PRIME 而忘记同步 FIRST_BYTE，症状原样复发），启动期告警。
+        if stream_prime_timeout_ms > 0
+            && stream_first_byte_timeout_secs > 0
+            && stream_prime_timeout_ms >= stream_first_byte_timeout_secs.saturating_mul(1000)
+        {
+            tracing::warn!(
+                prime_timeout_ms = stream_prime_timeout_ms,
+                first_byte_timeout_secs = stream_first_byte_timeout_secs,
+                "GATEWAY_STREAM_PRIME_TIMEOUT_MS >= GATEWAY_STREAM_FIRST_BYTE_TIMEOUT: \
+                 FIRST_BYTE degenerates to a fallback for SSE responses. The priming wall \
+                 clock commits no later than the first-byte window, so a stuck SSE upstream \
+                 surfaces as 200 + an in-stream error frame, not as a 504. Set FIRST_BYTE \
+                 below PRIME (or PRIME=0) if you need the 504 / candidate failover semantics."
+            );
+        }
         let upstream_proxy = std::env::var("GATEWAY_UPSTREAM_PROXY")
             .ok()
             .map(|v| v.trim().to_string())
