@@ -1288,7 +1288,8 @@ struct UpdateUserReq {
     /// Some(true) = 授权管理员（写手动覆盖）, Some(false) = 取消管理员（写手动覆盖）;
     /// None = 不变更。覆盖写入后 LDAP 登录不再改写它。与 reset_admin_source 互斥。
     is_admin: Option<bool>,
-    /// true = 恢复目录同步：清除手动覆盖，权限回到目录真值。与 is_admin 互斥。
+    /// true = 恢复目录同步：清除手动覆盖，权限回到目录真值。与 is_admin 互斥；
+    /// 仅 LDAP 用户可用，其他来源返回 400。
     reset_admin_source: Option<bool>,
 }
 
@@ -1311,6 +1312,13 @@ async fn update_user(
         return Err(AppError::BadRequest("user not found".into()));
     };
     ensure_not_protected(&st.cfg, &target)?;
+    // reset 只对 LDAP 用户有意义：本地账号没有目录真值，清除覆盖只会留下
+    // admin_override = NULL 的「directory」来源态。在任何字段写入之前拒绝。
+    if req.reset_admin_source == Some(true) && target.source != "ldap" {
+        return Err(AppError::BadRequest(
+            "reset_admin_source is only available for LDAP users".into(),
+        ));
+    }
     if let Some(status) = req.status {
         if !(0..=1).contains(&status) {
             return Err(AppError::BadRequest("status must be 0 or 1".into()));

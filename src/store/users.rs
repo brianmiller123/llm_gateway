@@ -168,13 +168,18 @@ pub async fn set_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> Result<(), 
         .map(|_| ())
 }
 
-/// 恢复目录同步：清除手动覆盖，有效权限回到目录真值 admin_ldap
+/// 恢复目录同步：清除手动覆盖，有效权限回到目录真值 admin_ldap。
+/// 只有 LDAP 用户有目录真值；`source <> 'ldap'` 的行不做任何写入（调用方据此
+/// 返回 400），避免本地账号落入 `admin_override = NULL` 的「directory」来源态。
 pub async fn reset_admin_source(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET admin_override = NULL, is_admin = admin_ldap WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await
-        .map(|_| ())
+    sqlx::query(
+        "UPDATE users SET admin_override = NULL, is_admin = admin_ldap \
+         WHERE id = $1 AND source = 'ldap'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// 是否存在本地管理员（break-glass 种子判断）
@@ -292,8 +297,19 @@ mod tests {
         assert_eq!(u.admin_override, None);
     }
 
-    /// 两条写路径（本地创建 / LDAP JIT / 手动覆盖 / reset）都维持
-    /// is_admin = COALESCE(admin_override, admin_ldap)
+    /// 不变式：任一时刻 is_admin = COALESCE(admin_override, admin_ldap)。
+    /// 每条写路径后各断言一次，避免后续写入把中间态「自愈」掉而掩盖回归。
+    async fn assert_invariant(pool: &PgPool) {
+        let (violations,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM users WHERE is_admin <> COALESCE(admin_override, admin_ldap)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(violations, 0, "有效权限必须等于来源列的 COALESCE");
+    }
+
+    /// 四条写路径（本地创建 / LDAP JIT / 手动覆盖 / reset）都维持不变式
     #[sqlx::test(migrations = "./migrations")]
     async fn is_admin_equals_coalesce_of_source_columns(pool: PgPool) {
         let local_admin = create_local_user(&pool, "root", "Root", "hash", true)
@@ -302,31 +318,64 @@ mod tests {
         assert!(local_admin.is_admin);
         assert_eq!(local_admin.admin_override, Some(true), "本地权限存于覆盖列");
         assert!(!local_admin.admin_ldap);
+        assert_invariant(&pool).await;
+
         let local_user = create_local_user(&pool, "plain", "Plain", "hash", false)
             .await
             .unwrap();
         assert_eq!(local_user.admin_override, Some(false));
+        assert_invariant(&pool).await;
 
         let ldap_admin = upsert_ldap_user(&pool, "bob", None, None, DN, true)
             .await
             .unwrap();
-        let ldap_plain = upsert_ldap_user(&pool, "carol", None, None, "uid=carol,ou=people,dc=example,dc=org", false)
-            .await
-            .unwrap();
+        assert_invariant(&pool).await;
+
+        let ldap_plain = upsert_ldap_user(
+            &pool,
+            "carol",
+            None,
+            None,
+            "uid=carol,ou=people,dc=example,dc=org",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_invariant(&pool).await;
+
         set_is_admin(&pool, ldap_plain.id, true).await.unwrap();
+        assert_invariant(&pool).await;
         set_is_admin(&pool, ldap_admin.id, false).await.unwrap();
+        assert_invariant(&pool).await;
+
         reset_admin_source(&pool, ldap_admin.id).await.unwrap();
+        assert_invariant(&pool).await;
         reset_admin_source(&pool, ldap_plain.id).await.unwrap();
+        assert_invariant(&pool).await;
+
         upsert_ldap_user(&pool, "bob", None, None, DN, true)
             .await
             .unwrap();
+        assert_invariant(&pool).await;
+    }
 
-        let (violations,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM users WHERE is_admin <> COALESCE(admin_override, admin_ldap)",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(violations, 0, "有效权限必须等于来源列的 COALESCE");
+    /// reset 只对 LDAP 用户生效：本地账号的手动权限不被清除，也不会出现
+    /// `admin_source = 'directory'` 的本地行（API 侧据此返回 400）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reset_admin_source_skips_non_ldap_users(pool: PgPool) {
+        let root = create_local_user(&pool, "root", "Root", "hash", true)
+            .await
+            .unwrap();
+        reset_admin_source(&pool, root.id).await.unwrap();
+
+        let u = find_by_id(&pool, root.id).await.unwrap().unwrap();
+        assert!(u.is_admin, "reset 不得清除本地管理员权限");
+        assert_eq!(u.admin_override, Some(true), "本地权限仍存于覆盖列");
+        assert_eq!(
+            admin_source(u.admin_override),
+            "manual",
+            "不得出现 directory 来源的本地行"
+        );
+        assert_invariant(&pool).await;
     }
 }
