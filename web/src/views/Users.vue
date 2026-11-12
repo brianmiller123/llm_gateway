@@ -67,8 +67,8 @@ async function toggleAdmin(u: UserWithUsage) {
     const tip =
       u.source === 'ldap'
         ? grant
-          ? 'LDAP 用户的管理员身份会在下次登录时按目录组（memberOf）重新计算，手动授权仅临时生效，确定授权吗？'
-          : 'LDAP 用户下次登录时将按目录组重新计算管理员身份，确定取消吗？'
+          ? 'LDAP 用户在目录组（memberOf）中时自动成为管理员。手动授予将成为显式覆盖：即使不在目录组也保持管理员，直到你恢复目录同步，确定授权吗？'
+          : '手动撤销将成为显式覆盖：即使在目录组中也不再是管理员，直到你恢复目录同步，确定取消吗？'
         : grant
           ? `将 ${u.username} 设为管理员？管理员可访问全部管理功能。`
           : `取消 ${u.username} 的管理员身份？其现有会话的管理权限立即失效。`
@@ -87,6 +87,30 @@ async function toggleAdmin(u: UserWithUsage) {
       body: JSON.stringify({ is_admin: grant }),
     })
     ElMessage.success(grant ? '已设为管理员' : '已取消管理员')
+    await loadUsers()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+  }
+}
+
+/** 恢复目录同步：清除手动权限覆盖，管理员身份回到目录组（memberOf）真值 */
+async function resetAdminSource(u: UserWithUsage) {
+  try {
+    await ElMessageBox.confirm(
+      `将清除 ${u.username} 的手动权限设置，管理员身份回到目录组（memberOf）真值，确定？`,
+      '恢复目录同步',
+      { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    await request(`/api/admin/users/${u.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reset_admin_source: true }),
+    })
+    ElMessage.success('已恢复目录同步')
     await loadUsers()
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '操作失败')
@@ -295,10 +319,22 @@ onMounted(loadUsers)
             <el-tag v-else type="success" size="small">本地</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="角色" width="130">
+        <el-table-column label="角色" width="200">
           <template #default="{ row }">
             <el-tag v-if="row.is_admin" type="primary" size="small">管理员</el-tag>
             <el-tag v-else type="info" size="small">成员</el-tag>
+            <el-tooltip
+              v-if="row.is_admin"
+              :content="row.admin_source === 'manual'
+                ? '权限由控制台手动设置（覆盖目录真值）'
+                : '权限跟随 LDAP 目录组（memberOf）'"
+            >
+              <el-tag
+                :type="row.admin_source === 'manual' ? 'success' : 'warning'"
+                size="small"
+                style="margin-left: 4px"
+              >{{ row.admin_source === 'manual' ? '手动' : '目录' }}</el-tag>
+            </el-tooltip>
             <el-tooltip v-if="row.protected" content="内置 break-glass 管理员，禁止经管理端修改">
               <el-tag type="warning" size="small" style="margin-left: 4px">内置</el-tag>
             </el-tooltip>
@@ -319,7 +355,7 @@ onMounted(loadUsers)
         <el-table-column label="最后登录" min-width="140">
           <template #default="{ row }">{{ fmt(row.last_login_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="330" fixed="right">
+        <el-table-column label="操作" width="420" fixed="right">
           <template #default="{ row }">
             <template v-if="!row.protected">
               <el-button size="small" type="primary" plain @click="openAccess(row)">模型授权</el-button>
@@ -340,6 +376,12 @@ onMounted(loadUsers)
               <el-button size="small" type="warning" plain @click="toggleAdmin(row)">
                 {{ row.is_admin ? '取消管理员' : '设为管理员' }}
               </el-button>
+              <el-button
+                v-if="row.source === 'ldap' && row.admin_source === 'manual'"
+                size="small"
+                plain
+                @click="resetAdminSource(row)"
+              >恢复目录同步</el-button>
               <el-button size="small" @click="forceLogout(row)">强制下线</el-button>
               <el-button
                 v-if="row.source === 'local'"

@@ -8,6 +8,8 @@ export interface UserInfo {
   source: 'local' | 'ldap'
   ldap_dn: string | null
   is_admin: boolean
+  /** 管理员权限来源：directory = 跟随 LDAP 目录组；manual = 控制台手动覆盖 */
+  admin_source: 'directory' | 'manual'
   status: number
   last_login_at: string | null
   created_at: string
@@ -224,6 +226,8 @@ export interface UserWithUsage {
   display_name: string | null
   source: string
   is_admin: boolean
+  /** 管理员权限来源：directory = 跟随 LDAP 目录组；manual = 控制台手动覆盖 */
+  admin_source: 'directory' | 'manual'
   status: number
   last_login_at: string | null
   created_at: string
