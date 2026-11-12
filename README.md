@@ -130,6 +130,8 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GATEWAY_RELOAD_INTERVAL` | `30` | 路由/限流/供应商配置热加载周期（秒） |
 | `GATEWAY_WEB_DIR` | `web/dist` | 控制台静态资源目录；目录不存在时 `/` 返回服务信息 JSON |
 | `GATEWAY_JWT_SECRET` / `GATEWAY_ACCESS_TOKEN_TTL` / `GATEWAY_REFRESH_TOKEN_TTL` | 派生 / `900` / `2592000` | 控制台会话 |
+| `GATEWAY_STREAM_FIRST_BYTE_TIMEOUT` / `GATEWAY_STREAM_IDLE_TIMEOUT` | `300` / `300` | 流式首字节 / chunk 静默超时（秒，`0` = 禁用）；默认与客户端首事件/空闲看门狗对齐，长预填充与长思考不被网关提前判失败 |
+| `GATEWAY_STREAM_PRIME_TIMEOUT_MS` | `2000` | 上游 2xx 后的 priming 墙钟上限（毫秒，`0` = 不限）：到期即向客户端提交响应并进入流式（响应头 + 15s `: ping` 心跳），仅 SSE 生效；到期后到达的上游错误帧随流透传，不再切换候选 |
 | `LDAP_URL` / `LDAP_STARTTLS` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_BASE_DN` / `LDAP_USER_FILTER` / `LDAP_ADMIN_GROUPS` | — | LDAP 登录（AD 默认 `sAMAccountName`，OpenLDAP 用 `uid`；不配置则仅本地账号） |
 | `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` | `admin` / `change-me-now` | break-glass 本地管理员（无本地管理员时首次启动创建） |
 | `SEED_PROVIDER_NAME` / `SEED_PROVIDER_BASE_URL` / `SEED_PROVIDER_API_KEY` / `SEED_MODEL_PATTERN` | 空 | 首次启动种子上游（`providers` 表为空时生效） |

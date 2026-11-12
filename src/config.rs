@@ -53,6 +53,9 @@ pub struct AppConfig {
     pub stream_first_byte_timeout_secs: u64,
     /// 流式静默超时（秒）：相邻 chunk 间最大间隔；0 = 禁用
     pub stream_idle_timeout_secs: u64,
+    /// 流式 priming 墙钟上限（毫秒）：上游 2xx 后到点即提交响应并进入流式
+    ///（客户端立刻拿到响应头与心跳）；0 = 不限。仅 SSE 响应生效
+    pub stream_prime_timeout_ms: u64,
     /// L29：出站上游代理（http/https/socks5 URL，如 http://127.0.0.1:7890）；
     /// 未配置时不启用（需经代理出海的部署使用）
     pub upstream_proxy: Option<String>,
@@ -134,12 +137,17 @@ impl AppConfig {
             return Err("GATEWAY_ACCESS/REFRESH_TOKEN_TTL must be > 0 seconds".into());
         }
 
-        let stream_first_byte_timeout_secs: u64 = env("GATEWAY_STREAM_FIRST_BYTE_TIMEOUT", "60")
+        // 默认与客户端首事件/空闲看门狗（300s）对齐：长预填充/长思考不再被网关先杀
+        let stream_first_byte_timeout_secs: u64 = env("GATEWAY_STREAM_FIRST_BYTE_TIMEOUT", "300")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_STREAM_FIRST_BYTE_TIMEOUT: {e}"))?;
-        let stream_idle_timeout_secs: u64 = env("GATEWAY_STREAM_IDLE_TIMEOUT", "120")
+        let stream_idle_timeout_secs: u64 = env("GATEWAY_STREAM_IDLE_TIMEOUT", "300")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_STREAM_IDLE_TIMEOUT: {e}"))?;
+        // priming 墙钟 deadline：上游 2xx 后迟迟无产出性事件时，到点提交并开始流式
+        let stream_prime_timeout_ms: u64 = env("GATEWAY_STREAM_PRIME_TIMEOUT_MS", "2000")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_STREAM_PRIME_TIMEOUT_MS: {e}"))?;
         let upstream_proxy = std::env::var("GATEWAY_UPSTREAM_PROXY")
             .ok()
             .map(|v| v.trim().to_string())
@@ -255,6 +263,7 @@ impl AppConfig {
             breaker_failure_threshold,
             stream_first_byte_timeout_secs,
             stream_idle_timeout_secs,
+            stream_prime_timeout_ms,
             upstream_proxy,
             max_attempts,
             non_stream_timeout_secs,
