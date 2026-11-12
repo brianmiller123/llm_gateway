@@ -1351,6 +1351,10 @@ async fn proxy_authed(
             // 此前仅校验首个 chunk——"200 + 首块 role delta + 次块错误 envelope"
             // 的上游会把 failed 透传给客户端且熔断器不记故障
             let is_sse = content_type.contains("text/event-stream");
+            // 透明 SSE 透传（非转换 + SSE）的熔断信号由 `SseErrorTail` 结算：
+            // 提交处不记 success，错误收尾上下文也按同一判定安装。判定只在这里
+            // 计算一次，提交点与安装点共用——避免两处各自推演条件而漂移
+            let tail_settles = !anthropic_converted && !converted && is_sse;
             let will_stream = is_sse || (!anthropic_converted && !converted);
             let mut resp = Some(resp);
             let mut stream_opt: Option<
@@ -1534,13 +1538,7 @@ async fn proxy_authed(
                 // record_success，首个 Err → record_failure），此处不得再记 success：
                 // 同一请求会被计 2 次 requests / 1 次 failure，连续计数每次归零、
                 // 错误率恒 0.5 < 0.6，"2xx 后必断流"的供应商两个维度都不熔断
-                settle_commit_signal(
-                    &st.breaker,
-                    provider.id,
-                    anthropic_converted,
-                    converted,
-                    &content_type,
-                );
+                settle_commit_signal(&st.breaker, provider.id, tail_settles);
                 stream_opt = Some(Box::pin(
                     futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(stream),
                 ));
@@ -1731,12 +1729,12 @@ async fn proxy_authed(
             let upstream = stream_opt.take().expect("stream preread present");
             // W1：SSE 透传流的错误在流内转成一条错误帧后正常结束（不再把 Err
             // 交给 hyper 硬断连接）；非 SSE 字节流保持原行为
-            let is_sse_body = content_type.contains("text/event-stream");
             // 错误帧与收尾副作用（熔断计数 / 关联日志）的上下文随流创建一次。
-            // 方言跟随客户端端点：透传出口同时服务原生 Anthropic
-            // （/v1/messages + api_type=anthropic 上游）与原生 Responses 客户端。
-            // 转换链路在更早的分支返回，走到这里的一定是原生透传。
-            let sse_error = is_sse_body.then(|| SseErrorContext {
+            // 安装判定复用提交点的 `tail_settles`（单一来源；走到这里已排除
+            // 转换链路——它们在上方分支返回）。方言跟随客户端端点：透传出口
+            // 同时服务原生 Anthropic（/v1/messages + api_type=anthropic 上游）
+            // 与原生 Responses 客户端。
+            let sse_error = tail_settles.then(|| SseErrorContext {
                 dialect: if endpoint.anthropic {
                     SseErrorDialect::Anthropic
                 } else if endpoint.responses {
@@ -1761,7 +1759,7 @@ async fn proxy_authed(
                 sse_error,
             );
             // 四-2：SSE 链路静默期向下游发 `: ping` 注释保活（长思考上游不中断连接）
-            let stream = if is_sse_body {
+            let stream = if is_sse {
                 Body::from_stream(with_ping_keepalive(stream, STREAM_PING_INTERVAL))
             } else {
                 Body::from_stream(stream)
@@ -3099,20 +3097,11 @@ fn sse_error_frame(ctx: &SseErrorContext, msg: &str) -> Bytes {
     }
 }
 
-/// 提交时结算熔断信号：透明 SSE 透传（`!anthropic_converted && !converted` 且
-/// content-type 为 SSE——即会装上 `SseErrorTail` 的路径）**不在此记 success**，
-/// 成功/失败都由 tail 在流终止时各记一次，保证每个请求只产生一个熔断信号。
-/// 非 SSE / 转换链路保持原语义（转换流自行收尾，不装 tail）。
-fn settle_commit_signal(
-    breaker: &Breaker,
-    provider_id: i64,
-    anthropic_converted: bool,
-    converted: bool,
-    content_type: &str,
-) {
-    let tail_settles = !anthropic_converted
-        && !converted
-        && content_type.contains("text/event-stream");
+/// 提交时结算熔断信号：`tail_settles`（透明 SSE 透传——会装上 `SseErrorTail`）
+/// 为真时**不在此记 success**，成功/失败都由 tail 在流终止时各记一次，保证每个
+/// 请求只产生一个熔断信号。非 SSE / 转换链路保持原语义（转换流自行收尾，不装
+/// tail）。`tail_settles` 由调用方与错误收尾上下文的安装点共用同一判定。
+fn settle_commit_signal(breaker: &Breaker, provider_id: i64, tail_settles: bool) {
     if !tail_settles {
         breaker.record_success(provider_id);
     }
@@ -3979,12 +3968,12 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     }
 
     /// 生产调用序列的最小复刻：一次已提交的透明 SSE 透传请求 =
-    /// 提交结算（透明 SSE 不记 success）+ `SseErrorTail` 驱动到终止（EOF / 首个 Err）
+    /// 提交结算（`tail_settles` → 不记 success）+ `SseErrorTail` 驱动到终止
     async fn drive_committed_sse(
         breaker: &Arc<Breaker>,
         events: Vec<Result<Bytes, Box<dyn Error + Send + Sync>>>,
     ) {
-        settle_commit_signal(breaker, 7, false, false, "text/event-stream");
+        settle_commit_signal(breaker, 7, true);
         let mut tail = Box::pin(SseErrorTail {
             inner: Box::pin(futures_util::stream::iter(events)),
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
