@@ -35,7 +35,8 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
         match ldap::authenticate(&ldap_settings, username, password).await {
             Ok(identity) => {
                 // 旧有效权限用于判断目录组是否改变了管理员身份（目录升降权需即时
-                // 反映到代理旁路的 admin_ids 缓存，不必等周期 reload）。
+                // 反映到代理旁路的 admin_ids 缓存，不必等周期 reload）。首次出现的
+                // 用户 was = None：不触发刷新，避免新用户首登白跑一次全表查询。
                 let was_admin = users::find_by_username(&st.pool, username)
                     .await
                     .map_err(AppError::internal)?
@@ -50,7 +51,7 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
                 )
                 .await
                 .map_err(AppError::internal)?;
-                if was_admin != Some(user.is_admin) {
+                if was_admin.is_some() && was_admin != Some(user.is_admin) {
                     if let Err(e) = st.reload_admin_ids().await {
                         tracing::warn!(username, error = %e, "admin_ids refresh failed after LDAP login");
                     }

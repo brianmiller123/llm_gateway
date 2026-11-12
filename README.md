@@ -130,7 +130,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GATEWAY_RELOAD_INTERVAL` | `30` | 路由/限流/供应商配置热加载周期（秒） |
 | `GATEWAY_WEB_DIR` | `web/dist` | 控制台静态资源目录；目录不存在时 `/` 返回服务信息 JSON |
 | `GATEWAY_JWT_SECRET` / `GATEWAY_ACCESS_TOKEN_TTL` / `GATEWAY_REFRESH_TOKEN_TTL` | 派生 / `900` / `2592000` | 控制台会话 |
-| `LDAP_URL` / `LDAP_STARTTLS` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_BASE_DN` / `LDAP_USER_FILTER` / `LDAP_ADMIN_GROUPS` | — | LDAP 登录（AD 默认 `sAMAccountName`，OpenLDAP 用 `uid`；不配置则仅本地账号）。管理员权限双来源：`LDAP_ADMIN_GROUPS` 命中的目录组成员每次登录自动授予、移出后下次登录自动撤销；管理端手动授予/撤销是显式覆盖，后续登录不再改写，直到用户列表点「恢复目录同步」回到目录真值。`/api/me` 与用户列表的 `admin_source`（`directory` / `manual`）标注当前来源 |
+| `LDAP_URL` / `LDAP_STARTTLS` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_BASE_DN` / `LDAP_USER_FILTER` / `LDAP_ADMIN_GROUPS` | — | LDAP 登录（AD 默认 `sAMAccountName`，OpenLDAP 用 `uid`；不配置则仅本地账号）。管理员权限双来源：`LDAP_ADMIN_GROUPS` 命中的目录组成员每次登录自动授予、移出后下次登录自动撤销；管理端手动授予/撤销是显式覆盖，后续登录不再改写，直到用户列表点「恢复目录同步」回到目录真值。`/api/me` 与用户列表的 `admin_source`（`directory` / `manual`）标注当前来源。升级提示：迁移前对 LDAP 用户的手动授予/撤销无法与目录真值区分，回填后一律记为 `directory`，该用户升级后首次登录会按目录组重算权限（可能静默变权）；需要保留手动结果的管理员请在升级后重新手动授予一次 |
 | `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` | `admin` / `change-me-now` | break-glass 本地管理员（无本地管理员时首次启动创建） |
 | `SEED_PROVIDER_NAME` / `SEED_PROVIDER_BASE_URL` / `SEED_PROVIDER_API_KEY` / `SEED_MODEL_PATTERN` | 空 | 首次启动种子上游（`providers` 表为空时生效） |
 

@@ -324,16 +324,24 @@ onMounted(loadUsers)
             <el-tag v-if="row.is_admin" type="primary" size="small">管理员</el-tag>
             <el-tag v-else type="info" size="small">成员</el-tag>
             <el-tooltip
-              v-if="row.is_admin"
-              :content="row.admin_source === 'manual'
-                ? '权限由控制台手动设置（覆盖目录真值）'
-                : '权限跟随 LDAP 目录组（memberOf）'"
+              v-if="row.admin_source === 'manual' && (row.is_admin || row.source === 'ldap')"
+              :content="row.source === 'ldap'
+                ? (row.is_admin
+                  ? '权限由控制台手动授予，覆盖 LDAP 目录真值（memberOf）'
+                  : '权限被控制台手动撤销，覆盖 LDAP 目录真值；可点「恢复目录同步」回到目录组结果')
+                : '本地账号没有目录真值，管理员权限由控制台手动设置'"
             >
               <el-tag
-                :type="row.admin_source === 'manual' ? 'success' : 'warning'"
+                :type="row.is_admin ? 'success' : 'info'"
                 size="small"
                 style="margin-left: 4px"
-              >{{ row.admin_source === 'manual' ? '手动' : '目录' }}</el-tag>
+              >{{ row.is_admin ? '手动' : '已撤销(手动)' }}</el-tag>
+            </el-tooltip>
+            <el-tooltip
+              v-else-if="row.is_admin"
+              content="权限跟随 LDAP 目录组（memberOf）"
+            >
+              <el-tag type="warning" size="small" style="margin-left: 4px">目录</el-tag>
             </el-tooltip>
             <el-tooltip v-if="row.protected" content="内置 break-glass 管理员，禁止经管理端修改">
               <el-tag type="warning" size="small" style="margin-left: 4px">内置</el-tag>
