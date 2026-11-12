@@ -83,7 +83,7 @@
 **W1**
 - 单测：priming deadline 到期提交（空缓冲/中性帧 SSE）、非 SSE 不提前提交、超时→`saw_timeout`、透传流 Err→方言错误帧（脱敏、无 Err 泄漏）、熔断按真实序列每次请求只记一个信号（成功/失败/半开 drop 释放）、ping 只在行边界注入。
 - e2e（mock 上游新增模式，`scripts/mock_upstream.py`）：①首字节 90s ②首 chunk 后静默 150s 再继续 ③持续中性帧 60s ④正常短流。判据：①②不产生 502、客户端在 ≤3s 内收到响应头、静默期每 ~15s 收到 `: ping`、最终完整结束；③不出现“无响应头”；真卡死（首字节 > 配置窗口，且 `first_byte < prime` 或 `PRIME=0`）在窗口内 504；默认配置下则为 `200 + 方言错误帧`。
-- `cargo test`（既有 + 新增）、`cargo build` 零警告；`scripts/test_conformance.py` 通过。
+- `cargo test`（既有 + 新增）、`cargo build` 无新增警告（基线既有 2 条 dead_code）；`scripts/test_conformance.py` 通过。
 - 真实链路：经网关 `localtest/deepseek-flash` 跑一次长上下文请求（≥100K 输入）确认流式无中断；omp 魔棒同 provider 复测成功（<120s）。
 
 **W2**
@@ -103,6 +103,9 @@
 | 仅中性帧的无限流（commit 后无产出） | 网关无“产出性空闲”计时；客户端 watchdog/断开兜底，终止性错误按净记账进熔断 | 下一计划（需评估逐帧解析成本） |
 | 错误构造器统一（Anthropic 已逐字段一致；Responses 错误码已对齐 `stream_error`，终止事件名不同：透传 `event: error` vs 转换 `response.failed`） | 构造器仍按链路各自维护 | 下一计划 |
 | 转换链（Anthropic/Responses）提交后传输失败不计熔断 | 既有行为，本次只覆盖透明 SSE | 下一计划（与构造器统一同批） |
+| 半开探测名额占用整条透明 SSE 流且不绑定请求（并行 drop 可提前释放；pre-commit 断开不释放） | 只影响半开探测并发度，不绕过熔断；`release_probe` 仅清标志 | 下一计划（token/guard 归属） |
+| 上游自报错误 message 进入 pre-commit 失败体时不做二次脱敏 | 需上游回显我方凭据才可泄露；当前零泄漏 | 观察 |
+| `reload_admin_ids` 的 `seen_gen` 读序无测试锁定 | 静态审核确认正确；时序回归会被两向 helper 测试部分覆盖 | 下一计划（补 seam 测试） |
 | 目录管理员“钉住为覆盖”交互 | UX 改进，非缺陷 | 有反馈时 |
 
 ## 8. 交付
