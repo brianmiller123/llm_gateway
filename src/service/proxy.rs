@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -14,6 +14,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::service::responses::dto::{ResponsesResponseOut, ResponsesStreamEventOut};
 use crate::service::usage;
 use crate::state::AppState;
 use crate::store::upstream::Provider;
@@ -157,8 +158,17 @@ fn is_timeout_node(e: &(dyn Error + 'static)) -> bool {
         || timeout_text(&e.to_string())
 }
 
-/// 判定错误是否为上游超时（header 等待 / 首字节 / 静默）：沿 source 链检查
-/// `reqwest::Error::is_timeout` 与既有超时文案。priming 与 header 失败分类共用。
+/// 判定错误是否为上游超时（header 等待 / 首字节 / 静默）：沿 `source()` 链检查
+/// `reqwest::Error::is_timeout` 与既有超时文案。
+///
+/// 两个调用点的能力不同：
+/// - priming 路径（流内 `Err`）：`StreamTimeoutStream` 用 `Box::from(e)` 保留了
+///   reqwest 类型，downcast 生效，类型判定可靠；
+/// - header 失败路径：`send_upstream` 已用
+///   `redact_secrets(format!("upstream request failed: {e}"), …).into()` 把 reqwest
+///   错误压平成字符串，`source()` 链为空、`downcast_ref` 永不命中——该路径上
+///   **只有文案匹配有效**（错误文案保留 reqwest 的 "header timeout" 措辞）。
+///   若要类型化，须先在 `send_upstream` 保留 reqwest source，本函数无需改动。
 fn is_timeout_error(err: &(dyn Error + Send + Sync + 'static)) -> bool {
     let mut cur: Option<&(dyn Error + 'static)> = Some(err);
     while let Some(e) = cur {
@@ -1330,10 +1340,17 @@ async fn proxy_authed(
                     let item = if let Some(deadline) = prime_deadline.as_mut() {
                         let mut pinned = stream.as_mut();
                         let mut next = pinned.next();
+                        // `biased` 下分支顺序即轮询顺序：deadline 必须排在 item 之前。
+                        // item 先轮询时，上游若把大批中性帧一次性压进 hyper 读缓冲，
+                        // 每轮 poll 都 Ready，deadline 的 Sleep 永不被 poll（waker 不
+                        // 注册），2s 墙钟上限被同步就绪洪水饿死。deadline 先轮询后：
+                        // - 未到期且 item Pending → select 正常挂起，无忙循环；
+                        // - 到期 → 只走 None 分支，随后要么提交退出、要么清空
+                        //   prime_deadline，已完成的 Sleep 不会再被 poll。
                         tokio::select! {
                             biased;
-                            item = &mut next => Some(item),
                             _ = deadline.as_mut() => None,
+                            item = &mut next => Some(item),
                         }
                     } else {
                         Some(stream.as_mut().next().await)
@@ -1669,6 +1686,18 @@ async fn proxy_authed(
             // W1：SSE 透传流的错误在流内转成一条错误帧后正常结束（不再把 Err
             // 交给 hyper 硬断连接）；非 SSE 字节流保持原行为
             let is_sse_body = content_type.contains("text/event-stream");
+            // 错误帧方言跟随客户端端点：透传出口同时服务原生 Anthropic
+            // （/v1/messages + api_type=anthropic 上游）与原生 Responses 客户端。
+            // 转换链路在更早的分支返回，走到这里的一定是原生透传。
+            let error_dialect = is_sse_body.then(|| {
+                if endpoint.anthropic {
+                    SseErrorDialect::Anthropic
+                } else if endpoint.responses {
+                    SseErrorDialect::Responses
+                } else {
+                    SseErrorDialect::Chat
+                }
+            });
             let stream = wrap_stream(
                 st.clone(),
                 meta,
@@ -1676,7 +1705,7 @@ async fn proxy_authed(
                 latency,
                 status.as_u16(),
                 capture_usage,
-                is_sse_body,
+                error_dialect,
             );
             // 四-2：SSE 链路静默期向下游发 `: ping` 注释保活（长思考上游不中断连接）
             let stream = if is_sse_body {
@@ -2951,20 +2980,108 @@ impl Stream for BillingStream {
     }
 }
 
-/// SSE 错误帧：透传链路在响应已提交后遇到上游错误时，用一条 OpenAI 风格错误
-/// 事件收尾（不追加 `[DONE]`——流本就未正常结束）。
-fn sse_error_frame(msg: &str) -> Bytes {
-    let payload = serde_json::json!({
-        "error": {"message": msg, "type": "upstream_error", "code": "upstream_error"}
-    });
-    Bytes::from(format!("data: {payload}\n\n"))
+/// SSE 透传出口的错误帧方言：跟随客户端端点，客户端 SDK 才能把终止事件归为
+/// typed error（而不是没有 event 名的裸 data 帧）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SseErrorDialect {
+    /// `/v1/chat/completions`（OpenAI 兼容）：仅 data 帧
+    Chat,
+    /// 原生 Anthropic `/v1/messages`（api_type=anthropic 上游透传）
+    Anthropic,
+    /// 原生 Responses `/v1/responses`（原生 Responses 上游透传）
+    Responses,
 }
 
-/// 上游流错误收尾：SSE 响应把 `Err` 转成一条错误帧后正常结束（不再把 `Err`
-/// 交给 hyper 导致 chunked body 硬断）；非 SSE 原样传播 `Err`。
+/// 构造 SSE 错误帧所需的静态上下文：随流创建一次，此后每条 Err 复用。
+struct SseErrorContext {
+    dialect: SseErrorDialect,
+    /// Responses 事件体的 `response.id`（与转换链路同源的 `resp_<request_id>`）
+    response_id: String,
+    model: String,
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// SSE 错误帧：透传链路在响应已提交后遇到上游错误时，用一条**客户端方言对应**
+/// 的终态错误事件收尾（不追加 `[DONE]`/`message_stop`——流本就未正常结束）。
+/// 三种形状的字段与各自转换链路（`anthropic/stream.rs`、`responses/stream.rs`）对齐。
+fn sse_error_frame(ctx: &SseErrorContext, msg: &str) -> Bytes {
+    match ctx.dialect {
+        // Chat：仅 data 帧、无 event 名（OpenAI SDK 按帧内 error 字段归错）
+        SseErrorDialect::Chat => {
+            let payload = serde_json::json!({
+                "error": {"message": msg, "type": "upstream_error", "code": "upstream_error"}
+            });
+            Bytes::from(format!("data: {payload}\n\n"))
+        }
+        // Anthropic：`event: error` + `{"type":"error","error":{…}}` 外层；
+        // 传输层/上游故障在 Anthropic 原生方言里归 api_error
+        SseErrorDialect::Anthropic => {
+            let payload = serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": msg}
+            });
+            Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+        }
+        // Responses：合法 response.failed 事件体，复用 responses::dto 结构序列化
+        SseErrorDialect::Responses => {
+            let response = ResponsesResponseOut {
+                id: ctx.response_id.clone(),
+                object: "response",
+                created_at: unix_now(),
+                status: "failed".into(),
+                error: Some(serde_json::json!({
+                    "code": "upstream_error",
+                    "message": msg
+                })),
+                incomplete_details: None,
+                instructions: None,
+                max_output_tokens: None,
+                model: ctx.model.clone(),
+                output: Vec::new(),
+                parallel_tool_calls: None,
+                previous_response_id: None,
+                reasoning: None,
+                store: None,
+                temperature: None,
+                tool_choice: None,
+                tools: None,
+                top_p: None,
+                truncation: None,
+                usage: None,
+                user: None,
+                metadata: None,
+            };
+            let event = ResponsesStreamEventOut {
+                r#type: "response.failed".into(),
+                response: Some(response),
+                delta: None,
+                item: None,
+                output_index: None,
+                content_index: None,
+                summary_index: None,
+                item_id: None,
+                part: None,
+                input: None,
+                text: None,
+                arguments: None,
+            };
+            Bytes::from(crate::service::responses::dto::sse_frame(&event))
+        }
+    }
+}
+
+/// 上游流错误收尾：SSE 响应把 `Err` 转成一条方言对应的错误帧后正常结束（不再把
+/// `Err` 交给 hyper 导致 chunked body 硬断）；非 SSE（`error_ctx == None`）原样
+/// 传播 `Err`。
 struct SseErrorTail<S> {
     inner: Pin<Box<S>>,
-    enabled: bool,
+    error_ctx: Option<SseErrorContext>,
     finished: bool,
 }
 
@@ -2983,14 +3100,14 @@ where
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Err(e))) => {
                 this.finished = true;
-                if !this.enabled {
+                let Some(ctx) = &this.error_ctx else {
                     return Poll::Ready(Some(Err(e)));
-                }
+                };
                 tracing::warn!(
                     error = %e,
                     "upstream stream error after commit; emitting SSE error frame"
                 );
-                Poll::Ready(Some(Ok(sse_error_frame(&e.to_string()))))
+                Poll::Ready(Some(Ok(sse_error_frame(ctx, &e.to_string()))))
             }
             Poll::Ready(None) => {
                 this.finished = true;
@@ -3006,8 +3123,8 @@ where
 ///   终态事件（[DONE]/response.*/message_stop）或流尾兜底记账（仅一次），字节流原样透传
 /// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
 /// - 流异常中断时由 chain 兜底记账（含 EOF flush 后的 captured）；客户端断开由 BillingOnDrop 兜底
-/// - sse_errors = true（SSE 响应）：上游 `Err` 转成一条错误帧后正常结束；
-///   非 SSE 流保持原行为（`Err` 交给 hyper）
+/// - `sse_error_dialect = Some(方言)`（SSE 响应）：上游 `Err` 转成一条该方言的错误帧后
+///   正常结束；`None`（非 SSE 流）保持原行为（`Err` 交给 hyper）
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
@@ -3015,11 +3132,16 @@ fn wrap_stream(
     latency: i64,
     record_status: u16,
     capture_usage: bool,
-    sse_errors: bool,
+    sse_error_dialect: Option<SseErrorDialect>,
 ) -> BillingStream {
+    let error_ctx = sse_error_dialect.map(|dialect| SseErrorContext {
+        dialect,
+        response_id: format!("resp_{}", meta.request_id),
+        model: meta.model.clone(),
+    });
     let upstream = SseErrorTail {
         inner: Box::pin(upstream),
-        enabled: sse_errors,
+        error_ctx,
         finished: false,
     };
     // 逐 chunk 共享上下文：流适配器每帧只能克隆一个 Arc，替代此前每帧克隆
@@ -3795,7 +3917,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ]);
         let mut tail = Box::pin(SseErrorTail {
             inner: Box::pin(inner),
-            enabled: true,
+            error_ctx: Some(SseErrorContext {
+                dialect: SseErrorDialect::Chat,
+                response_id: "resp_test".into(),
+                model: "gpt-x".into(),
+            }),
             finished: false,
         });
         assert_eq!(tail.next().await.unwrap().unwrap(), head);
@@ -3816,19 +3942,113 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         )]);
         let mut tail = Box::pin(SseErrorTail {
             inner: Box::pin(inner),
-            enabled: false,
+            error_ctx: None,
             finished: false,
         });
         assert!(tail.next().await.unwrap().is_err());
         assert!(tail.next().await.is_none());
     }
 
-    /// W1：priming deadline 到期判定——仅 SSE 提交，非 SSE 保持原判定
+    /// 透传错误帧按客户端方言选形状：三种帧的 event 名与字段各自成立
     #[test]
-    fn prime_deadline_commits_only_for_sse() {
-        assert!(prime_deadline_commits(true, true));
-        assert!(!prime_deadline_commits(true, false));
-        assert!(!prime_deadline_commits(false, true));
+    fn sse_error_frame_shapes_follow_client_dialect() {
+        let ctx = |dialect| SseErrorContext {
+            dialect,
+            response_id: "resp_test".into(),
+            model: "gpt-x".into(),
+        };
+
+        // Chat：只有 data 帧，无 event 名
+        let chat = sse_error_frame(&ctx(SseErrorDialect::Chat), "boom");
+        let chat = String::from_utf8(chat.to_vec()).unwrap();
+        assert!(
+            chat.starts_with("data: ") && chat.ends_with("\n\n"),
+            "{chat}"
+        );
+        assert!(!chat.contains("event: "), "Chat 帧不得带 event 名: {chat}");
+        let v: Value = serde_json::from_str(chat["data: ".len()..].trim_end()).unwrap();
+        assert_eq!(v["error"]["type"], "upstream_error");
+        assert_eq!(v["error"]["code"], "upstream_error");
+        assert_eq!(v["error"]["message"], "boom");
+        assert!(v.get("type").is_none(), "Chat 帧不得有 Anthropic 顶层 type");
+
+        // Anthropic：event: error + type/error 外层
+        let anthropic = sse_error_frame(&ctx(SseErrorDialect::Anthropic), "boom");
+        let anthropic = String::from_utf8(anthropic.to_vec()).unwrap();
+        assert!(
+            anthropic.starts_with("event: error\ndata: ") && anthropic.ends_with("\n\n"),
+            "{anthropic}"
+        );
+        let v: Value =
+            serde_json::from_str(anthropic["event: error\ndata: ".len()..].trim_end()).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "api_error");
+        assert_eq!(v["error"]["message"], "boom");
+
+        // Responses：event: response.failed + 合法事件体（含 response.id/status/error）
+        let responses = sse_error_frame(&ctx(SseErrorDialect::Responses), "boom");
+        let responses = String::from_utf8(responses.to_vec()).unwrap();
+        assert!(
+            responses.starts_with("event: response.failed\ndata: ") && responses.ends_with("\n\n"),
+            "{responses}"
+        );
+        let v: Value =
+            serde_json::from_str(responses["event: response.failed\ndata: ".len()..].trim_end())
+                .unwrap();
+        assert_eq!(v["type"], "response.failed");
+        assert_eq!(v["response"]["id"], "resp_test");
+        assert_eq!(v["response"]["object"], "response");
+        assert_eq!(v["response"]["status"], "failed");
+        assert_eq!(v["response"]["model"], "gpt-x");
+        assert_eq!(v["response"]["error"]["code"], "upstream_error");
+        assert_eq!(v["response"]["error"]["message"], "boom");
+        assert!(
+            v["response"]["output"].is_array(),
+            "终态 response 必带 output"
+        );
+    }
+
+    /// 方言接线：同一上游 Err 经 tail 转成对应 event 名；非 SSE 不转换
+    #[tokio::test]
+    async fn sse_error_tail_emits_dialect_frames_and_passes_non_sse_errors() {
+        for (dialect, prefix) in [
+            (SseErrorDialect::Anthropic, "event: error\n"),
+            (SseErrorDialect::Responses, "event: response.failed\n"),
+        ] {
+            let inner =
+                futures_util::stream::iter(vec![Err::<Bytes, _>(
+                    Box::<dyn Error + Send + Sync>::from("upstream stream idle timeout"),
+                )]);
+            let mut tail = Box::pin(SseErrorTail {
+                inner: Box::pin(inner),
+                error_ctx: Some(SseErrorContext {
+                    dialect,
+                    response_id: "resp_tail".into(),
+                    model: "m".into(),
+                }),
+                finished: false,
+            });
+            let frame = tail.next().await.unwrap().expect("Err 转为方言错误帧");
+            let text = String::from_utf8(frame.to_vec()).unwrap();
+            assert!(text.starts_with(prefix), "{dialect:?}: {text}");
+            assert!(text.ends_with("\n\n"), "{dialect:?}: {text}");
+            assert!(
+                tail.next().await.is_none(),
+                "{dialect:?}: 错误帧后流必须结束"
+            );
+        }
+
+        // 非 SSE（error_ctx None）：Err 原样传播，不做帧转换
+        let inner = futures_util::stream::iter(vec![Err::<Bytes, _>(
+            Box::<dyn Error + Send + Sync>::from("boom"),
+        )]);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(inner),
+            error_ctx: None,
+            finished: false,
+        });
+        assert!(tail.next().await.unwrap().is_err());
+        assert!(tail.next().await.is_none());
     }
 
     /// 按用户×模型并发 guard：同用户同模型累加、同用户异模型独立计数、
