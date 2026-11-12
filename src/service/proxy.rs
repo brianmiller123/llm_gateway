@@ -21,7 +21,8 @@ use crate::store::usage::{Usage, UsageMeta};
 
 /// 流式超时默认值（秒）：0 = 禁用。实际值取自 AppConfig
 ///（GATEWAY_STREAM_FIRST_BYTE_TIMEOUT / GATEWAY_STREAM_IDLE_TIMEOUT），
-/// 与 cc-switch ProxyConfig 同款（首字节 60 / 静默 120 默认）。
+/// 默认 300 / 300——与客户端首事件/空闲看门狗对齐（原 cc-switch 60 / 120
+/// 会把合法长预填充/长思考判成失败）。
 
 /// Chat 上游流式链路的心跳间隔：连续静默超过该间隔向下游发 `: ping` 注释行
 ///（SSE 注释行被 OpenAI/Anthropic 客户端解析器忽略，仅保活中间设备与客户端超时）
@@ -128,6 +129,45 @@ fn stream_timeouts(st: &AppState) -> (Option<Duration>, Option<Duration>) {
     let idle = (st.cfg.stream_idle_timeout_secs > 0)
         .then_some(Duration::from_secs(st.cfg.stream_idle_timeout_secs));
     (first_byte, idle)
+}
+
+/// priming 墙钟上限（GATEWAY_STREAM_PRIME_TIMEOUT_MS；0 = 不限）
+fn stream_prime_deadline(st: &AppState) -> Option<Duration> {
+    (st.cfg.stream_prime_timeout_ms > 0)
+        .then(|| Duration::from_millis(st.cfg.stream_prime_timeout_ms))
+}
+
+/// priming deadline 到期时的提交判定：SSE 响应一律提交——缓冲为空或仅有中性帧
+///（role delta / `: ping`）同样提交，客户端立刻拿到响应头 + 心跳；非 SSE 保持
+/// 「等 JSON 体 / 零产出」判定不变（上游 200 但忽略 stream 参数的识别路径）。
+fn prime_deadline_commits(expired: bool, is_sse: bool) -> bool {
+    expired && is_sse
+}
+
+/// 既有超时文案（header 等待 / 首字节 / 静默）
+fn timeout_text(text: &str) -> bool {
+    text.contains("header timeout")
+        || text.contains("stream first byte timeout")
+        || text.contains("stream idle timeout")
+}
+
+fn is_timeout_node(e: &(dyn Error + 'static)) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+        || timeout_text(&e.to_string())
+}
+
+/// 判定错误是否为上游超时（header 等待 / 首字节 / 静默）：沿 source 链检查
+/// `reqwest::Error::is_timeout` 与既有超时文案。priming 与 header 失败分类共用。
+fn is_timeout_error(err: &(dyn Error + Send + Sync + 'static)) -> bool {
+    let mut cur: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if is_timeout_node(e) {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
 }
 
 /// 心跳包装流：上游连续静默超过 `interval` 时向下游产出一条 `: ping` SSE
@@ -1224,7 +1264,7 @@ async fn proxy_authed(
                 Ok(SentOutcome::PreRead { .. }) => unreachable!("handled above"),
                 Err(e) => {
                     // M26：超时 vs 连接错误分类（全部候选失败后 504 / 502 / 503）
-                    if e.to_string().contains("header timeout") {
+                    if is_timeout_error(e.as_ref()) {
                         saw_timeout = true;
                     } else {
                         saw_connect_error = true;
@@ -1276,11 +1316,43 @@ async fn proxy_authed(
                 let mut buffered_bytes = 0usize;
                 let mut primer = PrimeState::default();
                 let mut committed = false;
+                // W1：priming 墙钟 deadline——上游 2xx 后迟迟没有首个“产出性”
+                // 事件（长预填充 / 长思考 / 中性帧洪水）时，到点即提交并进入流式，
+                // 客户端立刻拿到响应头 + 15s 心跳，不再被误判 502。
+                // 代价：deadline 之后到达的 200 + 错误帧已随流透传，不再触发
+                // 候选切换（换取有界首字节与不再“无响应头”）。
+                let mut prime_deadline =
+                    stream_prime_deadline(st).map(|d| Box::pin(tokio::time::sleep(d)));
                 while !committed {
                     if buffered_bytes >= STREAM_PRIME_MAX_BYTES {
                         break;
                     }
-                    match stream.as_mut().next().await {
+                    let item = if let Some(deadline) = prime_deadline.as_mut() {
+                        let mut pinned = stream.as_mut();
+                        let mut next = pinned.next();
+                        tokio::select! {
+                            biased;
+                            item = &mut next => Some(item),
+                            _ = deadline.as_mut() => None,
+                        }
+                    } else {
+                        Some(stream.as_mut().next().await)
+                    };
+                    let Some(item) = item else {
+                        if prime_deadline_commits(true, is_sse) {
+                            tracing::info!(
+                                provider = %provider.name,
+                                buffered_bytes,
+                                "stream priming deadline reached; committing to client"
+                            );
+                            committed = true;
+                            continue;
+                        }
+                        // 非 SSE：deadline 不适用（保持原「等 JSON 体 / 零产出」判定）
+                        prime_deadline = None;
+                        continue;
+                    };
+                    match item {
                         Some(Ok(chunk)) => {
                             if buffered.is_empty() {
                                 // L3：首块到达 → 首 token 延迟（cc-switch first_token_ms 同款）
@@ -1334,14 +1406,16 @@ async fn proxy_authed(
                                 format!("upstream stream failed before productive output: {e}");
                             tracing::warn!(provider = %provider.name, error = %e, "stream priming transport error");
                             last_failed = Some(provider);
+                            // 超时（首字节/静默）→ 504；传输错误与零产出断流 → 502
+                            let timed_out = is_timeout_error(e.as_ref());
                             last_failure = Some((
-                                502,
+                                if timed_out { 504 } else { 502 },
                                 upstream_error_envelope(&msg),
                                 "application/json".to_string(),
                                 Vec::new(),
                             ));
                             st.breaker.record_failure(provider.id);
-                            if e.to_string().contains("header timeout") {
+                            if timed_out {
                                 saw_timeout = true;
                             } else {
                                 saw_connect_error = true;
@@ -1592,6 +1666,9 @@ async fn proxy_authed(
             // 非 2xx：不透传 usage 计费（错误体里的 usage 不可信），按真实状态记账、token 记 0
             let capture_usage = status.is_success();
             let upstream = stream_opt.take().expect("stream preread present");
+            // W1：SSE 透传流的错误在流内转成一条错误帧后正常结束（不再把 Err
+            // 交给 hyper 硬断连接）；非 SSE 字节流保持原行为
+            let is_sse_body = content_type.contains("text/event-stream");
             let stream = wrap_stream(
                 st.clone(),
                 meta,
@@ -1599,9 +1676,10 @@ async fn proxy_authed(
                 latency,
                 status.as_u16(),
                 capture_usage,
+                is_sse_body,
             );
             // 四-2：SSE 链路静默期向下游发 `: ping` 注释保活（长思考上游不中断连接）
-            let stream = if content_type.contains("text/event-stream") {
+            let stream = if is_sse_body {
                 Body::from_stream(with_ping_keepalive(stream, STREAM_PING_INTERVAL))
             } else {
                 Body::from_stream(stream)
@@ -2873,11 +2951,63 @@ impl Stream for BillingStream {
     }
 }
 
+/// SSE 错误帧：透传链路在响应已提交后遇到上游错误时，用一条 OpenAI 风格错误
+/// 事件收尾（不追加 `[DONE]`——流本就未正常结束）。
+fn sse_error_frame(msg: &str) -> Bytes {
+    let payload = serde_json::json!({
+        "error": {"message": msg, "type": "upstream_error", "code": "upstream_error"}
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// 上游流错误收尾：SSE 响应把 `Err` 转成一条错误帧后正常结束（不再把 `Err`
+/// 交给 hyper 导致 chunked body 硬断）；非 SSE 原样传播 `Err`。
+struct SseErrorTail<S> {
+    inner: Pin<Box<S>>,
+    enabled: bool,
+    finished: bool,
+}
+
+impl<S> Stream for SseErrorTail<S>
+where
+    S: Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>>,
+{
+    type Item = Result<Bytes, Box<dyn Error + Send + Sync>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // 全字段 Unpin，get_mut 安全
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Err(e))) => {
+                this.finished = true;
+                if !this.enabled {
+                    return Poll::Ready(Some(Err(e)));
+                }
+                tracing::warn!(
+                    error = %e,
+                    "upstream stream error after commit; emitting SSE error frame"
+                );
+                Poll::Ready(Some(Ok(sse_error_frame(&e.to_string()))))
+            }
+            Poll::Ready(None) => {
+                this.finished = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
 /// 流式透传 + 流内 usage 捕获与记账：
 /// - capture_usage = true（上游 2xx）：逐帧合并 usage（后帧非 None 字段覆盖），
 ///   终态事件（[DONE]/response.*/message_stop）或流尾兜底记账（仅一次），字节流原样透传
 /// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
 /// - 流异常中断时由 chain 兜底记账（含 EOF flush 后的 captured）；客户端断开由 BillingOnDrop 兜底
+/// - sse_errors = true（SSE 响应）：上游 `Err` 转成一条错误帧后正常结束；
+///   非 SSE 流保持原行为（`Err` 交给 hyper）
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
@@ -2885,7 +3015,13 @@ fn wrap_stream(
     latency: i64,
     record_status: u16,
     capture_usage: bool,
+    sse_errors: bool,
 ) -> BillingStream {
+    let upstream = SseErrorTail {
+        inner: Box::pin(upstream),
+        enabled: sse_errors,
+        finished: false,
+    };
     // 逐 chunk 共享上下文：流适配器每帧只能克隆一个 Arc，替代此前每帧克隆
     // AppState（~20 个 Arc 原子操作）+ UsageMeta（String/Vec 堆分配）
     let ctx = Arc::new(UsageCapture {
@@ -3605,6 +3741,94 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["message"], "boom");
         assert_eq!(v["error"]["code"], "upstream_error");
+    }
+
+    /// W1：超时分类——既有超时文案与链式 source 都命中，连接失败不误判
+    #[test]
+    fn is_timeout_error_walks_source_chain_and_texts() {
+        let header: Box<dyn Error + Send + Sync> = "upstream header timeout".into();
+        assert!(is_timeout_error(header.as_ref()));
+        let first_byte: Box<dyn Error + Send + Sync> =
+            "upstream stream first byte timeout".into();
+        assert!(is_timeout_error(first_byte.as_ref()));
+        let idle: Box<dyn Error + Send + Sync> = "upstream stream idle timeout".into();
+        assert!(is_timeout_error(idle.as_ref()));
+        let refused: Box<dyn Error + Send + Sync> =
+            "upstream request failed: connection refused".into();
+        assert!(!is_timeout_error(refused.as_ref()), "连接失败不是超时");
+
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("upstream stream idle timeout")
+            }
+        }
+        impl Error for Inner {}
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapped transport failure")
+            }
+        }
+        impl Error for Outer {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let wrapped: Box<dyn Error + Send + Sync> = Box::new(Outer(Inner));
+        assert!(is_timeout_error(wrapped.as_ref()), "外层文案无关，source 链命中");
+    }
+
+    /// W1：SSE 流错误 → 单条错误帧后正常结束（无 Err 泄漏、无 [DONE] 伪造）；
+    /// 非 SSE 流保持 Err 透传
+    #[tokio::test]
+    async fn sse_error_tail_wraps_stream_error_and_ends() {
+        let head = Bytes::from_static(b"data: {\"choices\":[]}\n\n");
+        let inner = futures_util::stream::iter(vec![
+            Ok::<_, Box<dyn Error + Send + Sync>>(head.clone()),
+            Err(Box::<dyn Error + Send + Sync>::from(
+                "upstream stream idle timeout",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(inner),
+            enabled: true,
+            finished: false,
+        });
+        assert_eq!(tail.next().await.unwrap().unwrap(), head);
+        let frame = tail.next().await.unwrap().expect("Err 转为错误帧");
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.starts_with("data: ") && text.ends_with("\n\n"));
+        assert!(!text.contains("[DONE]"), "错误收尾不得伪造 [DONE]");
+        let v: serde_json::Value =
+            serde_json::from_str(text["data: ".len()..].trim_end()).unwrap();
+        assert_eq!(v["error"]["type"], "upstream_error");
+        assert_eq!(v["error"]["code"], "upstream_error");
+        assert_eq!(v["error"]["message"], "upstream stream idle timeout");
+        assert!(tail.next().await.is_none(), "错误后流结束，后续块不透传");
+
+        // 非 SSE：Err 原样传播
+        let inner = futures_util::stream::iter(vec![Err::<Bytes, Box<dyn Error + Send + Sync>>(
+            Box::from("boom"),
+        )]);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(inner),
+            enabled: false,
+            finished: false,
+        });
+        assert!(tail.next().await.unwrap().is_err());
+        assert!(tail.next().await.is_none());
+    }
+
+    /// W1：priming deadline 到期判定——仅 SSE 提交，非 SSE 保持原判定
+    #[test]
+    fn prime_deadline_commits_only_for_sse() {
+        assert!(prime_deadline_commits(true, true));
+        assert!(!prime_deadline_commits(true, false));
+        assert!(!prime_deadline_commits(false, true));
     }
 
     /// 按用户×模型并发 guard：同用户同模型累加、同用户异模型独立计数、
