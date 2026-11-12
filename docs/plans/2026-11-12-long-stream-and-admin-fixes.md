@@ -62,7 +62,7 @@
 2. 有效权限恒等式：`is_admin = COALESCE(admin_override, admin_ldap)`，两处写路径都必须维护三列一致：
    - LDAP JIT（`upsert_ldap_user`）：`admin_ldap = EXCLUDED.admin_ldap`，`is_admin = COALESCE(users.admin_override, EXCLUDED.admin_ldap)`；不再无条件覆盖 `is_admin`。
    - UI 修改（`set_is_admin`）：写 `admin_override = $grant` 且 `is_admin = $grant`；新增“恢复目录同步”：`admin_override = NULL, is_admin = admin_ldap`。
-3. API：`PATCH /api/admin/users/{id}` 增加 `reset_admin_source: bool`（与 `is_admin` 互斥，二者皆缺 400）；响应与列表 `user_json` 增加 `admin_source: "directory"|"manual"`。审计事件沿用 `user.is_admin`，reset 记 `user.admin_source.reset`。
+3. API：`PATCH /api/admin/users/{id}` 增加 `reset_admin_source: bool`（与 `is_admin` 互斥；二者皆缺时保持既有字段级 no-op 语义，仅更新 status 等其它字段；`reset` 对 `source != 'ldap'` 返回 400）；响应与列表 `user_json` 增加 `admin_source: "directory"|"manual"`。审计事件沿用 `user.is_admin`，reset 记 `user.admin_source.reset`。
 4. 立即性：JIT 与 PATCH 改变 `is_admin` 后即时刷新 `admin_ids`（复用 `state.reload()` 的 admin_ids 分节或等价轻量方法）；`reload()` 失败只 warn，不把已提交的 PATCH 变成 500。
 5. UI（`web/src/views/Users.vue`、`web/src/api/types.ts`）：权限列显示来源（目录/手动），手动覆盖行提供“恢复目录同步”，删除“仅临时生效”提示；新增 `reset_admin_source` 请求。
 6. 不纳入本次：用户名大小写规范化/唯一索引（A4 相关，需产品决策），记录于 §7。
