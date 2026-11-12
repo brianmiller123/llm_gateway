@@ -111,3 +111,12 @@
 ## 8. 交付
 
 feature 分支 `fix/long-task-admin` → 两任务 worktree → 合并 → SDD 每任务 review → QC tri-review（qc1/2/3 + consolidated）→ PM acceptance（上文判据）→ Done 汇总（无引擎，Done 记录在本文件尾部与提交信息）。
+
+## 9. Done（交付记录）
+
+- 分支：`fix/long-task-admin`（base `a65384d`，HEAD 见 `git log`）；两个任务分支 `fix/long-stream` / `fix/admin-source` 已合并并由 PM 统一 QC。
+- 评审：QC tri（qc1/2/3）+ targeted re-review + final closure + micro；最终三席位 **Approve**，0 Critical / 0 Warning；残余见 §7。
+- 验收：PM 独立 e2e —— 首字节 65s（旧 60s 窗口）200/2.0s 头/4 ping/65.2s 完成；静默 130s（旧 120s 窗口）200/8 ping/130.1s 完成；提交后 idle=3s → 200 + OpenAI 方言错误帧、curl exit 0；LDAP 手动授予跨 3 次登录保持、目录自动升降、reset 回目录真值、本地 reset 400、`is_admin = COALESCE(admin_override, admin_ldap)` 0 违例。
+- 构建/测试：`cargo build`（无新增警告；基线 2 条 dead_code）、`cargo test --bin llm_gateway` 320/320、`web npm run build` 零错。
+- 部署：compose project `llm_gateway` 已更新为 `0ee7b03` release 镜像 `7dd4018ed830`（8080/8443），迁移 33/34 已应用；回滚镜像 tag `llm_gateway-gateway:rollback-pre-longtask`。
+- 部署后冒烟：`/healthz` ok；真实 `deepseek-v4-flash` 流式 `[DONE]` 正常；管理员手动覆盖 PATCH 200（旧二进制在 0034 CHECK 下会 500）。
