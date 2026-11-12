@@ -208,12 +208,22 @@ impl AppState {
         Ok(())
     }
 
-    /// 仅刷新管理员 id 缓存（代理路径的管理员旁路判定）。权限变更后即时调用，
-    /// 不必等待周期 reload；控制台中间件每请求查库，天然即时。
+    /// 全量刷新管理员 id 缓存（代理路径的管理员旁路判定）。仅由启动/周期
+    /// reload 调用；权限变更走 [`Self::sync_admin_id`]，不等全表查询。
     pub async fn reload_admin_ids(&self) -> Result<(), sqlx::Error> {
         let v = crate::store::users::load_admin_ids(&self.pool).await?;
         *self.admin_ids.write() = v;
         Ok(())
+    }
+
+    /// 增量同步单个用户的管理员缓存：授予写锁加入，撤销/禁用写锁移除。
+    ///
+    /// `is_admin` 必须是「有效权限且账号启用」的物化结果（调用方用
+    /// `user.is_admin && user.status == 1`），与 [`crate::store::users::load_admin_ids`]
+    /// 的集合口径 `is_admin AND status = 1` 一致。写锁内单条操作不查库：撤销后
+    /// 代理旁路立即不含该 id，全量 reload 是否成功不再影响授权正确性。
+    pub fn sync_admin_id(&self, user_id: i64, is_admin: bool) {
+        apply_admin_id(&self.admin_ids, user_id, is_admin);
     }
 
     /// 全量热加载：供应商 / 路由 / 限流规则（并发上限）/ 单价 / 访问授权 / LDAP。
@@ -332,6 +342,17 @@ impl AppState {
     }
 }
 
+/// 管理员 id 缓存的增量维护（[`AppState::sync_admin_id`] 的实现，独立成函数
+/// 以便直接单测写锁语义）。`is_admin = true` 加入、`false` 移除，幂等。
+fn apply_admin_id(ids: &RwLock<HashSet<i64>>, user_id: i64, is_admin: bool) {
+    let mut ids = ids.write();
+    if is_admin {
+        ids.insert(user_id);
+    } else {
+        ids.remove(&user_id);
+    }
+}
+
 /// 空串 → None（DB 空字段回退 env 用）
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim();
@@ -344,7 +365,49 @@ fn non_empty(s: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageTemplates;
+    use super::{apply_admin_id, MessageTemplates};
+    use parking_lot::RwLock;
+    use sqlx::PgPool;
+    use std::collections::HashSet;
+
+    /// 增量同步：授予写入缓存、撤销立即移除（代理旁路不等 30s 周期 reload），重复
+    /// 操作幂等且不影响其他 id。
+    #[test]
+    fn incremental_admin_sync_inserts_and_removes() {
+        let ids = RwLock::new(HashSet::new());
+        apply_admin_id(&ids, 7, true);
+        assert!(ids.read().contains(&7), "授予后缓存必须包含该 id");
+        apply_admin_id(&ids, 7, false);
+        assert!(!ids.read().contains(&7), "撤销后缓存必须立即不含该 id");
+        apply_admin_id(&ids, 7, false);
+        assert!(!ids.read().contains(&7), "重复撤销幂等");
+
+        apply_admin_id(&ids, 8, true);
+        assert!(ids.read().contains(&8));
+        assert!(!ids.read().contains(&7), "其他 id 不受影响");
+    }
+
+    /// JIT 首登管理员仍立即生效：LDAP 首次登录创建的有效管理员经增量同步进入
+    /// 缓存，不再依赖周期 reload 的首次全量刷新。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn jit_first_login_admin_enters_admin_cache(pool: PgPool) {
+        let user = crate::store::users::upsert_ldap_user(
+            &pool,
+            "alice",
+            None,
+            None,
+            "uid=alice,ou=people,dc=example,dc=org",
+            true,
+        )
+        .await
+        .unwrap();
+        let ids = RwLock::new(HashSet::new());
+        apply_admin_id(&ids, user.id, user.is_admin && user.status == 1);
+        assert!(
+            ids.read().contains(&user.id),
+            "首登管理员必须立即进入代理旁路缓存"
+        );
+    }
 
     /// 空模板回落内置默认文案并替换占位符；自定义模板原样替换
     #[test]

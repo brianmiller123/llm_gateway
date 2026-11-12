@@ -113,6 +113,11 @@ pub async fn delete_group(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
 
 /// LDAP 同步建档：不存在则建（source='ldap'，非管理员）；存在则仅补邮箱/显示名/DN，
 /// 不触碰 is_admin/status/source（同步不做管理员判定，与登录 JIT 语义不同）。
+///
+/// 与双来源权限模型的关系：新行靠列默认值取得 `admin_ldap = FALSE`、
+/// `admin_override = NULL`，不变式 `is_admin = COALESCE(admin_override, admin_ldap)`
+/// 成立；目录组是否授予管理员由之后的 JIT 登录
+/// （[`crate::store::users::upsert_ldap_user`]）按当前组重算，本路径永不写覆盖列。
 pub async fn upsert_sync_user(
     pool: &PgPool,
     username: &str,

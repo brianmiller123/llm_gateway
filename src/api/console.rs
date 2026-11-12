@@ -1289,8 +1289,16 @@ struct UpdateUserReq {
     /// None = 不变更。覆盖写入后 LDAP 登录不再改写它。与 reset_admin_source 互斥。
     is_admin: Option<bool>,
     /// true = 恢复目录同步：清除手动覆盖，权限回到目录真值。与 is_admin 互斥；
-    /// 仅 LDAP 用户可用，其他来源返回 400。
+    /// 仅 LDAP 用户可用，其他来源返回 400。false = no-op（不触发互斥，可与
+    /// is_admin 同时出现）。
     reset_admin_source: Option<bool>,
+}
+
+/// `is_admin`（任何取值，含 false）与 `reset_admin_source = true` 互斥。
+/// `reset_admin_source: false` 是 no-op，不算冲突——`{"is_admin": true,
+/// "reset_admin_source": false}` 必须按 is_admin 处理。
+fn admin_actions_conflict(is_admin: Option<bool>, reset_admin_source: Option<bool>) -> bool {
+    is_admin.is_some() && reset_admin_source == Some(true)
 }
 
 async fn update_user(
@@ -1300,7 +1308,7 @@ async fn update_user(
     Json(req): Json<UpdateUserReq>,
 ) -> Result<impl IntoResponse, AppError> {
     let actor = admin.id;
-    if req.is_admin.is_some() && req.reset_admin_source.is_some() {
+    if admin_actions_conflict(req.is_admin, req.reset_admin_source) {
         return Err(AppError::BadRequest(
             "is_admin and reset_admin_source are mutually exclusive".into(),
         ));
@@ -1344,8 +1352,7 @@ async fn update_user(
         .map_err(AppError::internal)?;
     }
     // 权限变更：is_admin 写手动覆盖（LDAP 登录不再改写）；reset_admin_source
-    // 清除覆盖回到目录真值。写入后只做轻量 admin_ids 刷新——变更已提交，
-    // 刷新失败仅告警，不得把成功的 PATCH 变成 500。
+    // 清除覆盖回到目录真值。
     let admin_action = if let Some(grant) = req.is_admin {
         if target.is_admin == grant {
             None
@@ -1367,10 +1374,10 @@ async fn update_user(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Internal("user vanished".into()))?;
+    // 增量同步管理员缓存（含 status 变更：禁用即移出旁路集合）：撤销立即生效，
+    // 不再依赖可能失败的全量 reload——授权正确性只由已提交的物化值决定。
+    st.sync_admin_id(updated.id, updated.is_admin && updated.status == 1);
     if let Some(action) = admin_action {
-        if let Err(e) = st.reload_admin_ids().await {
-            tracing::warn!(user_id = id, error = %e, "admin_ids refresh failed after admin change");
-        }
         audit::log(
             &st.pool,
             Some(actor),
@@ -1659,8 +1666,29 @@ pub(crate) async fn ensure_not_protected_by_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{BucketPoint, aggregate_active_by_user, fill_bucket_gaps_at};
+    use super::{
+        admin_actions_conflict, aggregate_active_by_user, fill_bucket_gaps_at, BucketPoint,
+    };
     use std::collections::HashMap;
+
+    /// 互斥只由 `reset_admin_source == Some(true)` 触发：false 是 no-op，
+    /// `{"is_admin": <任意>, "reset_admin_source": false}` 必须放行按 is_admin 处理。
+    #[test]
+    fn admin_actions_conflict_only_on_active_reset() {
+        assert!(
+            admin_actions_conflict(Some(true), Some(true)),
+            "is_admin 与 reset=true 冲突"
+        );
+        assert!(admin_actions_conflict(Some(false), Some(true)));
+        assert!(
+            !admin_actions_conflict(Some(true), Some(false)),
+            "reset=false 是 no-op，不得误拒 is_admin"
+        );
+        assert!(!admin_actions_conflict(Some(false), Some(false)));
+        assert!(!admin_actions_conflict(Some(true), None));
+        assert!(!admin_actions_conflict(None, Some(true)));
+        assert!(!admin_actions_conflict(None, None));
+    }
 
     /// 在途聚合：同用户跨模型合计、总数降序/同数按 user_id 升序、by_model
     /// 模型名升序、空模型键原样透出、空表→空数组

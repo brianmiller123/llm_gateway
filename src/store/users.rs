@@ -158,7 +158,8 @@ pub fn admin_source(admin_override: Option<bool>) -> &'static str {
 
 /// 手动授予/撤销管理员：写 admin_override 并同步有效权限。覆盖一旦写入即优先于
 /// 目录真值，LDAP 登录不再改写它；清除覆盖走 [`reset_admin_source`]。
-/// 控制台中间件每请求查库天然即时；代理路径靠调用方刷新 admin_ids 缓存。
+/// 控制台中间件每请求查库天然即时；代理路径由调用方对该 id 增量同步
+/// `AppState::sync_admin_id`（撤销立即移出旁路，不依赖全量 reload）。
 pub async fn set_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE users SET admin_override = $1, is_admin = $1 WHERE id = $2")
         .bind(is_admin)
