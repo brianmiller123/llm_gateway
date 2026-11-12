@@ -136,7 +136,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` | `admin` / `change-me-now` | break-glass 本地管理员（无本地管理员时首次启动创建） |
 | `SEED_PROVIDER_NAME` / `SEED_PROVIDER_BASE_URL` / `SEED_PROVIDER_API_KEY` / `SEED_MODEL_PATTERN` | 空 | 首次启动种子上游（`providers` 表为空时生效） |
 
-**流式超时优先级**（同一请求内的判定顺序）：`PRIME`（提交前，仅 SSE）→ `FIRST_BYTE`（提交前兜底 / 非 SSE）→ `IDLE`（提交后）。`PRIME ≥ FIRST_BYTE` 时 `FIRST_BYTE` 对 SSE 只剩兜底意义，启动日志会给出明确告警。默认配置（PRIME 2000ms ≪ FIRST_BYTE 300s）下，2xx 之后真卡死的上游会先被 priming deadline 提交，客户端看到 **200 + 流内错误帧**；要复现 **504 并在候选间切换**，需令 `FIRST_BYTE ≤ PRIME`（如 `GATEWAY_STREAM_FIRST_BYTE_TIMEOUT=2`），或 `PRIME=0` 关闭墙钟上限。
+**流式超时优先级**（同一请求内的判定顺序）：`PRIME`（提交前，仅 SSE）→ `FIRST_BYTE`（提交前兜底 / 非 SSE）→ `IDLE`（提交后）。`PRIME ≥ FIRST_BYTE` 时 `FIRST_BYTE` 对 SSE 只剩兜底意义，启动日志会给出明确告警。默认配置（PRIME 2000ms ≪ FIRST_BYTE 300s）下，2xx 之后真卡死的上游会先被 priming deadline 提交，客户端看到 **200 + 流内错误帧**；要复现 **504 并在候选间切换**，需令 `FIRST_BYTE < PRIME`（如 `GATEWAY_STREAM_FIRST_BYTE_TIMEOUT=1`；取等时 `PRIME` 到期仍严格更早，会先提交），或 `PRIME=0` 关闭墙钟上限。
 
 ## API 概览
 

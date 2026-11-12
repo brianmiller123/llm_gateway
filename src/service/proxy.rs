@@ -1386,6 +1386,8 @@ async fn proxy_authed(
                             // 但忽略 stream 参数的识别路径）
                             if is_sse {
                                 tracing::info!(
+                                    request_id = %request_id,
+                                    model = %model,
                                     provider = %provider.name,
                                     buffered_bytes,
                                     "stream priming deadline reached; committing to client"
@@ -1448,9 +1450,14 @@ async fn proxy_authed(
                             }
                         }
                         Some(Err(e)) => {
-                            let msg =
-                                format!("upstream stream failed before productive output: {e}");
-                            tracing::warn!(provider = %provider.name, error = %e, "stream priming transport error");
+                            // 客户端错误体（全候选失败后经 last_failure 透传）与日志
+                            // 同源：错误 Display 在聚合器风格 base_url 下可能含渠道
+                            // 密钥，落响应体/日志前统一脱敏
+                            let msg = redact_secrets(
+                                format!("upstream stream failed before productive output: {e}"),
+                                &provider_key,
+                            );
+                            tracing::warn!(provider = %provider.name, error = %msg, "stream priming transport error");
                             last_failed = Some(provider);
                             // 超时（首字节/静默）→ 504；传输错误与零产出断流 → 502
                             let timed_out = is_timeout_error(e.as_ref());
@@ -1522,8 +1529,18 @@ async fn proxy_authed(
                         }
                     }
                 }
-                // 提交：熔断记成功 + 缓冲块与剩余流拼接（字节顺序不变）
-                st.breaker.record_success(provider.id);
+                // 提交：熔断信号结算 + 缓冲块与剩余流拼接（字节顺序不变）
+                // 透明 SSE 透传由 `SseErrorTail` 在流终止时结算（正常 EOF →
+                // record_success，首个 Err → record_failure），此处不得再记 success：
+                // 同一请求会被计 2 次 requests / 1 次 failure，连续计数每次归零、
+                // 错误率恒 0.5 < 0.6，"2xx 后必断流"的供应商两个维度都不熔断
+                settle_commit_signal(
+                    &st.breaker,
+                    provider.id,
+                    anthropic_converted,
+                    converted,
+                    &content_type,
+                );
                 stream_opt = Some(Box::pin(
                     futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(stream),
                 ));
@@ -3082,6 +3099,25 @@ fn sse_error_frame(ctx: &SseErrorContext, msg: &str) -> Bytes {
     }
 }
 
+/// 提交时结算熔断信号：透明 SSE 透传（`!anthropic_converted && !converted` 且
+/// content-type 为 SSE——即会装上 `SseErrorTail` 的路径）**不在此记 success**，
+/// 成功/失败都由 tail 在流终止时各记一次，保证每个请求只产生一个熔断信号。
+/// 非 SSE / 转换链路保持原语义（转换流自行收尾，不装 tail）。
+fn settle_commit_signal(
+    breaker: &Breaker,
+    provider_id: i64,
+    anthropic_converted: bool,
+    converted: bool,
+    content_type: &str,
+) {
+    let tail_settles = !anthropic_converted
+        && !converted
+        && content_type.contains("text/event-stream");
+    if !tail_settles {
+        breaker.record_success(provider_id);
+    }
+}
+
 /// 上游流错误收尾：SSE 响应把 `Err` 转成一条方言对应的错误帧后正常结束（不再把
 /// `Err` 交给 hyper 导致 chunked body 硬断）；非 SSE（`error_ctx == None`）原样
 /// 传播 `Err`。
@@ -3126,9 +3162,28 @@ where
             }
             Poll::Ready(None) => {
                 this.finished = true;
+                // 正常结束（未失败）：提交时未记 success，由这里补记一次——
+                // 与 `Err` 分支的 `record_failure` 互斥，每个请求只产生一个熔断信号
+                if let Some(ctx) = &this.error_ctx {
+                    ctx.breaker.record_success(ctx.provider_id);
+                }
                 Poll::Ready(None)
             }
             other => other,
+        }
+    }
+}
+
+impl<S> Drop for SseErrorTail<S> {
+    fn drop(&mut self) {
+        // 客户端断开 / 流被丢弃且从未结算（既无 EOF 也无 Err）：提交时未记 success，
+        // 这里也不计数，只归还半开探测名额——否则被中断的探测请求会让
+        // `half_open_probe_in_flight` 永久占位，该渠道之后再也无法 `allow` 放行
+        if self.finished {
+            return;
+        }
+        if let Some(ctx) = &self.error_ctx {
+            ctx.breaker.release_probe(ctx.provider_id);
         }
     }
 }
@@ -3139,7 +3194,8 @@ where
 /// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
 /// - 流异常中断时由 chain 兜底记账（含 EOF flush 后的 captured）；客户端断开由 BillingOnDrop 兜底
 /// - `sse_error = Some(ctx)`（SSE 响应）：上游 `Err` 转成一条该方言的错误帧后正常结束，
-///   并记一次熔断失败；`None`（非 SSE 流）保持原行为（`Err` 交给 hyper）
+///   首个 `Err` 记一次熔断失败、正常 EOF 记一次成功（提交处不再记 success）；
+///   流被 drop 时归还半开探测名额。`None`（非 SSE 流）保持原行为（`Err` 交给 hyper）
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
@@ -3922,6 +3978,21 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         }))
     }
 
+    /// 生产调用序列的最小复刻：一次已提交的透明 SSE 透传请求 =
+    /// 提交结算（透明 SSE 不记 success）+ `SseErrorTail` 驱动到终止（EOF / 首个 Err）
+    async fn drive_committed_sse(
+        breaker: &Arc<Breaker>,
+        events: Vec<Result<Bytes, Box<dyn Error + Send + Sync>>>,
+    ) {
+        settle_commit_signal(breaker, 7, false, false, "text/event-stream");
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(futures_util::stream::iter(events)),
+            error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
+            finished: false,
+        });
+        while tail.next().await.is_some() {}
+    }
+
     fn sse_ctx(dialect: SseErrorDialect, breaker: Arc<Breaker>) -> SseErrorContext {
         SseErrorContext {
             dialect,
@@ -4128,7 +4199,95 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             });
             while tail.next().await.is_some() {}
         }
-        assert!(breaker.allow(7), "正常结束 / 客户端断开不记熔断失败");
+        assert!(breaker.allow(7), "正常结束 / 客户端断开不记熔断失败（正常结束记成功）");
+    }
+
+    /// QC1 W1-new / QC2 F1：按真实调用序列（提交结算 + 尾部首个 `Err`），连续
+    /// `failure_threshold` 条「200 后必断流」的透明 SSE 请求必须熔断。旧实现在
+    /// 提交处无条件 `record_success`：连续计数每次归零、错误率恒 0.5 < 0.6，
+    /// 两个维度都永不打开
+    #[tokio::test]
+    async fn committed_sse_stream_failures_open_breaker() {
+        let breaker = test_breaker(4);
+        for attempt in 0..4 {
+            assert!(breaker.allow(7), "第 {attempt} 次请求：熔断前应放行");
+            drive_committed_sse(
+                &breaker,
+                vec![Err(Box::<dyn Error + Send + Sync>::from(
+                    "upstream stream idle timeout",
+                ))],
+            )
+            .await;
+        }
+        assert!(
+            !breaker.allow(7),
+            "连续 4 条提交后断流必须熔断（提交处记 success 的旧实现恒放行）"
+        );
+    }
+
+    /// 尾部正常 EOF 记一次成功 → 连续失败复位：2 败 + 1 正常结束 + 2 败不达阈值 4，
+    /// 不得熔断（若 EOF 不记成功，累计 4 次连续失败会误熔断）
+    #[tokio::test]
+    async fn committed_sse_normal_eof_resets_consecutive_failures() {
+        let breaker = test_breaker(4);
+        for _ in 0..2 {
+            drive_committed_sse(
+                &breaker,
+                vec![Err(Box::<dyn Error + Send + Sync>::from(
+                    "upstream stream idle timeout",
+                ))],
+            )
+            .await;
+        }
+        drive_committed_sse(&breaker, vec![Ok(Bytes::from_static(b"data: {}\n\n"))]).await;
+        for _ in 0..2 {
+            drive_committed_sse(
+                &breaker,
+                vec![Err(Box::<dyn Error + Send + Sync>::from(
+                    "upstream stream idle timeout",
+                ))],
+            )
+            .await;
+        }
+        assert!(
+            breaker.allow(7),
+            "正常结束已复位连续计数：2+2 不达阈值 4，不得熔断"
+        );
+    }
+
+    /// 半开探测名额：未结算的流被 drop（客户端断开）后 `release_probe` 归还名额。
+    /// `open_secs=0` 让熔断窗口立即到期，`allow` 立即可发探测；名额不归还时
+    /// 该渠道会被永久拒绝
+    #[tokio::test]
+    async fn dropped_unsettled_sse_tail_releases_half_open_probe() {
+        let breaker = Arc::new(Breaker::new_with(
+            crate::service::breaker::BreakerConfig {
+                failure_threshold: 1,
+                open_secs: 0,
+                min_requests: 1_000,
+                ..Default::default()
+            },
+        ));
+        breaker.record_failure(7); // 打开熔断（窗口 0s → 立即可半开）
+        assert!(breaker.allow(7), "窗口到期后第一个请求获得探测名额");
+        assert!(!breaker.allow(7), "探测名额已被占用");
+        {
+            let mut tail = Box::pin(SseErrorTail {
+                inner: Box::pin(futures_util::stream::pending::<
+                    Result<Bytes, Box<dyn Error + Send + Sync>>,
+                >()),
+                error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
+                finished: false,
+            });
+            // 客户端断开：流未结算（既无 EOF 也无 Err）即被 drop
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), tail.next())
+                    .await
+                    .is_err(),
+                "上游未结束，流处于进行中"
+            );
+        }
+        assert!(breaker.allow(7), "未结算的流被 drop 后探测名额归还");
     }
 
     /// QC1 W2 / QC3 F-003：持续同步就绪的中性帧洪水 + 墙钟 deadline →
