@@ -19,6 +19,13 @@ pub struct Session {
     pub user: users::UserRow,
 }
 
+/// 目录登录后是否需要刷新 admin_ids 缓存：仅在有效管理员权限实际变化时刷新。
+/// 首次出现的用户（was = None）在成为管理员时刷新——否则该用户的代理旁路会
+/// 滞后一个 reload 周期；新出现的非管理员不触发，避免首登白跑一次全表查询。
+fn admin_ids_changed(was_admin: Option<bool>, is_admin: bool) -> bool {
+    was_admin.map_or(is_admin, |was| was != is_admin)
+}
+
 pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Session, AppError> {
     if username.trim().is_empty() || password.is_empty() {
         return Err(AppError::BadRequest(
@@ -35,8 +42,7 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
         match ldap::authenticate(&ldap_settings, username, password).await {
             Ok(identity) => {
                 // 旧有效权限用于判断目录组是否改变了管理员身份（目录升降权需即时
-                // 反映到代理旁路的 admin_ids 缓存，不必等周期 reload）。首次出现的
-                // 用户 was = None：不触发刷新，避免新用户首登白跑一次全表查询。
+                // 反映到代理旁路的 admin_ids 缓存，不必等周期 reload）。
                 let was_admin = users::find_by_username(&st.pool, username)
                     .await
                     .map_err(AppError::internal)?
@@ -51,7 +57,7 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
                 )
                 .await
                 .map_err(AppError::internal)?;
-                if was_admin.is_some() && was_admin != Some(user.is_admin) {
+                if admin_ids_changed(was_admin, user.is_admin) {
                     if let Err(e) = st.reload_admin_ids().await {
                         tracing::warn!(username, error = %e, "admin_ids refresh failed after LDAP login");
                     }
@@ -165,4 +171,20 @@ pub async fn logout(st: &AppState, refresh_token: &str) -> Result<(), AppError> 
             .map_err(AppError::internal)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admin_ids_changed;
+
+    /// 刷新决策：首次出现的用户仅在成为管理员时刷新；已有用户仅在权限翻转时刷新。
+    #[test]
+    fn admin_ids_refresh_only_on_real_permission_change() {
+        assert!(admin_ids_changed(None, true), "首次出现即管理员需刷新");
+        assert!(!admin_ids_changed(None, false), "首次出现的非管理员不刷新");
+        assert!(admin_ids_changed(Some(false), true), "授予需刷新");
+        assert!(admin_ids_changed(Some(true), false), "撤销需刷新");
+        assert!(!admin_ids_changed(Some(true), true), "保持管理员不刷新");
+        assert!(!admin_ids_changed(Some(false), false), "保持非管理员不刷新");
+    }
 }
