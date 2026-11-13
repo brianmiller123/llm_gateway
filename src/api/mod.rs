@@ -40,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/", get(root))
         .merge(v1)
         .merge(status::routes())
@@ -60,6 +61,16 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn healthz() -> Response {
     (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
+}
+
+/// Prometheus 文本格式指标导出（进程启动以来累计；内存态，重启清零是有意为之）。
+/// 实例即 AppState.metrics 单例，与代理/熔断等记录方共享同一份计数。
+async fn metrics(State(st): State<AppState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        st.metrics.render(),
+    )
+        .into_response()
 }
 
 /// 就绪探针：DB 可达（2s 预算）才算就绪。LB/编排依此摘除依赖抖动的实例；
@@ -450,5 +461,41 @@ mod tests {
         assert!(oversized_content_length_response(&axum::http::HeaderMap::new(), 1024).is_none());
         // 非法头值：不误判，放行
         assert!(oversized_content_length_response(&req_with_length("garbage"), 1024).is_none());
+    }
+
+    // ---------- /metrics 渲染契约 ----------
+
+    #[test]
+    fn metrics_render_contains_help_type_lines_for_every_family() {
+        let m = crate::metrics::Metrics::new();
+        m.conn_accepted
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        m.record_upstream_error(3);
+        m.record_upstream_error(3);
+        m.record_upstream_error(9);
+        m.record_breaker_open();
+        let out = m.render();
+        for family in [
+            "gateway_conn_accepted_total",
+            "gateway_conn_error_total",
+            "gateway_tls_handshake_fail_total",
+            "gateway_client_abort_total",
+            "gateway_upstream_error_total",
+            "gateway_breaker_open_total",
+        ] {
+            assert!(
+                out.contains(&format!("# HELP {family} ")),
+                "missing HELP line for {family}"
+            );
+            assert!(
+                out.contains(&format!("# TYPE {family} counter")),
+                "missing TYPE line for {family}"
+            );
+        }
+        assert!(out.contains("gateway_conn_accepted_total 7"));
+        // 带 provider_id 标签的样本紧跟总数之后
+        assert!(out.contains("gateway_upstream_error_total{provider_id=\"3\"} 2"));
+        assert!(out.contains("gateway_upstream_error_total{provider_id=\"9\"} 1"));
+        assert!(out.contains("gateway_breaker_open_total 1"));
     }
 }
