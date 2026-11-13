@@ -357,8 +357,8 @@ mod tests {
     }
 
     /// 连接加固：filter_candidates 走 peek_allow 只读判定——熔断窗口到期的渠道
-    /// 被过滤放行，但**不**预占半开探测名额；候选循环里的 allow() 仍是唯一
-    /// 探测消费者（首次调用消费名额，第二次被拒）
+    /// 被过滤放行（过滤只看开/闭，与探测名额占用无关），且**不**预占半开探测
+    /// 名额；候选循环里的 allow() 仍是唯一探测消费者（首次调用消费名额，第二次被拒）
     #[test]
     fn filter_candidates_peek_does_not_consume_half_open_probe() {
         let b = Breaker::new();
@@ -370,9 +370,12 @@ mod tests {
         let cands = vec![("a", 1i64), ("b", 2i64)];
         let allowed = b
             .filter_candidates(&cands, |c| c.1)
-            .expect("窗口到期 → peek 放行该候选");
-        assert_eq!(allowed.len(), 1);
-        assert_eq!(allowed[0].0, "a");
+            .expect("窗口到期 → peek 放行 1 号 + 未熔断的 2 号");
+        assert_eq!(
+            allowed.len(),
+            2,
+            "peek 只看开/闭：到期窗口（1 号）与未熔断（2 号）候选都在放行子集"
+        );
         // 探测名额未被过滤预占：首个 allow 消费名额放行，紧随的 allow 被拒
         assert!(b.allow(1), "首次 allow 消费半开探测名额");
         assert!(!b.allow(1), "过滤不得预占名额：第二次 allow 必须被拒");
