@@ -13,6 +13,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # 宿主机重启后自愈：gateway 依赖本服务，本服务停机时网关会因解析不到
     # postgres 主机名而崩溃循环（DNS 记录随容器停止消失），整站不可用
     restart: unless-stopped
@@ -27,7 +32,8 @@ services:
       dockerfile: Dockerfile.runtime
     ports:
       - "8443:443"
-      - "8080:80"
+      # 明文全功能应用不发布全网：仅绑回环（8443 TLS 保持全网发布）
+      - "127.0.0.1:8080:80"
     environment:
       # 容器时区：chrono::Local（Plan 时段窗判定/价格生效日）与容器日志用它；
       # environment 优先级高于 env_file，覆盖 .env 中可能的 TZ
@@ -53,7 +59,26 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
+    # TCP 探活只证监听器已起；/readyz 落地后可换依赖检查
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/80'"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 45s
+    # 必须大于应用 GATEWAY_DRAIN_SECS=120 排水窗口，否则 SIGKILL 抢跑截断在途 SSE
+    stop_grace_period: 350s
+    # 启动失败最多重试 5 次，断掉“崩溃循环→端口 accept 后关闭→客户端持续 ECONNRESET”的放大回路
+    # （postgres 仍 unless-stopped，宿主机重启自愈由 depends_on service_healthy 兜底）
+    restart: on-failure:5
+    # 进程数与内存硬顶：防失控请求拖垮宿主机
+    mem_limit: 2g
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # 可选：冒烟测试/演示用的 OpenLDAP（osixia 镜像内置 memberOf overlay）
   # 启用后：docker-compose --profile ldap up -d ldap && bash scripts/seed-ldap.sh

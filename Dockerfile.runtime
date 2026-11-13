@@ -12,5 +12,10 @@ ENV TZ=Asia/Shanghai
 COPY target/release/llm_gateway /usr/local/bin/llm_gateway
 COPY web/dist /app/web/dist
 ENV GATEWAY_WEB_DIR=/app/web/dist
+# 非 root 运行（uid/gid 65532）：二进制与 web/dist 由 COPY 带入、默认全员可读，无需 chown；
+# /certs 为 ro 挂载不改属主——宿主机 key.pem 为 600 时容器内读不到，需交给组 65532 组读：
+# chgrp 65532 certs/key.pem && chmod 640 certs/key.pem（scripts/deploy-local-binary.sh 会尽力代劳）
+RUN groupadd -g 65532 gateway && useradd -r -u 65532 -g gateway gateway
+USER 65532:65532
 EXPOSE 443 80
 ENTRYPOINT ["llm_gateway"]
