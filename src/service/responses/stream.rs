@@ -1395,7 +1395,15 @@ struct BillingOnDrop {
 
 impl Drop for BillingOnDrop {
     fn drop(&mut self) {
+        // 连接加固：半开探测名额归还——流未结算即被丢弃（客户端断开）时只释放
+        // 名额不计数，否则探测名额被永久占位、该渠道窗口到期后不再放行
+        self.st.breaker.release_probe(self.meta.provider_id);
         if !self.recorded.swap(true, Ordering::SeqCst) {
+            // 连接加固：客户端中断计数（流式响应中途断开/丢弃）
+            self.st
+                .metrics
+                .client_abort_total
+                .fetch_add(1, Ordering::Relaxed);
             let st = self.st.clone();
             let meta = self.meta.clone();
             let usage = self.state.lock().billing_usage();
@@ -1443,6 +1451,9 @@ impl Stream for BillingStream {
 /// - 逐帧解析 → `ChatToResponsesStreamState` 转换 → `event: {type}\ndata: {json}\n\n` 透传
 /// - 遇 `[DONE]` 立即补发终态事件并记账（usage 取自累积 chunk）
 /// - 流异常中断由尾帧兜底：补发终态事件 + 记账（usage 未知）；客户端断开由 BillingOnDrop 兜底
+/// - 连接加固：熔断信号由流终态结算——传输 `Err` / 上游错误帧 / 干净 EOF 无
+///   [DONE] → `record_failure` + 上游错误指标；[DONE] 干净结束 → `record_success`；
+///   流被 drop（客户端断开）归还半开探测名额并计 client_abort_total
 pub fn wrap_chat_stream_to_responses(
     st: AppState,
     meta: UsageMeta,
@@ -1479,6 +1490,13 @@ pub fn wrap_chat_stream_to_responses(
                     Ok(c) => c,
                     Err(e) => {
                         if !ctx.finished.swap(true, Ordering::SeqCst) {
+                            // 连接加固：转换链熔断结算——上游传输错误计失败 +
+                            // 上游错误指标（此前转换链不与熔断器交互，错误渠道
+                            // 永远不被降级链隔离）
+                            ctx.st.breaker.record_failure(ctx.meta.provider_id);
+                            ctx.st
+                                .metrics
+                                .record_upstream_error(ctx.meta.provider_id);
                             let (final_events, usage) = {
                                 let mut state = ctx.state.lock();
                                 let mut events = Vec::new();
@@ -1537,6 +1555,15 @@ pub fn wrap_chat_stream_to_responses(
                 if (terminal || failed) && !ctx.finished.swap(true, Ordering::SeqCst) {
                     let (final_events, usage, history) = {
                         let mut state = ctx.state.lock();
+                        // 连接加固：流内终态结算——上游错误帧 = 失败 + 上游错误
+                        // 指标；[DONE] 干净结束 = 成功（与透传链 SseErrorTail
+                        // 同一语义，每个请求只产生一个熔断信号）
+                        if state.has_failed() {
+                            ctx.st.breaker.record_failure(ctx.meta.provider_id);
+                            ctx.st.metrics.record_upstream_error(ctx.meta.provider_id);
+                        } else {
+                            ctx.st.breaker.record_success(ctx.meta.provider_id);
+                        }
                         let mut events = Vec::new();
                         for ev in &state.finalize() {
                             events.extend_from_slice(sse_frame(ev).as_bytes());
@@ -1572,6 +1599,11 @@ pub fn wrap_chat_stream_to_responses(
         async move {
             // 上游未以 [DONE] 正常结束：补发终态事件 + 兜底记账
             if !ctx.finished.swap(true, Ordering::SeqCst) {
+                // 连接加固：干净 EOF 但无 [DONE] = 上游流在终态事件前结束——
+                // 与透传链同一语义记熔断失败 + 上游错误指标；客户端仍拿到
+                // finalize_truncated 兜底终态（行为不变，仅熔断归因修正）
+                ctx.st.breaker.record_failure(ctx.meta.provider_id);
+                ctx.st.metrics.record_upstream_error(ctx.meta.provider_id);
                 let (final_events, usage, history) = {
                     let mut state = ctx.state.lock();
                     let mut events = Vec::new();
