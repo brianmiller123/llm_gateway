@@ -92,11 +92,9 @@ cp .env.example .env
 # 2. 生成自签证书（公网部署请改用公司 CA / ACME 证书，替换 certs/ 下文件）
 bash scripts/gen-cert.sh
 
-# 3. 全自动构建（多阶段 Dockerfile：前端 + Rust + 运行镜像一步到位）
-docker compose up -d --build
-
-#    或本机快速构建（利用本地 cargo 缓存，秒级打镜像）：
-#    npm run build --prefix web && bash scripts/deploy-local-binary.sh
+# 3. 构建并部署：运行时镜像只打包本机编译产物（Dockerfile.runtime），
+#    需先完成 host 侧前端构建与 cargo build（脚本内置，另含部署前 DB 快照）
+npm run build --prefix web && bash scripts/deploy-local-binary.sh
 
 # 4. 验证
 curl -sk https://127.0.0.1:8443/healthz
@@ -118,6 +116,20 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 
 未配置供应商时，网关在 `providers` 表为空的首启会自动按 `SEED_PROVIDER_*` 环境变量种入默认上游。
 
+### 停机与部署
+
+- 更新部署统一走 `bash scripts/deploy-local-binary.sh`：本机 cargo build（利用缓存）+ 秒级打包运行时镜像；构建前自动尽力做一次数据库快照（`backups/pre-deploy-*.sql`）——回滚旧二进制撞上库结构版本不匹配（VersionMissing）时用快照恢复。
+- 优雅停机：`docker compose stop` 先发 SIGTERM，网关停止接新请求并在 `GATEWAY_DRAIN_SECS`（默认 120s）窗口内排水存量请求（含 SSE 流）；compose 的 `stop_grace_period: 350s` **必须大于该排水窗口**——宽限耗尽后 SIGKILL 会直接截断在途 SSE（客户端表现为响应中断，流式记账可能丢失）。
+- 容器以非 root（uid/gid 65532）运行：`certs/key.pem` 权限 600 时容器内读不到 TLS 私钥，需交给组 65532 组读——`sudo chgrp 65532 certs/key.pem && chmod 640 certs/key.pem`（deploy 脚本每次部署会尽力代劳，失败仅告警）。
+
+### 反向代理
+
+网关默认不采信 `X-Forwarded-For` / `X-Forwarded-Proto`（客户端 IP 取 TCP 直连对端，防伪造）。仅当请求来源 IP 命中 `GATEWAY_TRUST_PROXY_CIDRS`（逗号分隔 CIDR 列表）时才采信代理头；直连部署保持留空。
+
+### 凭据卫生
+
+`test_anthropic.py` / `test_response.py` 的调用凭据从 `GATEWAY_API_KEY` 环境变量读取，不再硬编码入仓；曾提交进仓库的 key 应视为泄露并轮换。
+
 ## 配置说明（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -132,6 +144,11 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GATEWAY_JWT_SECRET` / `GATEWAY_ACCESS_TOKEN_TTL` / `GATEWAY_REFRESH_TOKEN_TTL` | 派生 / `900` / `2592000` | 控制台会话 |
 | `GATEWAY_STREAM_FIRST_BYTE_TIMEOUT` / `GATEWAY_STREAM_IDLE_TIMEOUT` | `300` / `300` | 流式首字节 / chunk 静默超时（秒，`0` = 禁用）：首字节 = 提交前等待首个 chunk，对 SSE 是 PRIME 之后的兜底；静默 = 提交后相邻 chunk 间隔（默认与首字节同值）。默认与客户端首事件/空闲看门狗对齐，长预填充与长思考不被网关提前判失败 |
 | `GATEWAY_STREAM_PRIME_TIMEOUT_MS` | `2000` | 上游 2xx 后的 priming 墙钟上限（毫秒，`0` = 不限）：到期即向客户端提交响应并进入流式（响应头 + 15s `: ping` 心跳），仅 SSE 生效；到期后到达的上游错误帧随流透传，不再切换候选 |
+| `GATEWAY_DRAIN_SECS` | `120` | 优雅停机排水窗口（秒，≥1）：SIGTERM 后停止接新请求，等待存量请求（含 SSE）收尾的上限；compose `stop_grace_period` 必须大于此值（grace > drain），否则 SIGKILL 截断在途流 |
+| `GATEWAY_MAX_BODY_BYTES` | `209715200` | 请求体大小上限（字节，默认 200MiB；≥1MiB）：DefaultBodyLimit 与提前 Content-Length 检查共用，超限 413 |
+| `GATEWAY_GLOBAL_MAX_CONCURRENCY` | `256` | 全局在途请求兜底并发上限（进程级，与三层限流规则叠加、命中取更严者；`0` = 不限） |
+| `GATEWAY_FAILOVER_ON_HEADER_TIMEOUT` | `false` | 上游响应头阶段超时（请求体已完整写出后）是否换下一候选重发：`true` = 保留旧 failover 行为（有双份生成/计费风险）；`false`（默认）= 该候选判 504 终止 |
+| `GATEWAY_TRUST_PROXY_CIDRS` | 空 | 受信任反向代理网段（逗号分隔 CIDR，如 `10.0.0.0/8,192.168.1.0/24`）：仅这些来源的 `X-Forwarded-For`/`-Proto` 被采信；空 = 直连拓扑，客户端 IP 一律取对端 socket 地址 |
 | `LDAP_URL` / `LDAP_STARTTLS` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_BASE_DN` / `LDAP_USER_FILTER` / `LDAP_ADMIN_GROUPS` | — | LDAP 登录（AD 默认 `sAMAccountName`，OpenLDAP 用 `uid`；不配置则仅本地账号）。管理员权限双来源：`LDAP_ADMIN_GROUPS` 命中的目录组成员每次登录自动授予、移出后下次登录自动撤销；管理端手动授予/撤销是显式覆盖，后续登录不再改写，直到用户列表点「恢复目录同步」回到目录真值。`/api/me` 与用户列表的 `admin_source`（`directory` / `manual`）标注当前来源。升级提示：迁移前对 LDAP 用户的手动授予/撤销无法与目录真值区分，回填后一律记为 `directory`，该用户升级后首次登录会按目录组重算权限（可能静默变权）；需要保留手动结果的管理员请在升级后重新手动授予一次 |
 | `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` | `admin` / `change-me-now` | break-glass 本地管理员（无本地管理员时首次启动创建） |
 | `SEED_PROVIDER_NAME` / `SEED_PROVIDER_BASE_URL` / `SEED_PROVIDER_API_KEY` / `SEED_MODEL_PATTERN` | 空 | 首次启动种子上游（`providers` 表为空时生效） |
