@@ -7,5 +7,6 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
   -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes \
   -subj "/CN=llm-gateway" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-chmod 600 certs/key.pem
+# 容器内非 root (65532) 需组读
+chgrp 65532 certs/key.pem && chmod 640 certs/key.pem
 echo "OK: certs/cert.pem + certs/key.pem generated"
