@@ -1186,6 +1186,10 @@ async fn proxy_authed(
             .chain(route.upstream_model.clone())
             .collect(),
         plan: plan_bill,
+        // 失败归因（连接加固）：仅候选失败行经 usage::record_failure_row 填写
+        failure_class: None,
+        upstream_status: None,
+        attempt: None,
     };
 
     // 7. 转发 + 记账

@@ -24,11 +24,19 @@ pub struct UsageMeta {
     pub started: std::time::Instant,
     /// 管理员测试调用：跳过用量记账（不写 usage_logs，不污染状态页错误率）
     pub test_call: bool,
-    /// 计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
+    /// M33：计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
     /// 依次查价；仅记账使用）
     pub pricing_models: Vec<String>,
     /// Coding Plan 计量（None = 用户无生效 Plan，跳过计数器写入）
     pub plan: Option<PlanBill>,
+    /// 失败归因类别（连接加固；仅候选失败行有值，成功行恒 None）：
+    /// connect_error / header_timeout / body_timeout / body_read_error /
+    /// upstream_status / all_candidates_failed
+    pub failure_class: Option<&'static str>,
+    /// 上游 HTTP 状态（仅 failure_class = upstream_status 时有值）
+    pub upstream_status: Option<i16>,
+    /// 候选序号（0 = 主渠道，1.. = 降级链；仅候选失败行有值）
+    pub attempt: Option<i16>,
 }
 
 /// Coding Plan 计量载荷：生效 Plan 存在时随请求携带（proxy 期解析自 PlanRuntime）。
@@ -175,8 +183,9 @@ pub async fn record_usage(
         "INSERT INTO usage_logs
            (request_id, user_id, api_key_id, model, provider_id, endpoint, streamed,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            latency_ms, status, cost, client_ip, session_id, first_token_ms, gen_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17,$18)",
+            latency_ms, status, cost, client_ip, session_id, first_token_ms, gen_ms,
+            failure_class, upstream_status, attempt)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17,$18,$19,$20,$21)",
     )
     .bind(meta.request_id)
     .bind(meta.user_id)
@@ -196,6 +205,10 @@ pub async fn record_usage(
     .bind(meta.session_id.as_deref())
     .bind(meta.first_token_ms)
     .bind(gen_ms)
+    // 失败归因（连接加固）：候选失败行有值，成功行恒 NULL
+    .bind(meta.failure_class)
+    .bind(meta.upstream_status)
+    .bind(meta.attempt)
     .execute(&mut *tx)
     .await?;
 
