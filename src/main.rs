@@ -17,9 +17,9 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::serve::ListenerExt;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -144,9 +144,10 @@ async fn serve_https(
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(cfg.https_addr).await?;
     tracing::info!("HTTPS listening on {}", cfg.https_addr);
+    let graceful = GracefulShutdown::new();
     loop {
         tokio::select! {
-            // 关停：停止 accept 新连接；已接连接任务继续跑（排水期内自然收尾）
+            // 关停：停止 accept 新连接，随后进入下方有界排水
             _ = shutdown.changed() => break,
             accepted = listener.accept() => {
                 // accept 瞬时错误（EMFILE 等）只告警不退出，避免 HTTPS 服务整体挂掉
@@ -154,10 +155,15 @@ async fn serve_https(
                     Ok(x) => x,
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
+                // select 两臂同轮就绪的竞态：信号已触发则不再受理新连接（其 watcher
+                // 订阅会晚于关停广播，收不到关停通知，排水被空连接无限吊住）
+                if *shutdown.borrow() {
+                    break;
+                }
                 // SSE 高频小包写：禁用 Nagle，避免与延迟 ACK 互作用造成
                 // 每 token 数十毫秒级停顿（上游 reqwest 侧默认已开）
                 if let Err(e) = tcp.set_nodelay(true) {
@@ -165,6 +171,7 @@ async fn serve_https(
                 }
                 let acceptor = acceptor.clone();
                 let app = app.clone();
+                let watcher = graceful.watcher();
                 tokio::spawn(async move {
                     let stream = match acceptor.accept(tcp).await {
                         Ok(s) => s,
@@ -185,10 +192,10 @@ async fn serve_https(
                             app.call(req).await
                         }
                     });
-                    if let Err(e) =
-                        conn_builder()
-                            .serve_connection_with_upgrades(stream, service)
-                            .await
+                    // watch：关停广播后连接收到 GOAWAY/Connection: close，在途响应收尾即返回
+                    if let Err(e) = watcher
+                        .watch(conn_builder().serve_connection_with_upgrades(stream, service))
+                        .await
                     {
                         tracing::warn!(%addr, error = %e, "connection error");
                     }
@@ -196,6 +203,7 @@ async fn serve_https(
             }
         }
     }
+    drain_connections(graceful, cfg.drain_secs).await;
     Ok(())
 }
 
@@ -214,7 +222,11 @@ fn rustls_server_config(
     Ok(config)
 }
 
-/// HTTP：直接服务完整应用（前端 + API），明文无 TLS
+/// HTTP：直接服务完整应用（前端 + API），明文无 TLS。
+/// 手动 accept 循环（与 HTTPS 路径同一套配置化 Builder + 有界排水）：
+/// axum::serve 的 with_graceful_shutdown 只停 accept、不向存量 keep-alive
+/// 连接发关闭通知，排水期会被空闲连接吊满预算，故两条路径统一走
+/// GracefulShutdown。
 async fn serve_http_app(
     app: Router,
     cfg: Arc<AppConfig>,
@@ -222,21 +234,75 @@ async fn serve_http_app(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(cfg.http_addr).await?;
     tracing::info!("HTTP serving on {} (redirect disabled)", cfg.http_addr);
-    axum::serve(
-        // SSE 高频小包写：禁用 Nagle（axum 官方 tap_io 扩展，与 HTTPS 路径对齐）
-        listener.tap_io(|tcp| {
-            if let Err(e) = tcp.set_nodelay(true) {
-                tracing::warn!(error = %e, "failed to set TCP_NODELAY");
+    let graceful = GracefulShutdown::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            accepted = listener.accept() => {
+                let (tcp, addr) = match accepted {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                // 同 serve_https：信号已触发不再受理新连接（watcher 竞态防护）
+                if *shutdown.borrow() {
+                    break;
+                }
+                // SSE 高频小包写：禁用 Nagle，避免与延迟 ACK 互作用造成
+                // 每 token 数十毫秒级停顿（上游 reqwest 侧默认已开）
+                if let Err(e) = tcp.set_nodelay(true) {
+                    tracing::warn!(error = %e, "failed to set TCP_NODELAY");
+                }
+                let app = app.clone();
+                let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                    let mut app = app.clone();
+                    let peer = addr;
+                    async move {
+                        // ConnectInfo 注入：与 HTTPS 路径的 service_fn 模式对齐，
+                        // 供 v1 代理 / 控制台登录 IP 桶取客户端地址
+                        req.extensions_mut()
+                            .insert(axum::extract::ConnectInfo(peer));
+                        app.call(req).await
+                    }
+                });
+                let watcher = graceful.watcher();
+                tokio::spawn(async move {
+                    if let Err(e) = watcher
+                        .watch(conn_builder().serve_connection_with_upgrades(
+                            TokioIo::new(tcp),
+                            service,
+                        ))
+                        .await
+                    {
+                        tracing::warn!(%addr, error = %e, "connection error");
+                    }
+                });
             }
-        }),
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        // 收到关停信号：axum 停止 accept，存量连接跑完；整体退出上限由 main 的排水控制
-        let _ = shutdown.changed().await;
-    })
-    .await?;
+        }
+    }
+    drain_connections(graceful, cfg.drain_secs).await;
     Ok(())
+}
+
+/// 有界排水：向全部受管连接广播优雅关停（HTTP/2 GOAWAY、HTTP/1.1
+/// Connection: close），等在途响应收尾；超过 drain_secs 预算即放弃等待
+/// （超时后未完成连接随进程退出终止）。
+/// 与 docker compose stop_grace_period 的配套关系：SIGTERM 后宽限期到期即
+/// SIGKILL，故 stop_grace_period 必须 > drain_secs（本函数）+ main 在途请求
+/// 等待（同一预算），留足余量，否则排水被硬杀截断、在途 SSE 计费丢失。
+async fn drain_connections(graceful: GracefulShutdown, drain_secs: u64) {
+    if tokio::time::timeout(Duration::from_secs(drain_secs), graceful.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "drain budget ({}s) exhausted; dropping remaining connections",
+            drain_secs
+        );
+    }
 }
 
 /// HTTP：全部 301 到 HTTPS（Location 端口取自 https_addr，而非请求 Host）
