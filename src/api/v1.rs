@@ -12,14 +12,16 @@ use crate::service::proxy::{self, Endpoint};
 use crate::state::AppState;
 
 /// 客户端 IP：对端地址命中受信代理网段（GATEWAY_TRUST_PROXY_CIDRS）时采信
-/// XFF 首值；否则（含配置为空 = 直连拓扑）一律用对端地址——直连场景 XFF 可
-/// 伪造，采信会绕过按 IP 限流。仅用于用量统计/限流，非安全边界承诺。
+/// XFF 最右非空条目（W-1：proxy_add_x_forwarded_for 追加语义下最左是攻击者
+/// 可伪造首值；多行头并入拼接后取最右）；否则（含配置为空 = 直连拓扑）一律
+/// 用对端地址——直连场景 XFF 可伪造，采信会绕过按 IP 限流。仅用于用量统计/
+/// 限流，非安全边界承诺。
 pub(crate) fn resolve_client_ip(
     peer: SocketAddr,
     headers: &axum::http::HeaderMap,
     trust_cidrs: &str,
 ) -> std::net::IpAddr {
-    crate::api::resolve_trusted_ip(peer, headers.get("x-forwarded-for"), trust_cidrs)
+    crate::api::resolve_trusted_ip(peer, crate::api::last_xff_entry(headers), trust_cidrs)
 }
 
 pub fn routes(state: AppState) -> Router<AppState> {

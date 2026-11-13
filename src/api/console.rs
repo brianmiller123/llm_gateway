@@ -157,11 +157,12 @@ async fn login(
     Json(req): Json<LoginReq>,
 ) -> Result<impl IntoResponse, AppError> {
     // 暴力破解防护：每用户名 10 次/分 + 每来源 IP 30 次/分（成功后重置计数）
-    // IP 桶走受信代理判定（GATEWAY_TRUST_PROXY_CIDRS）：反代网段内取 XFF 首值，
+    // IP 桶走受信代理判定（GATEWAY_TRUST_PROXY_CIDRS）：反代网段内取 XFF 最右
+    // 非空条目（W-1：proxy_add_x_forwarded_for 追加语义，最左可伪造），
     // 直连/非受信对端一律用 socket 地址（XFF 可伪造，采信会绕过每 IP 限流）
     let client_ip = crate::api::resolve_trusted_ip(
         addr,
-        headers.get("x-forwarded-for"),
+        crate::api::last_xff_entry(&headers),
         &st.cfg.trust_proxy_cidrs,
     );
     let username = req.username.trim().to_string();

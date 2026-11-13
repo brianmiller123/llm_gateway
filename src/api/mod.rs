@@ -184,27 +184,49 @@ fn html_response(bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// 客户端来源解析的信任边界（审计 #15）：对端地址命中 `trust_cidrs`
+/// 客户端来源解析的信任边界（审计 #15 + W-1）：对端地址命中 `trust_cidrs`
 /// （CSV IPv4 CIDR，如 "10.0.0.0/8,192.168.1.0/24"，env GATEWAY_TRUST_PROXY_CIDRS）
-/// 时采信 XFF 首值——可信代理链上首值是客户端真实来源；否则（含配置为空 =
-/// 直连拓扑）一律用对端 socket 地址，XFF 可伪造、采信会绕过按 IP 限流。
+/// 时采信 XFF **最右非空条目**；否则（含配置为空 = 直连拓扑）一律用对端
+/// socket 地址，XFF 可伪造、采信会绕过按 IP 限流。
 /// 仅用于用量统计/限流桶，非安全边界承诺。
+///
+/// 最右语义（W-1）：`proxy_add_x_forwarded_for`（nginx 默认）把来源**追加**
+/// 到既有 XFF 尾部——最左是攻击者可伪造的首值，最右才是最贴近网关的可信
+/// 代理看到的客户端来源；本配置文档化的单可信代理拓扑下语义成立。若上游
+/// 代理采用**覆盖**（而非追加）写法，最右即该代理自身的视角值，仍是可信
+/// 代理链上最接近网关的一跳（此前取首值，攻击者在请求里自带 XFF 即可
+/// 伪造来源）。多行 XFF 头按出现顺序视同拼接（见 [`last_xff_entry`]）。
+/// 最右条目非法则拒绝（宁可退回对端地址，不可让伪造头决定限流桶键）。
 /// IPv4-mapped IPv6 对端（::ffff:a.b.c.d，双栈 socket 常见）先归一为 IPv4 再匹配。
 pub fn resolve_trusted_ip(
     peer: SocketAddr,
-    xff: Option<&axum::http::HeaderValue>,
+    xff_last: Option<&str>,
     trust_cidrs: &str,
 ) -> IpAddr {
     let peer_ip = normalize_ipv4_mapped(peer.ip());
     if !peer_in_trust_cidrs(peer_ip, trust_cidrs) {
         return peer_ip;
     }
-    // 受信代理链路：只认 XFF 首值（后值是代理自行追加，不可作为客户端来源）；
-    // 首值非法则拒绝（宁可退回对端地址，不可让伪造头决定限流桶键）
-    xff.and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(parse_xff_ip)
-        .unwrap_or(peer_ip)
+    xff_last.and_then(parse_xff_ip).unwrap_or(peer_ip)
+}
+
+/// XFF 全部行拼接语义的最右非空条目（零分配）：逐行从左到右覆盖"最后一个
+/// 非空白"——等价于 `get_all(..)` 拼接后 `split(',')` 取最右非空条目。
+/// `headers.get()` 只读首行，会漏掉多行 XFF（W-1）。
+pub(crate) fn last_xff_entry(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let mut last = None;
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(s) = value.to_str() else {
+            continue;
+        };
+        for entry in s.split(',') {
+            let trimmed = entry.trim();
+            if !trimmed.is_empty() {
+                last = Some(trimmed);
+            }
+        }
+    }
+    last
 }
 
 /// 对端是否命中受信网段；逐条匹配不落集合（请求期热路径，零分配）。
@@ -326,15 +348,52 @@ mod tests {
         Some(HeaderValue::from_static(value))
     }
 
-    /// resolve_trusted_ip 的测试包装：持有 XFF 所有权并在调用处转引用
+    /// resolve_trusted_ip 的测试包装：XFF 已按 last_xff_entry 语义取最右条目
     fn trusted(peer_addr: &str, forwarded: Option<HeaderValue>, cidrs: &str) -> IpAddr {
-        resolve_trusted_ip(peer(peer_addr), forwarded.as_ref(), cidrs)
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(v) = forwarded {
+            headers.append("x-forwarded-for", v);
+        }
+        resolve_trusted_ip(peer(peer_addr), crate::api::last_xff_entry(&headers), cidrs)
     }
 
+    /// W-1：受信代理链上采信 XFF **最右**非空条目——proxy_add_x_forwarded_for
+    /// 追加语义下，攻击者伪造的首条目必须被忽略
     #[test]
-    fn trusted_peer_takes_first_xff_entry() {
+    fn trusted_peer_takes_last_xff_entry_ignoring_spoofed_first() {
         let resolved = trusted("10.1.2.3", xff("203.0.113.7, 10.1.2.3"), "10.0.0.0/8");
-        assert_eq!(resolved, ip("203.0.113.7"));
+        assert_eq!(resolved, ip("10.1.2.3"), "伪造的首条目不得决定来源");
+        let resolved = trusted("10.1.2.3", xff("203.0.113.7, 198.51.100.4, 10.1.2.3"), "10.0.0.0/8");
+        assert_eq!(resolved, ip("10.1.2.3"), "最右条目才是最贴近网关的可信代理所见");
+    }
+
+    /// W-1：多行 XFF 头按拼接语义取最右（此前 get() 只读首行）
+    #[test]
+    fn multi_line_xff_concatenates_before_taking_last() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.4, 10.1.2.3"));
+        assert_eq!(
+            crate::api::last_xff_entry(&headers),
+            Some("10.1.2.3"),
+            "多行 XFF 并入拼接后取最右非空条目"
+        );
+        // 单行行为不变
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7, 10.1.2.3"));
+        assert_eq!(crate::api::last_xff_entry(&headers), Some("10.1.2.3"));
+        // 空白/空条目被跳过；无头 → None
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7, "));
+        assert_eq!(crate::api::last_xff_entry(&headers), Some("203.0.113.7"));
+        assert_eq!(crate::api::last_xff_entry(&axum::http::HeaderMap::new()), None);
+    }
+
+    /// W-1：最右条目非法 → 退回对端地址（伪造头不得决定限流桶键）
+    #[test]
+    fn malformed_last_xff_entry_falls_back_to_peer() {
+        let resolved = trusted("10.1.2.3", xff("203.0.113.7, not-an-ip"), "10.0.0.0/8");
+        assert_eq!(resolved, ip("10.1.2.3"));
     }
 
     #[test]
