@@ -157,13 +157,13 @@ async fn login(
     Json(req): Json<LoginReq>,
 ) -> Result<impl IntoResponse, AppError> {
     // 暴力破解防护：每用户名 10 次/分 + 每来源 IP 30 次/分（成功后重置计数）
-    // 反代部署下对端地址是 Nginx，IP 桶用 X-Forwarded-For 首值（假定可信反代）
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next().map(str::trim))
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        .unwrap_or(addr.ip());
+    // IP 桶走受信代理判定（GATEWAY_TRUST_PROXY_CIDRS）：反代网段内取 XFF 首值，
+    // 直连/非受信对端一律用 socket 地址（XFF 可伪造，采信会绕过每 IP 限流）
+    let client_ip = crate::api::resolve_trusted_ip(
+        addr,
+        headers.get("x-forwarded-for"),
+        &st.cfg.trust_proxy_cidrs,
+    );
     let username = req.username.trim().to_string();
     if let Err(secs) = st
         .limiter

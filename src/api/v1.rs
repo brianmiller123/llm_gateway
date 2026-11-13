@@ -11,18 +11,15 @@ use crate::error::AppError;
 use crate::service::proxy::{self, Endpoint};
 use crate::state::AppState;
 
-/// 客户端 IP：X-Forwarded-For 首值可解析时用之（假定经可信反代部署），
-/// 否则取对端地址。仅用于用量统计，非安全边界（直连场景可伪造 XFF）。
+/// 客户端 IP：对端地址命中受信代理网段（GATEWAY_TRUST_PROXY_CIDRS）时采信
+/// XFF 首值；否则（含配置为空 = 直连拓扑）一律用对端地址——直连场景 XFF 可
+/// 伪造，采信会绕过按 IP 限流。仅用于用量统计/限流，非安全边界承诺。
 pub(crate) fn resolve_client_ip(
     peer: SocketAddr,
     headers: &axum::http::HeaderMap,
+    trust_cidrs: &str,
 ) -> std::net::IpAddr {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next().map(str::trim))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(peer.ip())
+    crate::api::resolve_trusted_ip(peer, headers.get("x-forwarded-for"), trust_cidrs)
 }
 
 pub fn routes(state: AppState) -> Router<AppState> {
@@ -71,7 +68,7 @@ async fn responses(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, &st.cfg.trust_proxy_cidrs);
     proxy::proxy(
         &st,
         headers,
@@ -96,7 +93,7 @@ async fn messages(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, &st.cfg.trust_proxy_cidrs);
     match proxy::proxy(
         &st,
         headers,
@@ -122,7 +119,7 @@ async fn chat_completions(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, &st.cfg.trust_proxy_cidrs);
     proxy::proxy(
         &st,
         headers,
@@ -144,7 +141,7 @@ async fn completions(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, &st.cfg.trust_proxy_cidrs);
     proxy::proxy(
         &st,
         headers,
@@ -166,7 +163,7 @@ async fn embeddings(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, &st.cfg.trust_proxy_cidrs);
     proxy::proxy(
         &st,
         headers,
