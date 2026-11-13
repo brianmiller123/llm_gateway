@@ -1233,7 +1233,11 @@ async fn proxy_authed(
             .chain(route.upstream_model.clone())
             .collect(),
         plan: plan_bill,
-        // 失败归因（连接加固）：仅候选失败行经 usage::record_failure_row 填写
+        // 失败归因（连接加固/F3）：failure_class 仅内部候选失败行经
+        // usage::record_failure_row 填写（状态页聚合以 failure_class IS NULL
+        // 过滤出客户端可见行）；终局行保持 NULL，仅带 upstream_status/attempt
+        // 归因对——此前终局行也写 failure_class，会让该过滤器把客户端真实
+        // 收到的错误一并滤掉（错误率恒 0）
         failure_class: None,
         upstream_status: None,
         attempt: None,
@@ -1332,7 +1336,6 @@ async fn proxy_authed(
                 // 终局透传上游错误体：非重试失败（客户端拿到真实状态码）——
                 // 上游错误指标 + 失败归因随记账行落库
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
                 st.breaker.record_success(provider.id);
@@ -1818,7 +1821,6 @@ async fn proxy_authed(
                 );
                 // 连接加固：终局透传上游错误体 → 上游错误指标 + 失败归因
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
@@ -1909,7 +1911,6 @@ async fn proxy_authed(
                 // 连接加固：200 + 不可转换体 = 上游故障 → 上游错误指标 +
                 // 失败归因（真实上游状态），按 502 记账并整形返回
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, usage.as_ref(), 502, latency).await;
@@ -1946,7 +1947,6 @@ async fn proxy_authed(
                 }
                 // 连接加固：终局透传上游错误体 → 上游错误指标 + 失败归因
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
@@ -2038,7 +2038,6 @@ async fn proxy_authed(
             let latency = started.elapsed().as_millis() as i64;
             // 连接加固：终局失败行带归因——真实上游状态 + 候选序号成对落库
             //（F4：两者取自同一 last_failure_at，不指向无响应候选）
-            meta.failure_class = Some("upstream_status");
             meta.upstream_status = last_failure_at.map(|(s, _)| s as i16);
             meta.attempt = last_failure_at.map(|(_, i)| i as i16);
             usage::record(st, &meta, None, status, latency).await;
@@ -2181,7 +2180,6 @@ async fn proxy_authed(
                 // 终局透传上游错误体：非重试失败（客户端拿到真实状态码）——
                 // 上游错误指标 + 失败归因随记账行落库
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
                 st.breaker.record_success(provider.id);
@@ -2364,7 +2362,6 @@ async fn proxy_authed(
                 );
                 // 连接加固：终局上游故障（协议违约体）→ 上游错误指标 + 失败归因
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
@@ -2503,7 +2500,6 @@ async fn proxy_authed(
             // 终局状态，状态页错误率与客户端所见一致）
             if !response_status.is_success() {
                 st.metrics.record_upstream_error(provider.id);
-                meta.failure_class = Some("upstream_status");
                 meta.upstream_status = Some(status.as_u16() as i16);
                 meta.attempt = Some(attempt_idx as i16);
             }
@@ -2523,7 +2519,6 @@ async fn proxy_authed(
             let latency = started.elapsed().as_millis() as i64;
             // 连接加固：终局失败行带归因——真实上游状态 + 候选序号成对落库
             //（F4：序号来自产生该响应的同一候选，不指向无响应候选）
-            meta.failure_class = Some("upstream_status");
             meta.upstream_status = Some(status as i16);
             meta.attempt = Some(attempt_idx as i16);
             let usage = parse_usage(&bytes);

@@ -100,8 +100,10 @@ pub async fn record(
 
 /// 候选失败行（连接加固）：每个失败候选一条零 token / 零成本明细，仅记录
 /// 失败归因（类别 + 上游状态 + 候选序号）。`status_out` 写行内 status 列，
-/// 与该候选故障最终呈现给客户端的状态一致（状态页 `status >= 400` 口径下
-/// 真实反映上游故障）。成功行不经过此函数（归因列保持 NULL，行为不变）。
+/// 与该候选故障最终呈现给客户端的状态一致。成功行不经过此函数（归因列保持
+/// NULL）。F3：本函数是 failure_class 非空的唯一入口——状态页/实时聚合以
+/// `failure_class IS NULL` 排除这些内部归因行，只计客户端可见行（含终局
+/// 错误行；终局行保持 failure_class NULL，仅带 upstream_status/attempt）。
 pub async fn record_failure_row(
     st: &AppState,
     meta: &UsageMeta,

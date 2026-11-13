@@ -29,13 +29,16 @@ pub struct UsageMeta {
     pub pricing_models: Vec<String>,
     /// Coding Plan 计量（None = 用户无生效 Plan，跳过计数器写入）
     pub plan: Option<PlanBill>,
-    /// 失败归因类别（连接加固；仅候选失败行有值，成功行恒 None）：
-    /// connect_error / header_timeout / body_timeout / body_read_error /
-    /// upstream_status / all_candidates_failed
+    /// 失败归因类别（连接加固/F3；仅内部候选失败行经 record_failure_row 有值，
+    /// 成功行与终局行恒 None——状态页聚合以 `failure_class IS NULL` 过滤出
+    /// 客户端可见行）：connect_error / header_timeout / body_timeout /
+    /// body_read_error / upstream_status / all_candidates_failed
     pub failure_class: Option<&'static str>,
-    /// 上游 HTTP 状态（仅 failure_class = upstream_status 时有值）
+    /// 上游真实 HTTP 状态（候选失败行 = 该候选响应状态；终局透传行 = 客户端
+    /// 实际收到的上游错误状态；其余行 NULL）
     pub upstream_status: Option<i16>,
-    /// 候选序号（0 = 主渠道，1.. = 降级链；仅候选失败行有值）
+    /// 候选序号（0 = 主渠道，1.. = 降级链；候选失败行 = 该候选，终局透传行 =
+    /// 产生所透传响应的候选；与 upstream_status 成对更新，见 proxy F4）
     pub attempt: Option<i16>,
 }
 
@@ -205,7 +208,8 @@ pub async fn record_usage(
     .bind(meta.session_id.as_deref())
     .bind(meta.first_token_ms)
     .bind(gen_ms)
-    // 失败归因（连接加固）：候选失败行有值，成功行恒 NULL
+    // 失败归因（连接加固/F3）：failure_class 仅候选失败行有值；upstream_status/
+    // attempt 另带终局透传行归因（成对，见 proxy F4）；成功行三者恒 NULL
     .bind(meta.failure_class)
     .bind(meta.upstream_status)
     .bind(meta.attempt)

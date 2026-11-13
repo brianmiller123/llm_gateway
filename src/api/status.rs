@@ -167,24 +167,27 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
     let provider_names: HashMap<i64, String> =
         providers.iter().map(|p| (p.id, p.name.clone())).collect();
 
-    // 用量数据（DB 不可用时置空，供应商组件统一标记 unknown）
+    // 用量数据（DB 不可用时置空，供应商组件统一标记 unknown）。
+    // F3（连接加固）：failure_class 非空 = 内部候选失败归因行（每失败候选一条，
+    // 零 token 零成本），不进供应商调用统计——同一客户端请求会按失败候选数
+    // 重复计数；客户端可见行（含终局错误行，failure_class 恒 NULL）才是口径
     let (windows, daily, hourly) = if db_ok {
         let windows = sqlx::query_as::<_, WindowRow>(
             "SELECT provider_id, \
-                    COUNT(*) FILTER (WHERE created_at >= now() - interval '10 minutes')::bigint AS calls_10m, \
-                    COUNT(*) FILTER (WHERE created_at >= now() - interval '10 minutes' AND status >= 400)::bigint AS errors_10m, \
-                    COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes')::bigint AS calls_60m, \
-                    COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes' AND status >= 400)::bigint AS errors_60m, \
-                    COUNT(*) FILTER (WHERE created_at >= now() - interval '24 hours')::bigint AS calls_24h, \
-                    COUNT(*) FILTER (WHERE created_at >= now() - interval '24 hours' AND status >= 400)::bigint AS errors_24h \
+                    COUNT(*) FILTER (WHERE created_at >= now() - interval '10 minutes' AND failure_class IS NULL)::bigint AS calls_10m, \
+                    COUNT(*) FILTER (WHERE created_at >= now() - interval '10 minutes' AND status >= 400 AND failure_class IS NULL)::bigint AS errors_10m, \
+                    COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes' AND failure_class IS NULL)::bigint AS calls_60m, \
+                    COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes' AND status >= 400 AND failure_class IS NULL)::bigint AS errors_60m, \
+                    COUNT(*) FILTER (WHERE created_at >= now() - interval '24 hours' AND failure_class IS NULL)::bigint AS calls_24h, \
+                    COUNT(*) FILTER (WHERE created_at >= now() - interval '24 hours' AND status >= 400 AND failure_class IS NULL)::bigint AS errors_24h \
              FROM usage_logs WHERE created_at >= now() - interval '24 hours' GROUP BY provider_id",
         )
         .fetch_all(&st.pool)
         .await;
         let daily = sqlx::query_as::<_, DailyRow>(
             "SELECT provider_id, (created_at AT TIME ZONE 'UTC')::date AS d, \
-                    COUNT(*)::bigint AS calls, \
-                    COUNT(*) FILTER (WHERE status >= 400)::bigint AS errors \
+                    COUNT(*) FILTER (WHERE failure_class IS NULL)::bigint AS calls, \
+                    COUNT(*) FILTER (WHERE status >= 400 AND failure_class IS NULL)::bigint AS errors \
              FROM usage_logs WHERE created_at >= now() - interval '30 days' \
              GROUP BY provider_id, d ORDER BY d",
         )
@@ -192,8 +195,8 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         .await;
         let hourly = sqlx::query_as::<_, HourRow>(
             "SELECT provider_id, date_trunc('hour', created_at) AS hour, \
-                    COUNT(*)::bigint AS calls, \
-                    COUNT(*) FILTER (WHERE status >= 400)::bigint AS errors \
+                    COUNT(*) FILTER (WHERE failure_class IS NULL)::bigint AS calls, \
+                    COUNT(*) FILTER (WHERE status >= 400 AND failure_class IS NULL)::bigint AS errors \
              FROM usage_logs WHERE created_at >= now() - interval '30 days' \
              GROUP BY provider_id, hour ORDER BY hour",
         )
