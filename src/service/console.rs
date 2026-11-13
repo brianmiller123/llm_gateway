@@ -44,6 +44,9 @@ pub async fn login(st: &AppState, username: &str, password: &str) -> Result<Sess
                 )
                 .await
                 .map_err(AppError::internal)?;
+                // 目录升降权即时反映到代理旁路：增量同步单个 id（撤销/禁用立即
+                // 移除，首登管理员立即加入），不再全量 reload——其失败不影响授权。
+                st.sync_admin_id(user.id, user.is_admin && user.status == 1);
                 return issue_session(st, user).await;
             }
             Err(LdapError::UserNotFound) => {

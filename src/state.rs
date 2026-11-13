@@ -1,6 +1,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -68,6 +69,10 @@ pub struct AppState {
     pub plans: Arc<RwLock<HashMap<i64, Vec<crate::store::plans::PlanRuntime>>>>,
     /// 管理员用户 id 集合（授权检查时跳过）
     pub admin_ids: Arc<RwLock<HashSet<i64>>>,
+    /// `admin_ids` 的代际版本号：每次增量写（[`AppState::sync_admin_id`]）在写锁内
+    /// +1；全量 reload 以「读快照前取到的版本」为写回守卫，使在途快照不能把已
+    /// 提交的撤销/授予覆盖回旧值（授权正确性不依赖 reload 与增量写的时序）
+    admin_ids_gen: Arc<AtomicU64>,
     /// 模型库中已禁用的模型：provider_id → model_id 集合。代理管线按出站模型名
     /// 剔除候选供应商（全部被剔 → 503），/v1/models 不列出。模型库启停后 reload
     /// 即时生效
@@ -153,6 +158,7 @@ impl AppState {
             user_access: Arc::new(RwLock::new(HashMap::new())),
             plans: Arc::new(RwLock::new(HashMap::new())),
             admin_ids: Arc::new(RwLock::new(HashSet::new())),
+            admin_ids_gen: Arc::new(AtomicU64::new(0)),
             disabled_models: Arc::new(RwLock::new(HashMap::new())),
             breaker: Arc::new(crate::service::breaker::Breaker::new_with(breaker_cfg)),
             limiter: Arc::new(RateLimiter::new()),
@@ -208,6 +214,36 @@ impl AppState {
         Ok(())
     }
 
+    /// 全量刷新管理员 id 缓存（代理路径的管理员旁路判定）。仅由启动/周期
+    /// reload 调用；权限变更走 [`Self::sync_admin_id`]，不等全表查询。
+    ///
+    /// 写回带代际守卫：读快照之前取 `admin_ids_gen`，写锁内该版本若已被增量
+    /// 写推进，则丢弃本次快照（`debug!` 留痕，下一周期自然收敛）——在途
+    /// reload 因此不能把已撤销的管理员写回旁路。
+    pub async fn reload_admin_ids(&self) -> Result<(), sqlx::Error> {
+        let seen_gen = self.admin_ids_gen.load(Ordering::SeqCst);
+        let v = crate::store::users::load_admin_ids(&self.pool).await?;
+        if !commit_admin_snapshot(&self.admin_ids, &self.admin_ids_gen, seen_gen, v) {
+            tracing::debug!(
+                snapshot_gen = seen_gen,
+                current_gen = self.admin_ids_gen.load(Ordering::SeqCst),
+                "admin_ids snapshot discarded: incremental update committed meanwhile"
+            );
+        }
+        Ok(())
+    }
+
+    /// 增量同步单个用户的管理员缓存：授予写锁加入，撤销/禁用写锁移除。
+    ///
+    /// `is_admin` 必须是「有效权限且账号启用」的物化结果（调用方用
+    /// `user.is_admin && user.status == 1`），与 [`crate::store::users::load_admin_ids`]
+    /// 的集合口径 `is_admin AND status = 1` 一致。写锁内单条操作不查库：撤销后
+    /// 代理旁路立即不含该 id，全量 reload 是否成功、以及是否有在途 reload 快照
+    /// 都不再影响授权正确性（写锁内推进代际版本使陈旧快照作废）。
+    pub fn sync_admin_id(&self, user_id: i64, is_admin: bool) {
+        apply_admin_id(&self.admin_ids, &self.admin_ids_gen, user_id, is_admin);
+    }
+
     /// 全量热加载：供应商 / 路由 / 限流规则（并发上限）/ 单价 / 访问授权 / LDAP。
     ///
     /// 分节独立应用：任一节加载失败只影响该节（沿用旧值并 error 留痕），不再让
@@ -257,8 +293,7 @@ impl AppState {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("admin_ids", async {
-            let v: HashSet<i64> = crate::store::users::load_admin_ids(&self.pool).await?;
-            *self.admin_ids.write() = v;
+            self.reload_admin_ids().await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("disabled_models", async {
@@ -325,6 +360,41 @@ impl AppState {
     }
 }
 
+/// 管理员 id 缓存的增量维护（[`AppState::sync_admin_id`] 的实现，独立成函数
+/// 以便直接单测写锁语义）。`is_admin = true` 加入、`false` 移除，幂等；写锁内
+/// 推进代际版本，使在途的全量 reload 快照作废而不是覆盖本次变更。
+fn apply_admin_id(
+    ids: &RwLock<HashSet<i64>>,
+    generation: &AtomicU64,
+    user_id: i64,
+    is_admin: bool,
+) {
+    let mut ids = ids.write();
+    generation.fetch_add(1, Ordering::SeqCst);
+    if is_admin {
+        ids.insert(user_id);
+    } else {
+        ids.remove(&user_id);
+    }
+}
+
+/// 全量快照的写回判定（[`AppState::reload_admin_ids`] 的实现，独立成函数以便
+/// 直接单测代际守卫）：仅在读快照后没有增量写推进过代际时才整份覆盖；
+/// 否则保留增量结果并拒绝陈旧快照。返回是否写回。
+fn commit_admin_snapshot(
+    ids: &RwLock<HashSet<i64>>,
+    generation: &AtomicU64,
+    snapshot_gen: u64,
+    snapshot: HashSet<i64>,
+) -> bool {
+    let mut ids = ids.write();
+    if generation.load(Ordering::SeqCst) != snapshot_gen {
+        return false;
+    }
+    *ids = snapshot;
+    true
+}
+
 /// 空串 → None（DB 空字段回退 env 用）
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim();
@@ -337,7 +407,94 @@ fn non_empty(s: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageTemplates;
+    use super::{apply_admin_id, commit_admin_snapshot, MessageTemplates};
+    use parking_lot::RwLock;
+    use sqlx::PgPool;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 增量同步：授予写入缓存、撤销立即移除（代理旁路不等 30s 周期 reload），重复
+    /// 操作幂等且不影响其他 id。
+    #[test]
+    fn incremental_admin_sync_inserts_and_removes() {
+        let ids = RwLock::new(HashSet::new());
+        let generation = AtomicU64::new(0);
+        apply_admin_id(&ids, &generation, 7, true);
+        assert!(ids.read().contains(&7), "授予后缓存必须包含该 id");
+        apply_admin_id(&ids, &generation, 7, false);
+        assert!(!ids.read().contains(&7), "撤销后缓存必须立即不含该 id");
+        apply_admin_id(&ids, &generation, 7, false);
+        assert!(!ids.read().contains(&7), "重复撤销幂等");
+
+        apply_admin_id(&ids, &generation, 8, true);
+        assert!(ids.read().contains(&8));
+        assert!(!ids.read().contains(&7), "其他 id 不受影响");
+    }
+
+    /// 代际守卫（QC2 F2）：reload 读快照后发生增量撤销 → 写回被拒绝，
+    /// 已撤销的 id 不会因在途快照重新进入代理旁路。
+    #[test]
+    fn stale_admin_snapshot_is_rejected_after_incremental_revoke() {
+        let ids = RwLock::new(HashSet::from([7, 8]));
+        let generation = AtomicU64::new(0);
+
+        // T0：reload 读取代际并查库（快照里 7 仍是管理员）
+        let snapshot_gen = generation.load(Ordering::SeqCst);
+        let stale_snapshot = HashSet::from([7, 8]);
+        // T1-T2：PATCH 撤销 7 并提交，增量同步写锁内推进代际
+        apply_admin_id(&ids, &generation, 7, false);
+
+        // T3：reload 拿到写锁时发现代际已变 → 丢弃快照
+        assert!(
+            !commit_admin_snapshot(&ids, &generation, snapshot_gen, stale_snapshot),
+            "增量写提交后，陈旧快照必须被拒绝"
+        );
+        assert!(!ids.read().contains(&7), "已撤销管理员不得被在途 reload 写回");
+        assert!(ids.read().contains(&8), "未变更的 id 保持原状");
+    }
+
+    /// 无并发增量写时全量快照正常写回（启动/周期 reload 语义不变），
+    /// 随后的增量写仍在新快照之上生效。
+    #[test]
+    fn fresh_admin_snapshot_is_committed() {
+        let ids = RwLock::new(HashSet::new());
+        let generation = AtomicU64::new(0);
+        apply_admin_id(&ids, &generation, 7, true);
+
+        let snapshot_gen = generation.load(Ordering::SeqCst);
+        let snapshot = HashSet::from([7, 9]);
+        assert!(
+            commit_admin_snapshot(&ids, &generation, snapshot_gen, snapshot.clone()),
+            "代际未变时全量快照必须写回"
+        );
+        assert_eq!(*ids.read(), snapshot, "写回内容必须等于快照");
+
+        apply_admin_id(&ids, &generation, 7, false);
+        assert!(!ids.read().contains(&7), "快照之后的增量撤销仍然立即生效");
+    }
+
+    /// JIT 首登管理员仍立即生效：LDAP 首次登录创建的有效管理员经增量同步进入
+    /// 缓存，不再依赖周期 reload 的首次全量刷新。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn jit_first_login_admin_enters_admin_cache(pool: PgPool) {
+        let user = crate::store::users::upsert_ldap_user(
+            &pool,
+            "alice",
+            None,
+            None,
+            "uid=alice,ou=people,dc=example,dc=org",
+            true,
+        )
+        .await
+        .unwrap();
+        let ids = RwLock::new(HashSet::new());
+        let generation = AtomicU64::new(0);
+        apply_admin_id(&ids, &generation, user.id, user.is_admin && user.status == 1);
+        assert!(
+            ids.read().contains(&user.id),
+            "首登管理员必须立即进入代理旁路缓存"
+        );
+    }
 
     /// 空模板回落内置默认文案并替换占位符；自定义模板原样替换
     #[test]

@@ -173,6 +173,18 @@ impl Breaker {
         }
     }
 
+    /// 半开探测名额归还：探测请求既未成功也未失败就被丢弃（客户端断开、流未
+    /// 结算）时不计数，只释放名额——否则 `half_open_probe_in_flight` 会永久占位，
+    /// 渠道在窗口到期后再也不被 `allow` 放行。仅当名额确被占用时清除，不建条目。
+    pub fn release_probe(&self, provider_id: i64) {
+        let mut states = self.states.lock();
+        if let Some(pb) = states.get_mut(&provider_id) {
+            if pb.half_open_probe_in_flight {
+                pb.half_open_probe_in_flight = false;
+            }
+        }
+    }
+
     /// 衰减窗口：窗口到期整体重置（简单且无界安全的滑动近似）
     fn decay_window(&self, pb: &mut ProviderBreaker) {
         match pb.window_start {

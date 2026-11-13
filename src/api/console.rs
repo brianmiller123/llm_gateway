@@ -1206,6 +1206,7 @@ async fn list_users(
                 "display_name": u.display_name,
                 "source": u.source,
                 "is_admin": u.is_admin,
+                "admin_source": users::admin_source(u.admin_override),
                 "status": u.status,
                 "last_login_at": u.last_login_at,
                 "created_at": u.created_at,
@@ -1284,10 +1285,20 @@ async fn create_user(
 struct UpdateUserReq {
     /// 1 = 启用, 0 = 禁用
     status: Option<i16>,
-    /// Some(true) = 授权管理员, Some(false) = 取消管理员;None = 不变更。
-    /// 变更后 reload 刷新 admin_ids 缓存（代理路径授权即时生效）；
-    /// 控制台中间件每请求查库，天然即时。
+    /// Some(true) = 授权管理员（写手动覆盖）, Some(false) = 取消管理员（写手动覆盖）;
+    /// None = 不变更。覆盖写入后 LDAP 登录不再改写它。与 reset_admin_source 互斥。
     is_admin: Option<bool>,
+    /// true = 恢复目录同步：清除手动覆盖，权限回到目录真值。与 is_admin 互斥；
+    /// 仅 LDAP 用户可用，其他来源返回 400。false = no-op（不触发互斥，可与
+    /// is_admin 同时出现）。
+    reset_admin_source: Option<bool>,
+}
+
+/// `is_admin`（任何取值，含 false）与 `reset_admin_source = true` 互斥。
+/// `reset_admin_source: false` 是 no-op，不算冲突——`{"is_admin": true,
+/// "reset_admin_source": false}` 必须按 is_admin 处理。
+fn admin_actions_conflict(is_admin: Option<bool>, reset_admin_source: Option<bool>) -> bool {
+    is_admin.is_some() && reset_admin_source == Some(true)
 }
 
 async fn update_user(
@@ -1297,6 +1308,11 @@ async fn update_user(
     Json(req): Json<UpdateUserReq>,
 ) -> Result<impl IntoResponse, AppError> {
     let actor = admin.id;
+    if admin_actions_conflict(req.is_admin, req.reset_admin_source) {
+        return Err(AppError::BadRequest(
+            "is_admin and reset_admin_source are mutually exclusive".into(),
+        ));
+    }
     let Some(target) = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
@@ -1304,6 +1320,13 @@ async fn update_user(
         return Err(AppError::BadRequest("user not found".into()));
     };
     ensure_not_protected(&st.cfg, &target)?;
+    // reset 只对 LDAP 用户有意义：本地账号没有目录真值，清除覆盖只会留下
+    // admin_override = NULL 的「directory」来源态。在任何字段写入之前拒绝。
+    if req.reset_admin_source == Some(true) && target.source != "ldap" {
+        return Err(AppError::BadRequest(
+            "reset_admin_source is only available for LDAP users".into(),
+        ));
+    }
     if let Some(status) = req.status {
         if !(0..=1).contains(&status) {
             return Err(AppError::BadRequest("status must be 0 or 1".into()));
@@ -1328,28 +1351,49 @@ async fn update_user(
         .await
         .map_err(AppError::internal)?;
     }
-    if let Some(grant) = req.is_admin {
-        if target.is_admin != grant {
+    // 权限变更：is_admin 写手动覆盖（LDAP 登录不再改写）；reset_admin_source
+    // 清除覆盖回到目录真值。
+    let admin_action = if let Some(grant) = req.is_admin {
+        if target.is_admin == grant {
+            None
+        } else {
             users::set_is_admin(&st.pool, id, grant)
                 .await
                 .map_err(AppError::internal)?;
-            st.reload().await.map_err(AppError::internal)?;
-            audit::log(
-                &st.pool,
-                Some(actor),
-                "user.is_admin",
-                Some("user"),
-                Some(id),
-                Some(json!({"is_admin": grant, "username": target.username})),
-            )
+            Some("user.is_admin")
+        }
+    } else if req.reset_admin_source == Some(true) {
+        users::reset_admin_source(&st.pool, id)
             .await
             .map_err(AppError::internal)?;
-        }
-    }
+        Some("user.admin_source.reset")
+    } else {
+        None
+    };
     let updated = users::find_by_id(&st.pool, id)
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::Internal("user vanished".into()))?;
+    // 增量同步管理员缓存（含 status 变更：禁用即移出旁路集合）：撤销立即生效，
+    // 不再依赖可能失败的全量 reload——授权正确性只由已提交的物化值决定。
+    st.sync_admin_id(updated.id, updated.is_admin && updated.status == 1);
+    if let Some(action) = admin_action {
+        audit::log(
+            &st.pool,
+            Some(actor),
+            action,
+            Some("user"),
+            Some(id),
+            Some(json!({
+                "is_admin": updated.is_admin,
+                "admin_source": users::admin_source(updated.admin_override),
+                "directory_admin": updated.admin_ldap,
+                "username": updated.username,
+            })),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    }
     Ok(Json(json!({"user": user_json(&st, &updated)})))
 }
 
@@ -1578,6 +1622,7 @@ fn user_json(st: &AppState, u: &users::UserRow) -> serde_json::Value {
         "source": u.source,
         "ldap_dn": u.ldap_dn,
         "is_admin": u.is_admin,
+        "admin_source": users::admin_source(u.admin_override),
         "status": u.status,
         "last_login_at": u.last_login_at,
         "created_at": u.created_at,
@@ -1621,8 +1666,29 @@ pub(crate) async fn ensure_not_protected_by_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{BucketPoint, aggregate_active_by_user, fill_bucket_gaps_at};
+    use super::{
+        admin_actions_conflict, aggregate_active_by_user, fill_bucket_gaps_at, BucketPoint,
+    };
     use std::collections::HashMap;
+
+    /// 互斥只由 `reset_admin_source == Some(true)` 触发：false 是 no-op，
+    /// `{"is_admin": <任意>, "reset_admin_source": false}` 必须放行按 is_admin 处理。
+    #[test]
+    fn admin_actions_conflict_only_on_active_reset() {
+        assert!(
+            admin_actions_conflict(Some(true), Some(true)),
+            "is_admin 与 reset=true 冲突"
+        );
+        assert!(admin_actions_conflict(Some(false), Some(true)));
+        assert!(
+            !admin_actions_conflict(Some(true), Some(false)),
+            "reset=false 是 no-op，不得误拒 is_admin"
+        );
+        assert!(!admin_actions_conflict(Some(false), Some(false)));
+        assert!(!admin_actions_conflict(Some(true), None));
+        assert!(!admin_actions_conflict(None, Some(true)));
+        assert!(!admin_actions_conflict(None, None));
+    }
 
     /// 在途聚合：同用户跨模型合计、总数降序/同数按 user_id 升序、by_model
     /// 模型名升序、空模型键原样透出、空表→空数组

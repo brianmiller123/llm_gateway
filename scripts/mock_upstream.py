@@ -9,7 +9,17 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 9001
+PORT = int(os.environ.get("PORT", "9001"))
+
+
+def _delay_file(path: str, default: float) -> float:
+    """读取 /tmp 下的延迟秒数（缺失/非法时用 default）"""
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, obj: dict) -> None:
@@ -19,6 +29,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # ---- 流式辅助（长任务模式复用）----
+    def _sse_start(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+
+    def _sse_write(self, obj=None, raw=None):
+        self.wfile.write(raw if raw is not None else f"data: {json.dumps(obj)}\n\n".encode())
+        self.wfile.flush()
+
+    def _chat_chunk(self, model, delta, finish=None, usage=None):
+        chunk = {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "model": model,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if usage is not None:
+            chunk["usage"] = usage
+        self._sse_write(chunk)
+
+    def _chat_stream_content(self, model, usage):
+        pieces = ["Hello", " world", "!"]
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            self._chat_chunk(model, {"content": piece}, "stop" if last else None,
+                             usage if last else None)
+            time.sleep(0.05)
+        self._sse_write(raw=b"data: [DONE]\n\n")
 
     def do_GET(self):
         if self.path in ("/1/status", "/v1/1/status"):
@@ -88,6 +124,33 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             mode = ""
 
+        # ---- 长任务模式（W1 回归：长预填充 / 长思考 / 中性帧洪水）----
+        if mode == "slow_first_byte" and body.get("stream"):
+            # SSE 头立即返回，首块延迟 /tmp/mock_delay_first_secs 秒（长预填充）
+            self._sse_start()
+            time.sleep(_delay_file("/tmp/mock_delay_first_secs", 90.0))
+            self._chat_stream_content(model, usage)
+            return
+        if mode == "slow_mid" and body.get("stream"):
+            # 首块产出后静默 /tmp/mock_delay_mid_secs 秒再继续（长思考）
+            self._sse_start()
+            self._chat_chunk(model, {"content": "Hello"}, None)
+            time.sleep(_delay_file("/tmp/mock_delay_mid_secs", 150.0))
+            self._chat_chunk(model, {"content": " world"}, None)
+            self._chat_chunk(model, {"content": "!"}, "stop", usage)
+            self._sse_write(raw=b"data: [DONE]\n\n")
+            return
+        if mode == "neutral_frames" and body.get("stream"):
+            # 持续中性帧（delta.role + `: ping`）共 /tmp/mock_delay_neutral_secs 秒
+            # 后再输出内容：验证 priming deadline 到点提交响应头
+            self._sse_start()
+            deadline = time.monotonic() + _delay_file("/tmp/mock_delay_neutral_secs", 60.0)
+            while time.monotonic() < deadline:
+                self._chat_chunk(model, {"role": "assistant"}, None)
+                self._sse_write(raw=b": ping\n\n")
+                time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+            self._chat_stream_content(model, usage)
+            return
         if mode == "json_body_for_stream" and body.get("stream"):
             # 流式请求但回完整 Chat completion JSON（上游忽略 stream 参数）
             self._json(200, {
