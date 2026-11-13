@@ -1254,13 +1254,13 @@ async fn proxy_authed(
         // 尚未向客户端写出任何字节（响应流在候选选定后才返回），无重复生成风险
         //（cc-switch 流式首块失败可重试同款）。选定候选后不再重试（防重复计费）。
         let mut last_failure: Option<(u16, Vec<u8>, String, UpstreamHeaders)> = None;
-        // last_failure 元组里的状态码可能是网关合成的 502（priming 错误帧/
-        // 提前断流）；归因行需要真实上游状态（200 流内错误帧 / 重试状态原值）
-        let mut last_failure_upstream: Option<u16> = None;
+        // 终局归因对（真实上游状态, 候选序号）：必须成对更新。此前 upstream_status
+        // 取最后一次 HTTP 响应、attempt 取最后一次失败候选，两者可能错位（F4：
+        // attempt 指向无响应候选）。last_failure 元组里网关合成的状态码（priming
+        // 错误帧 / 提前断流）不进这里——归因只记真实上游状态
+        let mut last_failure_at: Option<(u16, usize)> = None;
         // L5：实际最后失败的候选（尾段错误上下文归属；默认主候选）
         let mut last_failed: Option<&Provider> = None;
-        // 失败归因行的 attempt 列（0 = 主渠道，1.. = 降级链）
-        let mut last_failed_idx: Option<usize> = None;
         let mut saw_timeout = false;
         let mut saw_connect_error = false;
         // 候选循环内响应体预读/错误体收集的统一截止时间（僵死流兜底）
@@ -1429,7 +1429,6 @@ async fn proxy_authed(
                         );
                     }
                     last_failed = Some(provider);
-                    last_failed_idx = Some(attempt_idx);
                     continue;
                 }
             };
@@ -1453,7 +1452,7 @@ async fn proxy_authed(
                     .to_vec();
                 tracing::warn!(provider = %provider.name, status = %status, "upstream stream retryable failure");
                 last_failure = Some((status.as_u16(), bytes, content_type, rl.clone()));
-                last_failure_upstream = Some(status.as_u16());
+                last_failure_at = Some((status.as_u16(), attempt_idx));
                 if st.breaker.record_failure(provider.id) {
                     st.metrics.record_breaker_open();
                 }
@@ -1473,7 +1472,6 @@ async fn proxy_authed(
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                 }
                 last_failed = Some(provider);
-                last_failed_idx = Some(attempt_idx);
                 continue;
             }
             // P0-2：熔断 success 复位延后——priming 窗口内错误（传输错误/错误
@@ -1553,14 +1551,13 @@ async fn proxy_authed(
                                     "upstream stream error envelope within priming window; failing over"
                                 );
                                 last_failed = Some(provider);
-                                last_failed_idx = Some(attempt_idx);
                                 last_failure = Some((
                                     502,
                                     upstream_error_envelope(&msg),
                                     "application/json".to_string(),
                                     Vec::new(),
                                 ));
-                                last_failure_upstream = Some(status.as_u16());
+                                last_failure_at = Some((status.as_u16(), attempt_idx));
                                 if st.breaker.record_failure(provider.id) {
                                     st.metrics.record_breaker_open();
                                 }
@@ -1589,14 +1586,13 @@ async fn proxy_authed(
                                         "upstream stream error frame within priming window; failing over"
                                     );
                                     last_failed = Some(provider);
-                                    last_failed_idx = Some(attempt_idx);
                                     last_failure = Some((
                                         502,
                                         upstream_error_envelope(&msg),
                                         "application/json".to_string(),
                                         Vec::new(),
                                     ));
-                                    last_failure_upstream = Some(status.as_u16());
+                                    last_failure_at = Some((status.as_u16(), attempt_idx));
                                     if st.breaker.record_failure(provider.id) {
                                         st.metrics.record_breaker_open();
                                     }
@@ -1629,7 +1625,6 @@ async fn proxy_authed(
                             );
                             tracing::warn!(provider = %provider.name, error = %msg, "stream priming transport error");
                             last_failed = Some(provider);
-                            last_failed_idx = Some(attempt_idx);
                             // 超时（首字节/静默）→ 504；传输错误与零产出断流 → 502
                             let timed_out = is_timeout_error(e.as_ref());
                             last_failure = Some((
@@ -1645,7 +1640,7 @@ async fn proxy_authed(
                             } else {
                                 ("connect_error", 502u16)
                             };
-                            last_failure_upstream = Some(status.as_u16());
+                            last_failure_at = Some((status.as_u16(), attempt_idx));
                             if st.breaker.record_failure(provider.id) {
                                 st.metrics.record_breaker_open();
                             }
@@ -1710,7 +1705,6 @@ async fn proxy_authed(
                             };
                             tracing::warn!(provider = %provider.name, "{msg}");
                             last_failed = Some(provider);
-                            last_failed_idx = Some(attempt_idx);
                             last_failure = Some((
                                 502,
                                 upstream_error_envelope(&msg),
@@ -1719,7 +1713,7 @@ async fn proxy_authed(
                             ));
                             // 连接加固：体未完成即干净断流 → body_read_error
                             //（真实上游状态 = 已收到的 200）
-                            last_failure_upstream = Some(status.as_u16());
+                            last_failure_at = Some((status.as_u16(), attempt_idx));
                             if st.breaker.record_failure(provider.id) {
                                 st.metrics.record_breaker_open();
                             }
@@ -2037,10 +2031,11 @@ async fn proxy_authed(
         // 全部候选失败/不可用：优先透传最后一次上游失败响应（按客户端方言整形）
         if let Some((status, bytes, content_type, rl)) = last_failure {
             let latency = started.elapsed().as_millis() as i64;
-            // 连接加固：终局失败行带归因（真实上游状态 + 最后失败候选序号）
+            // 连接加固：终局失败行带归因——真实上游状态 + 候选序号成对落库
+            //（F4：两者取自同一 last_failure_at，不指向无响应候选）
             meta.failure_class = Some("upstream_status");
-            meta.upstream_status = last_failure_upstream.map(|s| s as i16);
-            meta.attempt = last_failed_idx.map(|i| i as i16);
+            meta.upstream_status = last_failure_at.map(|(s, _)| s as i16);
+            meta.attempt = last_failure_at.map(|(_, i)| i as i16);
             usage::record(st, &meta, None, status, latency).await;
             // L5：错误上下文归属实际最后失败的候选（此前固定 candidates[0]）
             let ctx = error_context(last_failed.unwrap_or(&candidates[0]), &model, request_id);
@@ -2109,11 +2104,11 @@ async fn proxy_authed(
             ))
         }
     } else {
-        let mut last_response: Option<(u16, Vec<u8>, String, UpstreamHeaders)> = None;
+        // 终局透传候选（状态码, 候选序号, 响应体…）：状态与序号成对更新（F4），
+        // 终局归因行不得把最后 HTTP 响应的候选序号错位到无响应候选上
+        let mut last_response: Option<(u16, usize, Vec<u8>, String, UpstreamHeaders)> = None;
         // L5：实际最后失败的候选（尾段错误上下文归属）
         let mut last_failed: Option<&Provider> = None;
-        // 失败归因行的 attempt 列（0 = 主渠道，1.. = 降级链）
-        let mut last_failed_idx: Option<usize> = None;
         // 响应体读取的统一截止时间（僵死流兜底）
         let body_read_deadline = Duration::from_secs(st.cfg.stream_idle_timeout_secs.max(1));
         for (attempt_idx, provider) in candidates.iter().enumerate().take(max_attempts) {
@@ -2272,7 +2267,6 @@ async fn proxy_authed(
                         );
                     }
                     last_failed = Some(provider);
-                    last_failed_idx = Some(attempt_idx);
                     continue;
                 }
             };
@@ -2296,7 +2290,7 @@ async fn proxy_authed(
                     .unwrap_or_default()
                     .to_vec();
                 tracing::warn!(provider = %provider.name, status = %status, "upstream retryable failure");
-                last_response = Some((status.as_u16(), bytes, content_type, rl.clone()));
+                last_response = Some((status.as_u16(), attempt_idx, bytes, content_type, rl.clone()));
                 if st.breaker.record_failure(provider.id) {
                     st.metrics.record_breaker_open();
                 }
@@ -2316,7 +2310,6 @@ async fn proxy_authed(
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                 }
                 last_failed = Some(provider);
-                last_failed_idx = Some(attempt_idx);
                 continue;
             }
             // M34：先完整读体再记 success（读体失败=可重试传输错误，熔断器不得
@@ -2344,7 +2337,6 @@ async fn proxy_authed(
                     )
                     .await;
                     last_failed = Some(provider);
-                    last_failed_idx = Some(attempt_idx);
                     continue;
                 }
             };
@@ -2517,12 +2509,13 @@ async fn proxy_authed(
             ));
         }
         // 全部候选失败：优先透传最后一次上游响应，否则 503
-        if let Some((status, bytes, content_type, rl)) = last_response {
+        if let Some((status, attempt_idx, bytes, content_type, rl)) = last_response {
             let latency = started.elapsed().as_millis() as i64;
-            // 连接加固：终局失败行带归因（真实上游状态 + 最后失败候选序号）
+            // 连接加固：终局失败行带归因——真实上游状态 + 候选序号成对落库
+            //（F4：序号来自产生该响应的同一候选，不指向无响应候选）
             meta.failure_class = Some("upstream_status");
             meta.upstream_status = Some(status as i16);
-            meta.attempt = last_failed_idx.map(|i| i as i16);
+            meta.attempt = Some(attempt_idx as i16);
             let usage = parse_usage(&bytes);
             usage::record(st, &meta, usage.as_ref(), status, latency).await;
             // L5：错误上下文归属实际最后失败的候选（此前固定 candidates[0]）
