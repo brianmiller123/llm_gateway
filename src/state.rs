@@ -195,7 +195,70 @@ impl AppState {
         Ok(state)
     }
 
-    /// 重载 LDAP 设置：DB 配置启用（url 非空）时字段级 DB 优先、空字段回退 env；
+    /// 测试夹具：空内存态 + 断连池（connect_lazy 不发起 I/O；触池路径只会
+    /// 快速失败并被记账层告警吞掉）。仅流级单测使用，不触 DB。
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> Self {
+        static ENV_ONCE: std::sync::Once = std::sync::Once::new();
+        ENV_ONCE.call_once(|| {
+            // AppConfig::from_env 仅强依赖 GATEWAY_MASTER_KEY；CI/单测环境无
+            // 网关环境变量时注入测试密钥。本进程内唯一一次 env 写入，且先于
+            // 任何 from_env 调用（同进程其余测试只读环境变量）。
+            if std::env::var("GATEWAY_MASTER_KEY").is_err() {
+                // SAFETY: edition 2024 的 set_var 为 unsafe；单测进程内一次性
+                // 写入、无并发读者依赖旧值（全仓测试均不读取 GATEWAY_MASTER_KEY）
+                unsafe {
+                    std::env::set_var("GATEWAY_MASTER_KEY", "ab".repeat(32));
+                }
+            }
+        });
+        // 断连池：connect_lazy 不发起任何 I/O，触池的记账路径只会快速失败并被
+        // record_with_gen_ms 告警吞掉；流级单测（转换链熔断/记账分流）用
+        let pool = sqlx::postgres::PgPool::connect_lazy("postgres://127.0.0.1:1/none")
+            .expect("lazy pool");
+        let cfg = std::sync::Arc::new(crate::config::AppConfig::from_env().expect("env config"));
+        let ldap = crate::service::ldap::LdapSettings::from(&*cfg);
+        Self {
+            pool,
+            cfg,
+            client: Client::new(),
+            providers: Arc::new(RwLock::new(Vec::new())),
+            routes: Arc::new(RwLock::new(Vec::new())),
+            rules: Arc::new(RwLock::new(Vec::new())),
+            prices: Arc::new(RwLock::new(HashMap::new())),
+            user_access: Arc::new(RwLock::new(HashMap::new())),
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            admin_ids: Arc::new(RwLock::new(HashSet::new())),
+            admin_ids_gen: Arc::new(AtomicU64::new(0)),
+            disabled_models: Arc::new(RwLock::new(HashMap::new())),
+            breaker: Arc::new(crate::service::breaker::Breaker::new_with(
+                crate::service::breaker::BreakerConfig::default(),
+            )),
+            limiter: Arc::new(RateLimiter::new()),
+            concurrency: Arc::new(crate::service::ratelimit::ConcurrencyLimiter::new()),
+            ldap: Arc::new(RwLock::new(ldap)),
+            extra_body_enabled: Arc::new(RwLock::new(true)),
+            message_templates: Arc::new(RwLock::new(MessageTemplates::default())),
+            active_requests: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            active_by_user: Arc::new(Mutex::new(HashMap::new())),
+            api_endpoints: Arc::new(RwLock::new(crate::store::config::ApiEndpointSettings {
+                responses_enabled: true,
+                responses_visible: true,
+                messages_enabled: true,
+                messages_visible: true,
+            })),
+            custom_headers: Arc::new(RwLock::new(crate::store::config::HeaderSettings::default())),
+            usage: Arc::new(UsageCache::new()),
+            responses_history: Arc::new(
+                crate::service::responses::history::ResponseHistoryStore::new(),
+            ),
+            plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
+            provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        }
+    }
+
+    /// 重载 LDAP 设置（生产路径：DB 配置启用（url 非空）时字段级 DB 优先、空字段回退 env）
     /// DB 未启用（url 为空）则整体回退 env（兼容纯环境变量部署）
     pub(crate) async fn reload_ldap(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = crate::store::config::load_ldap_settings(&self.pool).await?;
