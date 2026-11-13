@@ -60,6 +60,18 @@ struct ProviderBreaker {
     window_start: Option<Instant>,
 }
 
+/// 只读快照行：供状态页/指标导出（仅聚合状态，不含敏感信息）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BreakerSnapshot {
+    pub provider_id: i64,
+    pub open: bool,
+    pub open_secs_left: u64,
+    pub consec_failures: u32,
+    pub half_open_probe_in_flight: bool,
+    pub window_requests: u64,
+    pub window_failures: u64,
+}
+
 pub struct Breaker {
     states: Mutex<HashMap<i64, ProviderBreaker>>,
     cfg: BreakerConfig,
@@ -118,6 +130,27 @@ impl Breaker {
         } else {
             Some(allowed)
         }
+    }
+
+    /// 只读快照：短暂持锁聚合各渠道当前状态（状态页/指标导出用；不改任何状态）
+    pub fn snapshot(&self) -> Vec<BreakerSnapshot> {
+        let states = self.states.lock();
+        let now = Instant::now();
+        states
+            .iter()
+            .map(|(id, pb)| BreakerSnapshot {
+                provider_id: *id,
+                open: pb.open_until.is_some(),
+                open_secs_left: pb
+                    .open_until
+                    .map(|u| u.saturating_duration_since(now).as_secs())
+                    .unwrap_or(0),
+                consec_failures: pb.consec_failures,
+                half_open_probe_in_flight: pb.half_open_probe_in_flight,
+                window_requests: pb.window_requests,
+                window_failures: pb.window_failures,
+            })
+            .collect()
     }
 
     pub fn record_success(&self, provider_id: i64) {
