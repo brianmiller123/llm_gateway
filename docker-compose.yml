@@ -68,8 +68,9 @@ services:
       start_period: 45s
     # 必须大于应用 GATEWAY_DRAIN_SECS=120 排水窗口，否则 SIGKILL 抢跑截断在途 SSE
     stop_grace_period: 350s
-    # 启动失败最多重试 5 次，断掉“崩溃循环→端口 accept 后关闭→客户端持续 ECONNRESET”的放大回路
-    # （postgres 仍 unless-stopped，宿主机重启自愈由 depends_on service_healthy 兜底）
+    # 启动失败最多重试 5 次，防崩溃循环；postgres 仍 unless-stopped。守护进程重启场景无
+    # depends_on 排序，postgres 冷启动慢于 5 次重试时网关可能停机，执行 docker compose up -d gateway
+    # 恢复（部署脚本末尾的 up -d 同样会复活）
     restart: on-failure:5
     # 进程数与内存硬顶：防失控请求拖垮宿主机
     mem_limit: 2g

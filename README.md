@@ -121,6 +121,7 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 - 更新部署统一走 `bash scripts/deploy-local-binary.sh`：本机 cargo build（利用缓存）+ 秒级打包运行时镜像；构建前自动尽力做一次数据库快照（`backups/pre-deploy-*.sql`）——回滚旧二进制撞上库结构版本不匹配（VersionMissing）时用快照恢复。
 - 优雅停机：`docker compose stop` 先发 SIGTERM，网关停止接新请求并在 `GATEWAY_DRAIN_SECS`（默认 120s）窗口内排水存量请求（含 SSE 流）；compose 的 `stop_grace_period: 350s` **必须大于该排水窗口**——宽限耗尽后 SIGKILL 会直接截断在途 SSE（客户端表现为响应中断，流式记账可能丢失）。
 - 容器以非 root（uid/gid 65532）运行：`certs/key.pem` 权限 600 时容器内读不到 TLS 私钥，需交给组 65532 组读——`sudo chgrp 65532 certs/key.pem && chmod 640 certs/key.pem`（deploy 脚本每次部署会尽力代劳，失败仅告警）。
+- 网关连续 5 次启动失败后会停机（`docker compose ps` 显示 Exited）；排除原因（如 DB 未就绪/证书权限）后执行 `docker compose up -d gateway` 恢复；`bash scripts/deploy-local-binary.sh` 末尾的 up -d 同样会复活。
 
 ### 反向代理
 
