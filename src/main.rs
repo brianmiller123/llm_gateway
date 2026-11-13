@@ -10,6 +10,7 @@ mod worker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -18,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::serve::ListenerExt;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -88,19 +89,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         res = https => res??,
         res = http => res??,
         _ = signal_task => {
-            tracing::info!("draining in-flight requests (up to 15s)");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            // 排水预算 = GATEWAY_DRAIN_SECS（cfg.drain_secs）；整体仍受 docker compose
+            // stop_grace_period 约束（宽限期到期发 SIGKILL），部署侧须保证
+            // stop_grace_period > drain_secs，否则进程被硬杀、在途 SSE 计费丢失
+            tracing::info!("draining in-flight requests (up to {}s)", cfg.drain_secs);
+            let deadline = std::time::Instant::now() + Duration::from_secs(cfg.drain_secs);
             while state.active_requests.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!("drain timeout; exiting with requests still in flight");
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            tracing::info!("drain finished, exiting");
+            tracing::info!(
+                "drain finished, exiting (active={})",
+                state.active_requests.load(std::sync::atomic::Ordering::Relaxed)
+            );
         }
     }
     Ok(())
+}
+
+/// HTTP/1.1 header 读空闲超时：回收空闲 keep-alive 连接；值须小于中间设备
+/// （LB/conntrack）的 idle 阈值，否则连接先被中间设备单方面掐掉、网关侧不可感知
+const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// HTTP/2 keep-alive PING 发送间隔：持续探测连接活性
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// HTTP/2 keep-alive PING 判定窗口：超时未收到 PONG 即判定半开连接并回收
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// HTTPS 与 HTTP 明文两条服务路径共用的连接 Builder：统一 HTTP/1.1 空闲读
+/// 超时与 HTTP/2 keep-alive 配置（半开/僵死连接回收，防止排水期被空连接吊住）
+fn conn_builder() -> hyper_util::server::conn::auto::Builder<TokioExecutor> {
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Some(HTTP1_HEADER_READ_TIMEOUT));
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
+    builder
 }
 
 /// HTTPS 服务：hyper-util + tokio-rustls 手动 accept 循环（axum 官方示例同款）
@@ -155,7 +186,7 @@ async fn serve_https(
                         }
                     });
                     if let Err(e) =
-                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        conn_builder()
                             .serve_connection_with_upgrades(stream, service)
                             .await
                     {
@@ -228,6 +259,21 @@ async fn serve_http_redirect(
 }
 
 async fn redirect_to_https(req: Request, https_port: u16) -> Response {
+    // LB 已终结 TLS（x-forwarded-proto: https）时再 301 会造成重定向死循环；
+    // 完整应用应由 GATEWAY_HTTP_REDIRECT=false 的 80 端口服务，此处仅回非重定向
+    // 响应保证探活/直达请求不被循环消耗
+    let xf_proto = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim);
+    if xf_proto.is_some_and(|v| v.eq_ignore_ascii_case("https")) {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .expect("static response is valid");
+    }
     let host = req
         .headers()
         .get(axum::http::header::HOST)
