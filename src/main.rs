@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod crypto;
 mod error;
+mod metrics;
 mod service;
 mod state;
 mod store;
