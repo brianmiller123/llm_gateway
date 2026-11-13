@@ -1279,7 +1279,18 @@ async fn proxy_authed(
             let anthropic_converted =
                 crate::service::anthropic::should_convert(endpoint.anthropic, provider);
             let converted = crate::service::responses::should_convert(endpoint.responses, provider);
-            let (outbound, upstream_path) = build_outbound(provider)?;
+            // F1：出站体构建失败（方言转换/序列化错误）不是渠道健康信号——此前
+            // `?` 直接上抛，已占用的半开探测名额被永久占位，该渠道窗口到期后
+            // 再也无法 allow 放行。只归还探测名额（record_failure 会把半开渠道
+            // 重开整个窗口，且这不是线路故障）后换下一候选
+            let (outbound, upstream_path) = match build_outbound(provider) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(provider = %provider.name, error = %e, "provider outbound build failed");
+                    st.breaker.release_probe(provider.id);
+                    continue;
+                }
+            };
             let provider_key = match crate::crypto::decrypt(
                 &provider.api_key_encrypted,
                 &st.cfg.master_key,
@@ -1788,6 +1799,13 @@ async fn proxy_authed(
                     body_read_deadline,
                 )
                 .await;
+                // F1：非 2xx + SSE 走到这里时提交点结算已被推迟（tail_settles =
+                // is_sse），转换分支又不像透传链那样安装收尾流——不在此显式结算，
+                // 半开探测名额永久占位。渠道给出了明确响应（可重试状态早已换家）
+                // = 健康，与非 SSE 缓冲路径提交点 record_success 同语义
+                if will_stream {
+                    st.breaker.record_success(provider.id);
+                }
                 let response_status = if status.is_success() {
                     // 状态码统一（对齐 Responses 链路 502）：上游 200 + 不可转换体
                     // 属上游故障语义；422 会让客户端误判为请求错误重发同样的请求
@@ -1922,6 +1940,11 @@ async fn proxy_authed(
                     body_read_deadline,
                 )
                 .await;
+                // F1：非 2xx + SSE 的提交点结算已被推迟（tail_settles = is_sse），
+                // 转换分支不安装收尾流——显式结算一次（同 anthropic 分支语义）
+                if will_stream {
+                    st.breaker.record_success(provider.id);
+                }
                 // 连接加固：终局透传上游错误体 → 上游错误指标 + 失败归因
                 st.metrics.record_upstream_error(provider.id);
                 meta.failure_class = Some("upstream_status");
@@ -2118,9 +2141,17 @@ async fn proxy_authed(
                     continue;
                 }
             };
+            // F1：出站体构建失败（方言转换/序列化错误）不是渠道健康信号——
+            // 此前 `?` 直接上抛，半开探测名额被永久占位。归还探测名额后换下一
+            // 候选（与 decrypt 失败分支同形：last_failed 仅作尾段错误上下文归属）
             let (outbound, upstream_path) = match build_outbound(provider) {
                 Ok(v) => v,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    tracing::warn!(provider = %provider.name, error = %e, "provider outbound build failed");
+                    st.breaker.release_probe(provider.id);
+                    last_failed = Some(provider);
+                    continue;
+                }
             };
             let sent = send_with_rectify(
                 st,
@@ -3472,6 +3503,7 @@ struct BillingOnDrop {
 impl Drop for BillingOnDrop {
     fn drop(&mut self) {
         // 连接加固：半开探测名额归还——流未结算即被丢弃时只释放名额不计数
+        // （见 QC 评审 S-2：极端时序下可能清除下一位探针，暂不处理）
         self.st.breaker.release_probe(self.meta.provider_id);
         if !self.recorded.swap(true, Ordering::SeqCst) {
             // 连接加固：客户端中断计数（流式响应中途断开/丢弃）
@@ -4949,6 +4981,191 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             );
         }
         assert!(breaker.allow(7), "未结算的流被 drop 后探测名额归还");
+    }
+
+    // ---------- QC1 F1：post-allow() 退出路径的探测名额结算 ----------
+
+    /// 一次性假上游：接受单个连接，排空一次读后回写预置 HTTP 响应并断开
+    async fn spawn_one_shot_upstream(response: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            // 小请求（头+体通常一个分段）排空一次读即可；失败不影响回写
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    fn http_response(status_line: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn test_provider(
+        id: i64,
+        api_type: &str,
+        base_url: &str,
+        key: &str,
+        master_key: &[u8; 32],
+    ) -> Provider {
+        Provider {
+            id,
+            name: format!("p{id}"),
+            api_type: api_type.into(),
+            base_url: base_url.into(),
+            api_key_encrypted: crate::crypto::encrypt(key.as_bytes(), master_key).expect("encrypt"),
+            timeout_ms: 1000,
+            extra_body: serde_json::json!({}),
+            auth_scheme: "bearer".into(),
+            extra_headers: serde_json::json!({}),
+            supports_images: true,
+        }
+    }
+
+    fn test_route(
+        pattern: &str,
+        primary: i64,
+        fallbacks: Vec<i64>,
+    ) -> crate::store::upstream::ModelRoute {
+        crate::store::upstream::ModelRoute {
+            model_pattern: pattern.into(),
+            provider_id: primary,
+            fallback_ids: fallbacks,
+            upstream_model: None,
+            extra_body: serde_json::json!({}),
+            strict_system_head: false,
+            system_head_merge: false,
+            reasoning_effort_mode: None,
+            thinking_form: None,
+            responses_passthrough_fields: None,
+        }
+    }
+
+    /// 双候选链 + 立即半开的夹具：open_secs=0 让熔断窗口立刻到期，主候选
+    /// allow() 消费探测名额后暴露 post-allow() 泄漏
+    fn probe_fixture(st: &mut crate::state::AppState) {
+        st.breaker = Arc::new(Breaker::new_with(crate::service::breaker::BreakerConfig {
+            failure_threshold: 1,
+            open_secs: 0,
+            min_requests: 1_000,
+            ..Default::default()
+        }));
+    }
+
+    /// QC1 F1(a)：出站体构建失败必须归还半开探测名额——此前 `?` 直接上抛，
+    /// 名额永久占位，该渠道窗口到期后再也无法 allow 放行；降级链第二候选正常
+    /// 完成请求
+    #[tokio::test]
+    async fn outbound_build_failure_releases_half_open_probe() {
+        let mut st = crate::state::AppState::test_fixture();
+        probe_fixture(&mut st);
+        let upstream =
+            spawn_one_shot_upstream(http_response(
+                "HTTP/1.1 200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ))
+            .await;
+        // 主候选 api_type=openai + 缺 messages 的 Anthropic 请求 → build_outward
+        // 必失败（Anthropic→Chat 转换报 "missing 'messages' field"）
+        let broken = test_provider(1, "openai", "http://127.0.0.1:9", "sk-broken", &st.cfg.master_key);
+        let healthy =
+            test_provider(2, "anthropic", &format!("http://{upstream}"), "sk-ok", &st.cfg.master_key);
+        *st.providers.write() = vec![broken, healthy];
+        *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        // 半开：1 次失败即开闸（open_secs=0 → 窗口立即到期）；探测名额由
+        // 候选循环内的 allow() 消费（唯一消费者），不在夹具里预占
+        st.breaker.record_failure(1);
+
+        let json = serde_json::json!({"model": "t-model", "stream": true});
+        let resp = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/messages",
+                upstream: "/messages",
+                responses: false,
+                anthropic: true,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect("build 失败换候选后降级链必须完成请求");
+        assert_eq!(resp.status(), StatusCode::OK, "第二候选成功流式响应");
+        assert!(
+            st.breaker.allow(1),
+            "build_outward 失败后探测名额必须归还（可再次放行）"
+        );
+    }
+
+    /// QC1 F1(b)：converted 非 2xx + SSE 回退分支必须显式结算一次——此前
+    /// 提交点推迟结算（tail_settles）后分支直接整形返回，半开探测名额永久占位
+    #[tokio::test]
+    async fn converted_non2xx_sse_fallback_settles_probe_once() {
+        let mut st = crate::state::AppState::test_fixture();
+        probe_fixture(&mut st);
+        // 406：非可重试（不换家）、不可整流（不进 PreRead）→ 落入 converted
+        // 非 2xx 回退分支；SSE content-type → 提交点结算被推迟
+        let upstream =
+            spawn_one_shot_upstream(http_response(
+                "HTTP/1.1 406 Not Acceptable",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"boom\"}}]}\n\n",
+            ))
+            .await;
+        let converted =
+            test_provider(1, "openai", &format!("http://{upstream}"), "sk-c", &st.cfg.master_key);
+        let unused = test_provider(2, "anthropic", "http://127.0.0.1:9", "sk-u", &st.cfg.master_key);
+        *st.providers.write() = vec![converted, unused];
+        *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        // 半开：探测名额由候选循环内的 allow() 消费（唯一消费者）
+        st.breaker.record_failure(1);
+
+        let json = serde_json::json!({
+            "model": "t-model",
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/messages",
+                upstream: "/messages",
+                responses: false,
+                anthropic: true,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect("converted 非 2xx 回退按方言整形返回");
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE, "上游状态透传");
+        assert!(
+            st.breaker.allow(1),
+            "回退分支结算后探测名额归还（可再次放行）"
+        );
+        let snap = st
+            .breaker
+            .snapshot()
+            .into_iter()
+            .find(|s| s.provider_id == 1)
+            .expect("snapshot");
+        assert_eq!(
+            snap.window_requests, 1,
+            "必须恰好结算一次（重复结算会计 2 次窗口请求）"
+        );
     }
 
     /// QC1 W2 / QC3 F-003：持续同步就绪的中性帧洪水 + 墙钟 deadline →
