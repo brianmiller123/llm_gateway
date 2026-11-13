@@ -110,6 +110,9 @@ pub struct AppState {
     pub provider_health: Arc<tokio::sync::Mutex<HashMap<i64, crate::service::health::ProbeResult>>>,
     /// Plan 阈值告警进程内去重：(user_id, plan_id, period_key, level)
     pub plan_alerts_seen: Arc<Mutex<HashSet<(i64, i64, String, i16)>>>,
+    /// 进程内指标计数器（/metrics 文本导出；连接加固 wave1 挂载）。
+    /// 全应用共享单实例：proxy 候选失败 / 熔断开闸 / 客户端中断在此累计
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl AppState {
@@ -118,13 +121,18 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pool = crate::store::init(&cfg).await?;
         // L22：连接池调优（cc-switch http_client.rs:216-260 同款思想）——
-        // 空闲连接 60s 回收、同 host 最多 10 个空闲连接、TCP keepalive 60s。
+        // 空闲连接 60s 回收、同 host 最多 32 个空闲连接（连接加固：降级链并发
+        // 复用同 host 连接，10 会把池内空闲连接挤兑重建）、TCP keepalive 60s。
         // L29：出站代理（GATEWAY_UPSTREAM_PROXY，http/https/socks5）
         let mut client_builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(10)
-            .tcp_keepalive(Duration::from_secs(60));
+            .pool_max_idle_per_host(32)
+            .tcp_keepalive(Duration::from_secs(60))
+            // 连接加固：HTTP/2 层保活 PING——半开连接（NAT/LB 静默丢弃）在
+            // 30s 无流量后主动探测，15s 无 PONG 即判死，不再把请求挂在死连接上
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(15));
         if let Some(proxy_url) = cfg.upstream_proxy.as_deref() {
             match reqwest::Proxy::all(proxy_url) {
                 Ok(proxy) => {
@@ -181,6 +189,7 @@ impl AppState {
             ),
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         state.reload().await?;
         Ok(state)
