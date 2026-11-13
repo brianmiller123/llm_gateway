@@ -3637,11 +3637,14 @@ struct SseErrorTail<S> {
     /// 透传字节里是否见过方言终态标记（连接加固）：干净 EOF 但无终态 = 上游
     /// 流未正常结束，按失败结算并给客户端补发错误帧
     saw_terminal: bool,
+    /// F2：上一 chunk 尾部 max_marker_len-1 字节。终态标记跨 chunk 分裂时
+    ///（如 `data: [DO` | `NE]\n\n`）在边界窗口补扫——否则健康上游被误记失败
+    /// 并在真实终态帧后追加错误帧
+    carry: Vec<u8>,
 }
 
-/// 各方言流正常结束的终态标记（字节级扫描；标记跨 chunk 分裂时不识别，
-/// 与 first_chunk_error 同一粒度权衡）
-fn has_terminal_marker(dialect: SseErrorDialect, chunk: &[u8]) -> bool {
+/// 各方言流正常结束的终态标记集合（透传链扫描与跨 chunk 补扫共用）
+fn terminal_markers(dialect: SseErrorDialect) -> &'static [&'static str] {
     const ANTHROPIC: &[&str] = &["message_stop"];
     const CHAT: &[&str] = &["data: [DONE]"];
     const RESPONSES: &[&str] = &[
@@ -3649,14 +3652,52 @@ fn has_terminal_marker(dialect: SseErrorDialect, chunk: &[u8]) -> bool {
         "response.incomplete",
         "response.failed",
     ];
-    let markers: &[&str] = match dialect {
+    match dialect {
         SseErrorDialect::Anthropic => ANTHROPIC,
         SseErrorDialect::Chat => CHAT,
         SseErrorDialect::Responses => RESPONSES,
-    };
-    markers
+    }
+}
+
+/// 各方言终态标记的最大长度（跨 chunk 补扫窗口保留字节数 = len - 1）
+fn max_terminal_marker_len(dialect: SseErrorDialect) -> usize {
+    terminal_markers(dialect)
+        .iter()
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// 各方言流正常结束的终态标记（字节级扫描，标记完全落入 chunk 内时命中；
+/// 跨 chunk 分裂由 [`SseErrorTail`] 的 carry 边界补扫覆盖）
+fn has_terminal_marker(dialect: SseErrorDialect, chunk: &[u8]) -> bool {
+    terminal_markers(dialect)
         .iter()
         .any(|m| chunk.windows(m.len()).any(|w| w == m.as_bytes()))
+}
+
+/// F2：终态标记跨 chunk 分裂补扫——标记起点落在 carry（上一 chunk 尾部
+/// max_marker_len-1 字节）内、终点落入当前 chunk 时命中。零分配：只在边界
+/// 窗口逐标记比对，不拼接缓冲
+fn marker_spans_carry_boundary(dialect: SseErrorDialect, carry: &[u8], chunk: &[u8]) -> bool {
+    if carry.is_empty() || chunk.is_empty() {
+        return false;
+    }
+    terminal_markers(dialect).iter().any(|m| {
+        let m = m.as_bytes();
+        if m.len() <= 1 {
+            return false;
+        }
+        let start_min = carry.len().saturating_sub(m.len() - 1);
+        (start_min..carry.len()).any(|start| {
+            let head = &carry[start..];
+            let tail_len = (m.len() - head.len()).min(chunk.len());
+            let tail = &chunk[..tail_len];
+            head.len() + tail.len() == m.len()
+                && head == &m[..head.len()]
+                && tail == &m[head.len()..]
+        })
+    })
 }
 
 impl<S> Stream for SseErrorTail<S>
@@ -3674,8 +3715,27 @@ where
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 if let Some(ctx) = &this.error_ctx {
+                    // F2：终态标记跨 chunk 分裂补扫（carry = 上一 chunk 尾部）
+                    // + 全块扫描；随后把本 chunk 尾部 max_marker_len-1 字节
+                    // 滚动进 carry
+                    if marker_spans_carry_boundary(ctx.dialect, &this.carry, &chunk) {
+                        this.saw_terminal = true;
+                    }
                     if has_terminal_marker(ctx.dialect, &chunk) {
                         this.saw_terminal = true;
+                    }
+                    let keep = max_terminal_marker_len(ctx.dialect).saturating_sub(1);
+                    if keep == 0 {
+                        this.carry.clear();
+                    } else if chunk.len() >= keep {
+                        this.carry.clear();
+                        this.carry.extend_from_slice(&chunk[chunk.len() - keep..]);
+                    } else {
+                        this.carry.extend_from_slice(&chunk);
+                        let excess = this.carry.len().saturating_sub(keep);
+                        if excess > 0 {
+                            this.carry.drain(..excess);
+                        }
                     }
                 }
                 Poll::Ready(Some(Ok(chunk)))
@@ -3778,6 +3838,7 @@ fn wrap_stream(
         error_ctx: sse_error,
         finished: false,
         saw_terminal: false,
+        carry: Vec::new(),
     };
     // 逐 chunk 共享上下文：流适配器每帧只能克隆一个 Arc，替代此前每帧克隆
     // AppState（~20 个 Arc 原子操作）+ UsageMeta（String/Vec 堆分配）
@@ -4559,8 +4620,80 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         while tail.next().await.is_some() {}
+    }
+
+    /// QC1 F2：终态标记跨 chunk 分裂必须被识别——`data: [DO` | `NE]\n\n` 分
+    /// 两个 chunk 到达时 saw_terminal 置位、EOF 按成功结算且不追加错误帧。
+    /// 此前逐 chunk 整块扫描漏判分裂标记：健康上游被记熔断失败并在真实
+    /// `[DONE]` 后补发一条错误帧
+    #[tokio::test]
+    async fn split_terminal_marker_across_chunks_is_detected() {
+        let breaker = test_breaker(1);
+        settle_commit_signal(&breaker, 7, true);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(futures_util::stream::iter(vec![
+                Ok::<_, Box<dyn Error + Send + Sync>>(Bytes::from_static(b"data: [DO")),
+                Ok(Bytes::from_static(b"NE]\n\n")),
+            ])),
+            error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
+            finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
+        });
+        let mut out: Vec<Bytes> = Vec::new();
+        while let Some(item) = tail.next().await {
+            out.push(item.expect("透传 chunk 不得被错误帧替换"));
+        }
+        assert_eq!(out.len(), 2, "两个 chunk 必须原样透传（不得追加错误帧）");
+        let joined = String::from_utf8_lossy(&out.concat()).into_owned();
+        assert_eq!(joined, "data: [DONE]\n\n", "字节序不变: {joined}");
+        // EOF 结算走成功分支：threshold=1 下若误记失败会直接开闸
+        assert!(breaker.allow(7), "分裂终态标记识别后按成功结算，不得开闸");
+    }
+
+    /// F2 边界补扫纯函数：起点在 carry 内、终点在 chunk 内的各种切法
+    #[test]
+    fn marker_spans_carry_boundary_cases() {
+        // "data: [DONE]" 从 carry 第 5 字节开始，跨到 chunk 前 4 字节
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b"data: [DO",
+            b"NE]\n\n"
+        ));
+        // 仅 1 字节跨界的极端切法
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b"data: [DON",
+            b"E]\n\n"
+        ));
+        // carry 只保留尾部 max_marker_len-1 字节（"data: [DONE]" len-1 = 11）
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b": xdata: [DO",
+            b"NE]\n\n"
+        ));
+        // 不构成标记的跨界组合不误报
+        assert!(!marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b"data: [DO",
+            b"X]\n\n"
+        ));
+        // 空边界（首个 chunk / 标记长度 1）直接跳过
+        assert!(!marker_spans_carry_boundary(SseErrorDialect::Chat, b"", b"data: [DONE]"));
+        // Anthropic 方言只认 message_stop
+        assert!(!marker_spans_carry_boundary(
+            SseErrorDialect::Anthropic,
+            b"data: [DO",
+            b"NE]\n\n"
+        ));
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Anthropic,
+            b"event: message_st",
+            b"op\n\n"
+        ));
     }
 
     fn sse_ctx(dialect: SseErrorDialect, breaker: Arc<Breaker>) -> SseErrorContext {
@@ -4593,6 +4726,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, test_breaker(4))),
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         assert_eq!(tail.next().await.unwrap().unwrap(), head);
         let frame = tail.next().await.unwrap().expect("Err 转为错误帧");
@@ -4615,6 +4749,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: None,
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         assert!(tail.next().await.is_none(), "非 SSE Err 截断为干净 EOF");
         assert!(tail.next().await.is_none());
@@ -4686,6 +4821,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 error_ctx: Some(sse_ctx(dialect, test_breaker(4))),
                 finished: false,
                 saw_terminal: false,
+                carry: Vec::new(),
             });
             let frame = tail.next().await.unwrap().expect("Err 转为方言错误帧");
             let text = String::from_utf8(frame.to_vec()).unwrap();
@@ -4706,6 +4842,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: None,
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         assert!(tail.next().await.is_none(), "非 SSE Err 截断为干净 EOF");
         assert!(tail.next().await.is_none());
@@ -4724,6 +4861,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, test_breaker(4))),
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         let frame = tail.next().await.unwrap().expect("Err 转为错误帧");
         let text = String::from_utf8(frame.to_vec()).unwrap();
@@ -4753,6 +4891,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
                 finished: false,
                 saw_terminal: false,
+                carry: Vec::new(),
             });
             tail.next().await.unwrap().expect("错误帧");
             assert!(tail.next().await.is_none(), "错误帧后不再产出（只记一次）");
@@ -4773,6 +4912,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         while tail.next().await.is_some() {}
         assert!(breaker.allow(7), "带终态标记的正常结束记成功，不熔断");
@@ -4845,6 +4985,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
             finished: false,
             saw_terminal: false,
+            carry: Vec::new(),
         });
         // 首项 = 原样透传的数据块；次项 = EOF 无终态 → 补发方言错误帧
         let chunk = tail.next().await.unwrap().expect("透传数据块");
@@ -4971,6 +5112,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
                 finished: false,
                 saw_terminal: false,
+                carry: Vec::new(),
             });
             // 客户端断开：流未结算（既无 EOF 也无 Err）即被 drop
             assert!(
