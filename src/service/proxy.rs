@@ -185,11 +185,12 @@ impl PrimeDeadline {
     }
 }
 
-/// 既有超时文案（header 等待 / 首字节 / 静默）
+/// 既有超时文案（header 等待 / 首字节 / 静默 / 非流式总超时）
 fn timeout_text(text: &str) -> bool {
     text.contains("header timeout")
         || text.contains("stream first byte timeout")
         || text.contains("stream idle timeout")
+        || text.contains("request timeout")
 }
 
 fn is_timeout_node(e: &(dyn Error + 'static)) -> bool {
@@ -1405,7 +1406,8 @@ async fn proxy_authed(
                     if st.breaker.record_failure(provider.id) {
                         st.metrics.record_breaker_open();
                     }
-                    let (class, status_out, header_timeout) = classify_send_failure(e.as_ref());
+                    let (class, status_out, terminal_reason) =
+                        classify_send_failure(e.as_ref(), streamed);
                     st.metrics.record_upstream_error(provider.id);
                     usage::record_failure_row(
                         st,
@@ -1420,12 +1422,15 @@ async fn proxy_authed(
                     // 连接加固：header 等待超时默认判终局——请求体已完整写出，
                     // 上游可能已在生成，换候选重发有双份生成/计费风险；
                     // GATEWAY_FAILOVER_ON_HEADER_TIMEOUT=true 保留旧 failover 行为
-                    if header_timeout && !st.cfg.failover_on_header_timeout {
+                    if let Some(reason) = terminal_reason
+                        && !st.cfg.failover_on_header_timeout
+                    {
                         return header_timeout_terminal_response(
                             provider,
                             &model,
                             request_id,
                             endpoint,
+                            reason,
                         );
                     }
                     last_failed = Some(provider);
@@ -2243,7 +2248,8 @@ async fn proxy_authed(
                     if st.breaker.record_failure(provider.id) {
                         st.metrics.record_breaker_open();
                     }
-                    let (class, status_out, header_timeout) = classify_send_failure(e.as_ref());
+                    let (class, status_out, terminal_reason) =
+                        classify_send_failure(e.as_ref(), streamed);
                     st.metrics.record_upstream_error(provider.id);
                     usage::record_failure_row(
                         st,
@@ -2255,15 +2261,19 @@ async fn proxy_authed(
                         started.elapsed().as_millis() as i64,
                     )
                     .await;
-                    // 连接加固：header 等待超时默认判终局（不再换候选重发——
-                    // 请求体已完整写出，上游可能已在生成，重发有双份生成/计费
-                    // 风险）；GATEWAY_FAILOVER_ON_HEADER_TIMEOUT=true 保留旧行为
-                    if header_timeout && !st.cfg.failover_on_header_timeout {
+                    // 连接加固：header 等待超时 / 非流式总超时（F5，请求体已完整
+                    // 写出）默认判终局（不再换候选重发——上游可能已在生成，重发
+                    // 有双份生成/计费风险）；GATEWAY_FAILOVER_ON_HEADER_TIMEOUT
+                    // =true 保留旧行为
+                    if let Some(reason) = terminal_reason
+                        && !st.cfg.failover_on_header_timeout
+                    {
                         return header_timeout_terminal_response(
                             provider,
                             &model,
                             request_id,
                             endpoint,
+                            reason,
                         );
                     }
                     last_failed = Some(provider);
@@ -2988,26 +2998,25 @@ fn upstream_error_envelope(msg: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// 连接加固：header 等待超时且未启用 failover（GATEWAY_FAILOVER_ON_HEADER_TIMEOUT
-/// = false，默认）→ 该候选直接判终局 504，按客户端方言整形后返回，不再换候选
-/// 重发——请求体已完整写出，上游可能已在生成，重发有双份生成/计费风险。
+/// 连接加固：header 等待超时 / 非流式总超时且未启用 failover
+/// （GATEWAY_FAILOVER_ON_HEADER_TIMEOUT = false，默认）→ 该候选直接判终局
+/// 504，按客户端方言整形后返回，不再换候选重发——请求体已完整写出，上游
+/// 可能已在生成，重发有双份生成/计费风险。`reason` 为超时归因文案
+/// （"upstream header timeout" / "upstream request timeout"）。
 fn header_timeout_terminal_response(
     provider: &Provider,
     model: &str,
     request_id: Uuid,
     endpoint: Endpoint,
+    reason: &str,
 ) -> Result<Response, AppError> {
     let ctx = error_context(provider, model, request_id);
     let body = if endpoint.anthropic {
-        crate::service::anthropic::reshape_upstream_error(504, b"upstream header timeout", &ctx)
+        crate::service::anthropic::reshape_upstream_error(504, reason.as_bytes(), &ctx)
     } else if endpoint.responses {
-        crate::service::responses::reshape_upstream_error_for_responses(
-            504,
-            b"upstream header timeout",
-            &ctx,
-        )
+        crate::service::responses::reshape_upstream_error_for_responses(504, reason.as_bytes(), &ctx)
     } else {
-        upstream_error_envelope("upstream header timeout")
+        upstream_error_envelope(reason)
     };
     Ok(Response::builder()
         .status(StatusCode::GATEWAY_TIMEOUT)
@@ -3285,16 +3294,23 @@ fn retry_after_secs(headers: &HeaderMap, applicable: bool) -> Option<u64> {
         .map(|s| s.clamp(0, 2) as u64)
 }
 
-/// send 阶段候选失败归因：header 等待超时 → (header_timeout, 504)；其余
-/// （连接超时 / 拒绝 / 重置）→ (connect_error, 502)。
-/// 返回 (失败类别, 呈现给客户端的状态码, 是否 header 等待超时)。
+/// send 阶段候选失败归因：header 等待超时 → (header_timeout, 504, 终局)；
+/// 非流式总超时（reqwest .timeout()，请求体已完整写出后触发）→
+/// (body_timeout, 504, 终局)——换候选重发有双份生成/计费风险，同 header
+/// 超时规则终局返回（F5；此前压平成字符串后类型信息丢失，被误归
+/// connect_error/502 并继续换家）；其余（连接超时 / 拒绝 / 重置）→
+/// (connect_error, 502, 不终局)。流式路径无总超时，保持连接错误分类。
+/// 返回 (失败类别, 呈现给客户端的状态码, 终局 504 响应的错误文案)。
 fn classify_send_failure(
     e: &(dyn Error + Send + Sync + 'static),
-) -> (&'static str, u16, bool) {
+    streamed: bool,
+) -> (&'static str, u16, Option<&'static str>) {
     if e.to_string().contains("header timeout") {
-        ("header_timeout", 504, true)
+        ("header_timeout", 504, Some("upstream header timeout"))
+    } else if !streamed && is_timeout_error(e) {
+        ("body_timeout", 504, Some("upstream request timeout"))
     } else {
-        ("connect_error", 502, false)
+        ("connect_error", 502, None)
     }
 }
 
@@ -3465,7 +3481,18 @@ async fn send_upstream(
             .map_err(|_| "upstream header timeout".to_string())?,
         None => send.await,
     };
-    resp.map_err(|e| redact_secrets(format!("upstream request failed: {e}"), provider_key).into())
+    resp.map_err(|e| {
+        // F5：reqwest 总超时（非流式 .timeout()，请求体已完整写出后触发）压平
+        // 成字符串时类型信息丢失——显式标注 timeout 文案，classify_send_failure
+        // / is_timeout_error 才能归入超时家族；连接阶段超时（connect_timeout，
+        // 体未写出、可安全换家）仍按连接失败归因
+        let msg = if e.is_timeout() && !e.is_connect() {
+            format!("upstream request timeout: {e}")
+        } else {
+            format!("upstream request failed: {e}")
+        };
+        redact_secrets(msg, provider_key).into()
+    })
 }
 
 fn content_type_of(resp: &reqwest::Response) -> String {
@@ -4590,6 +4617,41 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         }
         let wrapped: Box<dyn Error + Send + Sync> = Box::new(Outer(Inner));
         assert!(is_timeout_error(wrapped.as_ref()), "外层文案无关，source 链命中");
+    }
+
+    /// QC1 F5：非流式总超时（reqwest .timeout() 在体完整写出后触发，压平后
+    /// 仅剩文案）必须归入超时家族 → 504 终局；流式路径保持连接错误分类；
+    /// header 等待超时文案优先归因
+    #[test]
+    fn classify_send_failure_non_stream_timeout_is_terminal_504() {
+        // send_upstream 压平后的总超时文案（reqwest 类型信息已丢失）
+        let total: Box<dyn Error + Send + Sync> = Box::<dyn Error + Send + Sync>::from(
+            "upstream request timeout: error sending request for url(...)",
+        );
+        assert!(is_timeout_error(total.as_ref()), "总超时文案须命中超时判定");
+        assert_eq!(
+            classify_send_failure(total.as_ref(), false),
+            ("body_timeout", 504, Some("upstream request timeout")),
+            "非流式总超时归入超时家族并判终局（不再换家）"
+        );
+        assert_eq!(
+            classify_send_failure(total.as_ref(), true),
+            ("connect_error", 502, None),
+            "流式路径无总超时，保持连接错误分类"
+        );
+        let header: Box<dyn Error + Send + Sync> = "upstream header timeout".into();
+        assert_eq!(
+            classify_send_failure(header.as_ref(), false),
+            ("header_timeout", 504, Some("upstream header timeout")),
+            "header 等待超时文案优先归因"
+        );
+        let refused: Box<dyn Error + Send + Sync> =
+            "upstream request failed: connection refused".into();
+        assert_eq!(
+            classify_send_failure(refused.as_ref(), false),
+            ("connect_error", 502, None),
+            "连接失败不终局（可换候选）"
+        );
     }
 
     /// 熔断器（测试用）：只让连续失败计数生效，错误率维度需要 1000 个样本
