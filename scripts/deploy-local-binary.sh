@@ -20,10 +20,14 @@ docker exec llm_gateway-postgres-1 pg_dump -U gateway llm_gateway > "backups/pre
 echo "==> [3/4] 构建运行时镜像（仅 COPY 产物，秒级）..."
 docker-compose build gateway
 
-# 非 root 容器（组 65532）需组读 TLS 私钥：key 为 600 时放宽为组可读（尽力而为，失败仅告警）
+# 非 root 容器（组 65532）需组读 TLS 私钥：key 为 600 时容器读不到；宿主机 chgrp 失败时经容器 root 兜底，兜底再失败则中止部署
 if [ -f certs/key.pem ]; then
+    chgrp 65532 certs/key.pem 2>/dev/null || {
+        echo "==> 宿主机 chgrp 失败，经 docker 容器以 root 修复 key 属组…"
+        docker run --rm -v "$(pwd)/certs:/certs" ubuntu:24.04 chgrp 65532 /certs/key.pem
+        docker run --rm -v "$(pwd)/certs:/certs" ubuntu:24.04 chmod 640 /certs/key.pem
+    }
     chmod 640 certs/key.pem 2>/dev/null || true
-    chgrp 65532 certs/key.pem 2>/dev/null || echo "警告: certs/key.pem 属组未改为 65532，容器可能读不到 TLS 私钥（修复: sudo chgrp 65532 certs/key.pem）"
 fi
 
 echo "==> [4/4] 启动/更新网关容器..."
