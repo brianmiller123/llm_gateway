@@ -4193,7 +4193,18 @@ fn wrap_stream(
                 // 记账只在终态事件（[DONE]/response.*/message_stop）触发一次
                 if done && !ctx.recorded.swap(true, Ordering::SeqCst) {
                     let u = ctx.captured.lock().take();
-                    usage::record(&ctx.st, &ctx.meta, u.as_ref(), record_status, latency).await;
+                    // F4（连接加固）：最终记账 spawn 化——记账 await 卡在半途随流
+                    // 被取消（客户端断开/轮询器丢弃）会丢账；owned 副本进 spawned
+                    // task 脱离流生命周期，尽力落库（BillingOnDrop 同款）。gen_ms
+                    // spawn 前锁定，调度延迟不计入生成长度；swap-first 守卫保持
+                    // 不变（happy path 幂等）
+                    let st = ctx.st.clone();
+                    let meta = ctx.meta.clone();
+                    let gen_ms = usage::gen_ms_at(&meta, latency);
+                    tokio::spawn(async move {
+                        usage::record_with_gen_ms(&st, &meta, u.as_ref(), record_status, latency, gen_ms)
+                            .await;
+                    });
                 }
                 Ok::<Bytes, Box<dyn Error + Send + Sync>>(chunk)
             }
@@ -4214,7 +4225,14 @@ fn wrap_stream(
             // 上游未正常结束（无 [DONE]/usage）时兜底记账
             if !ctx.recorded.swap(true, Ordering::SeqCst) {
                 let u = ctx.captured.lock().take();
-                usage::record(&ctx.st, &ctx.meta, u.as_ref(), record_status, latency).await;
+                // F4：最终记账 spawn 化（同上）——gen_ms 先锁定，流取消不再丢账
+                let st = ctx.st.clone();
+                let meta = ctx.meta.clone();
+                let gen_ms = usage::gen_ms_at(&meta, latency);
+                tokio::spawn(async move {
+                    usage::record_with_gen_ms(&st, &meta, u.as_ref(), record_status, latency, gen_ms)
+                        .await;
+                });
             }
             Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::new())
         }
