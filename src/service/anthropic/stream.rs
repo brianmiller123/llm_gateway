@@ -683,7 +683,16 @@ struct BillingOnDrop {
 
 impl Drop for BillingOnDrop {
     fn drop(&mut self) {
+        // 连接加固：半开探测名额归还——流未结算即被丢弃（客户端断开）时只释放
+        // 名额不计数，否则探测名额被永久占位、该渠道窗口到期后不再放行
+        // 已知残留（QC 评审 S-2）：极端时序下 drop 可能清除下一位探针标记（ABA），暂不处理
+        self.st.breaker.release_probe(self.meta.provider_id);
         if !self.recorded.swap(true, Ordering::SeqCst) {
+            // 连接加固：客户端中断计数（流式响应中途断开/丢弃）
+            self.st
+                .metrics
+                .client_abort_total
+                .fetch_add(1, Ordering::Relaxed);
             let usage = self.state.lock().billing_usage();
             let st = self.st.clone();
             let meta = self.meta.clone();
@@ -728,6 +737,9 @@ impl Stream for BillingStream {
 /// 上游 Chat SSE → 客户端 Anthropic SSE：
 /// - 逐帧解析 → `ChatToAnthropicState` 转换 → `event: {type}\ndata: {json}\n\n`
 /// - 遇 [DONE]/错误帧立即收尾并记账；流异常中断由尾帧兜底（断流语义见 finalize_truncated）
+/// - 连接加固：熔断信号由流终态结算——传输 `Err` / 上游错误帧 / 干净 EOF 无
+///   [DONE] → `record_failure` + 上游错误指标；[DONE] 干净结束 → `record_success`；
+///   流被 drop（客户端断开）归还半开探测名额并计 client_abort_total
 pub fn wrap_chat_stream_to_anthropic(
     st: AppState,
     meta: UsageMeta,
@@ -762,6 +774,13 @@ pub fn wrap_chat_stream_to_anthropic(
                     Ok(c) => c,
                     Err(e) => {
                         if !ctx.finished.swap(true, Ordering::SeqCst) {
+                            // 连接加固：转换链熔断结算——上游传输错误计失败 +
+                            // 上游错误指标（此前转换链不与熔断器交互，错误渠道
+                            // 永远不被降级链隔离）
+                            ctx.st.breaker.record_failure(ctx.meta.provider_id);
+                            ctx.st
+                                .metrics
+                                .record_upstream_error(ctx.meta.provider_id);
                             let (frames, usage) = {
                                 let mut state = ctx.state.lock();
                                 let mut frames = Vec::new();
@@ -816,6 +835,15 @@ pub fn wrap_chat_stream_to_anthropic(
                 if (terminal || failed) && !ctx.finished.swap(true, Ordering::SeqCst) {
                     let (final_frames, usage) = {
                         let mut state = ctx.state.lock();
+                        // 连接加固：流内终态结算——上游错误帧 = 失败 + 上游错误
+                        // 指标；[DONE] 干净结束 = 成功（与透传链 SseErrorTail
+                        // 同一语义，每个请求只产生一个熔断信号）
+                        if state.has_failed() {
+                            ctx.st.breaker.record_failure(ctx.meta.provider_id);
+                            ctx.st.metrics.record_upstream_error(ctx.meta.provider_id);
+                        } else {
+                            ctx.st.breaker.record_success(ctx.meta.provider_id);
+                        }
                         let mut frames = Vec::new();
                         for frame in &state.finalize() {
                             frames.extend_from_slice(frame.as_bytes());
@@ -843,6 +871,11 @@ pub fn wrap_chat_stream_to_anthropic(
         let ctx = ctx.clone();
         async move {
             if !ctx.finished.swap(true, Ordering::SeqCst) {
+                // 连接加固：干净 EOF 但无 [DONE] = 上游流在终态事件前结束——
+                // 与透传链同一语义记熔断失败 + 上游错误指标；客户端仍拿到
+                // finalize_truncated 兜底帧（行为不变，仅熔断归因修正）
+                ctx.st.breaker.record_failure(ctx.meta.provider_id);
+                ctx.st.metrics.record_upstream_error(ctx.meta.provider_id);
                 let (final_frames, usage) = {
                     let mut state = ctx.state.lock();
                     let mut frames = Vec::new();
@@ -895,6 +928,137 @@ struct ConvertCtx {
 mod tests {
     use super::*;
     use crate::service::responses::dto::{ChatStreamChoice, ChatStreamDelta, FunctionDelta};
+
+    /// 转换流单测记账载荷：test_call = true 跳过 usage_logs 落库（不触 DB）
+    fn test_meta(provider_id: i64) -> UsageMeta {
+        UsageMeta {
+            request_id: uuid::Uuid::new_v4(),
+            user_id: None,
+            api_key_id: None,
+            model: "m".into(),
+            provider_id,
+            endpoint: "/v1/messages",
+            streamed: true,
+            client_ip: None,
+            session_id: None,
+            first_token_ms: None,
+            started: std::time::Instant::now(),
+            test_call: true,
+            pricing_models: Vec::new(),
+            plan: None,
+            failure_class: None,
+            upstream_status: None,
+            attempt: None,
+        }
+    }
+
+    /// 连接加固：转换链熔断结算——连续 `failure_threshold`（默认 4）条「提交后
+    /// 传输错误」的转换流必须打开熔断器。此前转换流不与熔断器交互，"200 后
+    /// 必断流"的供应商走转换链路时永远不被降级链隔离
+    #[tokio::test]
+    async fn converted_stream_failures_open_breaker() {
+        let st = crate::state::AppState::test_fixture();
+        let provider_id = 7;
+        for attempt in 0..4 {
+            assert!(
+                st.breaker.allow(provider_id),
+                "第 {attempt} 次请求：熔断前应放行"
+            );
+            let upstream = futures_util::stream::iter(vec![Err::<
+                Bytes,
+                Box<dyn Error + Send + Sync>,
+            >(
+                Box::<dyn Error + Send + Sync>::from("upstream stream idle timeout"),
+            )]);
+            let mut stream = wrap_chat_stream_to_anthropic(
+                st.clone(),
+                test_meta(provider_id),
+                upstream,
+                100,
+                200,
+                "msg_1".into(),
+                "m".into(),
+            );
+            while let Some(item) = stream.next().await {
+                item.expect("传输错误已转 event: error 帧，不再有 Err");
+            }
+        }
+        assert!(
+            !st.breaker.allow(provider_id),
+            "连续 4 条错误转换流必须熔断"
+        );
+    }
+
+    /// 连接加固：带 [DONE] 的干净转换流记一次成功 → 连续失败计数复位
+    #[tokio::test]
+    async fn converted_stream_clean_done_records_success() {
+        let st = crate::state::AppState::test_fixture();
+        let provider_id = 7;
+        // 2 次传输错误（连续计数 2）+ 1 条 [DONE] 干净流（复位）+ 2 次传输错误，
+        // 共 4 次失败但连续峰值 2 < 4，不得熔断
+        for _ in 0..2 {
+            let upstream = futures_util::stream::iter(vec![Err::<
+                Bytes,
+                Box<dyn Error + Send + Sync>,
+            >(
+                Box::<dyn Error + Send + Sync>::from("upstream stream idle timeout"),
+            )]);
+            let mut stream = wrap_chat_stream_to_anthropic(
+                st.clone(),
+                test_meta(provider_id),
+                upstream,
+                100,
+                200,
+                "msg_1".into(),
+                "m".into(),
+            );
+            while let Some(item) = stream.next().await {
+                item.expect("错误帧字节");
+            }
+        }
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]);
+        let mut stream = wrap_chat_stream_to_anthropic(
+            st.clone(),
+            test_meta(provider_id),
+            upstream,
+            100,
+            200,
+            "msg_1".into(),
+            "m".into(),
+        );
+        while let Some(item) = stream.next().await {
+            item.expect("转换帧字节");
+        }
+        for _ in 0..2 {
+            let upstream = futures_util::stream::iter(vec![Err::<
+                Bytes,
+                Box<dyn Error + Send + Sync>,
+            >(
+                Box::<dyn Error + Send + Sync>::from("upstream stream idle timeout"),
+            )]);
+            let mut stream = wrap_chat_stream_to_anthropic(
+                st.clone(),
+                test_meta(provider_id),
+                upstream,
+                100,
+                200,
+                "msg_1".into(),
+                "m".into(),
+            );
+            while let Some(item) = stream.next().await {
+                item.expect("错误帧字节");
+            }
+        }
+        assert!(
+            st.breaker.allow(provider_id),
+            "[DONE] 干净结束已复位连续计数：2+2 不达阈值 4，不得熔断"
+        );
+    }
 
     fn chunk(
         content: Option<&str>,

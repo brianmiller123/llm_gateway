@@ -160,6 +160,26 @@ class Handler(BaseHTTPRequestHandler):
                              "finish_reason": "stop"}],
                 "usage": usage})
             return
+        # ---- 断连类 fault 注入（连接加固回归）----
+        if mode == "stall_body" and not body.get("stream"):
+            # 非流式：500 响应头 + 声明 Content-Length 后正文一个字节不发，
+            # 静默 /tmp/mock_stall_secs 秒（默认 120）再断连——验证网关响应体读取超时
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "26")  # 声明的体长；正文永不发出
+            self.end_headers()
+            time.sleep(_delay_file("/tmp/mock_stall_secs", 120.0))
+            self.close_connection = True
+            return
+        if mode == "eof_no_terminal" and body.get("stream"):
+            # 流式 200 SSE：两个正常 delta 后直接断连、不发 [DONE]——
+            # 验证 EOF 作为终止帧的兜底（不得挂死，按截断处理并记账）
+            self._sse_start()
+            self._chat_chunk(model, {"content": "Hello"}, None)
+            self._chat_chunk(model, {"content": " world"}, None)
+            time.sleep(0.05)
+            self.close_connection = True
+            return
         # ---- quirk 模式（复现上游不守协议形态）----
         if mode == "content_parts_nonstream" and not body.get("stream"):
             # 非流式：message.content 为 parts 数组（type=text）

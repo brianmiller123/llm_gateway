@@ -24,11 +24,22 @@ pub struct UsageMeta {
     pub started: std::time::Instant,
     /// 管理员测试调用：跳过用量记账（不写 usage_logs，不污染状态页错误率）
     pub test_call: bool,
-    /// 计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
+    /// M33：计价候选模型名（M33：客户端模型名 → 路由映射后的上游模型名，
     /// 依次查价；仅记账使用）
     pub pricing_models: Vec<String>,
     /// Coding Plan 计量（None = 用户无生效 Plan，跳过计数器写入）
     pub plan: Option<PlanBill>,
+    /// 失败归因类别（连接加固/F3；仅内部候选失败行经 record_failure_row 有值，
+    /// 成功行与终局行恒 None——状态页聚合以 `failure_class IS NULL` 过滤出
+    /// 客户端可见行）：connect_error / header_timeout / body_timeout /
+    /// body_read_error / upstream_status / all_candidates_failed
+    pub failure_class: Option<&'static str>,
+    /// 上游真实 HTTP 状态（候选失败行 = 该候选响应状态；终局透传行 = 客户端
+    /// 实际收到的上游错误状态；其余行 NULL）
+    pub upstream_status: Option<i16>,
+    /// 候选序号（0 = 主渠道，1.. = 降级链；候选失败行 = 该候选，终局透传行 =
+    /// 产生所透传响应的候选；与 upstream_status 成对更新，见 proxy F4）
+    pub attempt: Option<i16>,
 }
 
 /// Coding Plan 计量载荷：生效 Plan 存在时随请求携带（proxy 期解析自 PlanRuntime）。
@@ -175,8 +186,9 @@ pub async fn record_usage(
         "INSERT INTO usage_logs
            (request_id, user_id, api_key_id, model, provider_id, endpoint, streamed,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            latency_ms, status, cost, client_ip, session_id, first_token_ms, gen_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17,$18)",
+            latency_ms, status, cost, client_ip, session_id, first_token_ms, gen_ms,
+            failure_class, upstream_status, attempt)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17,$18,$19,$20,$21)",
     )
     .bind(meta.request_id)
     .bind(meta.user_id)
@@ -196,6 +208,11 @@ pub async fn record_usage(
     .bind(meta.session_id.as_deref())
     .bind(meta.first_token_ms)
     .bind(gen_ms)
+    // 失败归因（连接加固/F3）：failure_class 仅候选失败行有值；upstream_status/
+    // attempt 另带终局透传行归因（成对，见 proxy F4）；成功行三者恒 NULL
+    .bind(meta.failure_class)
+    .bind(meta.upstream_status)
+    .bind(meta.attempt)
     .execute(&mut *tx)
     .await?;
 
@@ -283,7 +300,8 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::Usage;
+    use super::{record_usage, Usage, UsageMeta};
+    use uuid::Uuid;
 
     #[test]
     fn openai_nested_cache_details_map_to_cache_read() {
@@ -353,5 +371,78 @@ mod tests {
         u2.fold_anthropic_input();
         u2.fold_anthropic_input();
         assert_eq!(u2.input_tokens, Some(10));
+    }
+
+    // ---------- DB 集成测试（#[sqlx::test] 每测独立临时库，自动应用迁移） ----------
+
+    /// 最小 UsageMeta 构造（user_id = None：跳过月度/Plan 计数器，仅验证明细行）
+    fn meta(request_id: Uuid, failure_class: Option<&'static str>) -> UsageMeta {
+        UsageMeta {
+            request_id,
+            user_id: None,
+            api_key_id: None,
+            model: "test-model".into(),
+            provider_id: 1,
+            endpoint: "openai",
+            streamed: false,
+            client_ip: None,
+            session_id: None,
+            first_token_ms: None,
+            started: std::time::Instant::now(),
+            test_call: false,
+            pricing_models: Vec::new(),
+            plan: None,
+            failure_class,
+            upstream_status: None,
+            attempt: None,
+        }
+    }
+
+    /// 0036 回归（F3 缺陷）：同一 request_id 的候选归因行（failure_class 非空）
+    /// 与终局客户端可见行（NULL）必须共存——全表 UNIQUE 时代先落的归因行会把
+    /// 后落的终局行挤掉（duplicate key），客户端实际收到的错误从状态页消失。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn failure_row_and_client_visible_row_share_request_id(pool: sqlx::PgPool) {
+        let rid = Uuid::new_v4();
+        // 与 proxy 实际顺序一致：先落候选归因行，再落终局行
+        record_usage(&pool, &meta(rid, Some("upstream_status")), None, 502, 10, 1, 0.0)
+            .await
+            .unwrap();
+        record_usage(&pool, &meta(rid, None), None, 502, 10, 1, 0.0)
+            .await
+            .unwrap();
+
+        let (total, visible): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE failure_class IS NULL) \
+             FROM usage_logs WHERE request_id = $1",
+        )
+        .bind(rid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 2, "归因行与终局行都应落库");
+        assert_eq!(visible, 1, "客户端可见行恰一条");
+    }
+
+    /// 0036 回归：终态行（failure_class NULL）每请求仍唯一——同 request_id 的
+    /// 第二条 NULL 行必须被部分唯一索引拒绝（终局行只写一次的语义兜底）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn duplicate_client_visible_row_violates_partial_unique(pool: sqlx::PgPool) {
+        let rid = Uuid::new_v4();
+        record_usage(&pool, &meta(rid, None), None, 200, 10, 1, 0.0)
+            .await
+            .unwrap();
+        let err = record_usage(&pool, &meta(rid, None), None, 200, 10, 1, 0.0)
+            .await
+            .unwrap_err();
+        let sqlx::Error::Database(db) = err else {
+            panic!("expected DatabaseError, got {err}");
+        };
+        assert!(db.is_unique_violation(), "expected 23505, got {db}");
+        assert_eq!(
+            db.constraint(),
+            Some("usage_logs_request_id_client_visible_key"),
+            "违例应来自部分唯一索引而非其它约束"
+        );
     }
 }

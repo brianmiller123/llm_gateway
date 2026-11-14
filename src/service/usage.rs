@@ -98,6 +98,28 @@ pub async fn record(
     record_with_gen_ms(st, meta, usage, status, latency_ms, gen_ms).await;
 }
 
+/// 候选失败行（连接加固）：每个失败候选一条零 token / 零成本明细，仅记录
+/// 失败归因（类别 + 上游状态 + 候选序号）。`status_out` 写行内 status 列，
+/// 与该候选故障最终呈现给客户端的状态一致。成功行不经过此函数（归因列保持
+/// NULL）。F3：本函数是 failure_class 非空的唯一入口——状态页/实时聚合以
+/// `failure_class IS NULL` 排除这些内部归因行，只计客户端可见行（含终局
+/// 错误行；终局行保持 failure_class NULL，仅带 upstream_status/attempt）。
+pub async fn record_failure_row(
+    st: &AppState,
+    meta: &UsageMeta,
+    class: &'static str,
+    upstream_status: Option<u16>,
+    attempt: Option<usize>,
+    status_out: u16,
+    latency_ms: i64,
+) {
+    let mut m = meta.clone();
+    m.failure_class = Some(class);
+    m.upstream_status = upstream_status.map(|s| s as i16);
+    m.attempt = attempt.map(|a| a as i16);
+    record(st, &m, None, status_out, latency_ms).await;
+}
+
 /// 带显式生成阶段耗时的记账（客户端断开兜底在断开时点先算好 gen_ms）。
 pub async fn record_with_gen_ms(
     st: &AppState,

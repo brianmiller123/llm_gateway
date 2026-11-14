@@ -83,6 +83,20 @@ pub struct AppConfig {
     /// M4：半开需连续成功次数才闭合（cc-switch success_threshold=2；单次成功
     /// 闭合会让抖动上游在开-半开间震荡）
     pub breaker_success_threshold: u32,
+    /// 优雅停机排水窗口（秒）：SIGTERM 后等待存量请求（含 SSE）收尾的上限；
+    /// 需与 docker stop_grace_period 配套（grace > drain）
+    pub drain_secs: u64,
+    /// 请求体大小上限（字节）：router DefaultBodyLimit 与提前 Content-Length 检查共用；
+    /// 默认保持 200MiB（历史原因：32MB 曾拒绝真实长上下文流量，见 src/api/mod.rs 注释）
+    pub max_body_bytes: usize,
+    /// 全局在途请求兜底并发上限（与限流规则叠加，规则命中取更严者）；0 = 不限
+    pub global_max_concurrency: usize,
+    /// header 超时（请求体已完整写出后）是否继续换下一候选重发：true=保留旧 failover
+    /// 行为（有双份生成/计费风险），false=该候选直接判 504 终止（默认，防重复计费）
+    pub failover_on_header_timeout: bool,
+    /// 受信任反向代理网段（CSV，如 "10.0.0.0/8,192.168.1.0/24"）：仅这些来源的
+    /// X-Forwarded-For/Proto 被采信；空=直连拓扑，一律用对端 socket 地址
+    pub trust_proxy_cidrs: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +183,28 @@ impl AppConfig {
                  below PRIME (or PRIME=0) if you need the 504 / candidate failover semantics."
             );
         }
+        // 连接加固：优雅停机排水窗口（需 >= 1s；docker stop_grace_period 应大于此值）
+        let drain_secs: u64 = env("GATEWAY_DRAIN_SECS", "120")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_DRAIN_SECS: {e}"))?;
+        if drain_secs == 0 {
+            return Err("GATEWAY_DRAIN_SECS must be >= 1 second".into());
+        }
+        // 连接加固：请求体上限（默认 200MiB；下限 1MiB）
+        let max_body_bytes: usize = env("GATEWAY_MAX_BODY_BYTES", "209715200")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_MAX_BODY_BYTES: {e}"))?;
+        if max_body_bytes < 1_048_576 {
+            return Err("GATEWAY_MAX_BODY_BYTES must be >= 1 MiB".into());
+        }
+        // 连接加固：全局在途并发兜底（0 = 不限）
+        let global_max_concurrency: usize = env("GATEWAY_GLOBAL_MAX_CONCURRENCY", "256")
+            .parse()
+            .map_err(|e| format!("invalid GATEWAY_GLOBAL_MAX_CONCURRENCY: {e}"))?;
+        // 连接加固：header 超时后是否换候选重发（默认 false，防重复计费）
+        let failover_on_header_timeout = env_bool("GATEWAY_FAILOVER_ON_HEADER_TIMEOUT", false)?;
+        // 连接加固：受信代理网段（CSV；空 = 直连拓扑，仅用对端 socket 地址）
+        let trust_proxy_cidrs = env("GATEWAY_TRUST_PROXY_CIDRS", "");
         let upstream_proxy = std::env::var("GATEWAY_UPSTREAM_PROXY")
             .ok()
             .map(|v| v.trim().to_string())
@@ -293,6 +329,11 @@ impl AppConfig {
             breaker_min_requests,
             breaker_window_secs,
             breaker_success_threshold,
+            drain_secs,
+            max_body_bytes,
+            global_max_concurrency,
+            failover_on_header_timeout,
+            trust_proxy_cidrs,
         })
     }
 }

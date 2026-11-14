@@ -110,6 +110,9 @@ pub struct AppState {
     pub provider_health: Arc<tokio::sync::Mutex<HashMap<i64, crate::service::health::ProbeResult>>>,
     /// Plan 阈值告警进程内去重：(user_id, plan_id, period_key, level)
     pub plan_alerts_seen: Arc<Mutex<HashSet<(i64, i64, String, i16)>>>,
+    /// 进程内指标计数器（/metrics 文本导出；连接加固 wave1 挂载）。
+    /// 全应用共享单实例：proxy 候选失败 / 熔断开闸 / 客户端中断在此累计
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl AppState {
@@ -118,13 +121,18 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pool = crate::store::init(&cfg).await?;
         // L22：连接池调优（cc-switch http_client.rs:216-260 同款思想）——
-        // 空闲连接 60s 回收、同 host 最多 10 个空闲连接、TCP keepalive 60s。
+        // 空闲连接 60s 回收、同 host 最多 32 个空闲连接（连接加固：降级链并发
+        // 复用同 host 连接，10 会把池内空闲连接挤兑重建）、TCP keepalive 60s。
         // L29：出站代理（GATEWAY_UPSTREAM_PROXY，http/https/socks5）
         let mut client_builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(10)
-            .tcp_keepalive(Duration::from_secs(60));
+            .pool_max_idle_per_host(32)
+            .tcp_keepalive(Duration::from_secs(60))
+            // 连接加固：HTTP/2 层保活 PING——半开连接（NAT/LB 静默丢弃）在
+            // 30s 无流量后主动探测，15s 无 PONG 即判死，不再把请求挂在死连接上
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(15));
         if let Some(proxy_url) = cfg.upstream_proxy.as_deref() {
             match reqwest::Proxy::all(proxy_url) {
                 Ok(proxy) => {
@@ -181,12 +189,76 @@ impl AppState {
             ),
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         state.reload().await?;
         Ok(state)
     }
 
-    /// 重载 LDAP 设置：DB 配置启用（url 非空）时字段级 DB 优先、空字段回退 env；
+    /// 测试夹具：空内存态 + 断连池（connect_lazy 不发起 I/O；触池路径只会
+    /// 快速失败并被记账层告警吞掉）。仅流级单测使用，不触 DB。
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> Self {
+        static ENV_ONCE: std::sync::Once = std::sync::Once::new();
+        ENV_ONCE.call_once(|| {
+            // AppConfig::from_env 仅强依赖 GATEWAY_MASTER_KEY；CI/单测环境无
+            // 网关环境变量时注入测试密钥。本进程内唯一一次 env 写入，且先于
+            // 任何 from_env 调用（同进程其余测试只读环境变量）。
+            if std::env::var("GATEWAY_MASTER_KEY").is_err() {
+                // SAFETY: edition 2024 的 set_var 为 unsafe；单测进程内一次性
+                // 写入、无并发读者依赖旧值（全仓测试均不读取 GATEWAY_MASTER_KEY）
+                unsafe {
+                    std::env::set_var("GATEWAY_MASTER_KEY", "ab".repeat(32));
+                }
+            }
+        });
+        // 断连池：connect_lazy 不发起任何 I/O，触池的记账路径只会快速失败并被
+        // record_with_gen_ms 告警吞掉；流级单测（转换链熔断/记账分流）用
+        let pool = sqlx::postgres::PgPool::connect_lazy("postgres://127.0.0.1:1/none")
+            .expect("lazy pool");
+        let cfg = std::sync::Arc::new(crate::config::AppConfig::from_env().expect("env config"));
+        let ldap = crate::service::ldap::LdapSettings::from(&*cfg);
+        Self {
+            pool,
+            cfg,
+            client: Client::new(),
+            providers: Arc::new(RwLock::new(Vec::new())),
+            routes: Arc::new(RwLock::new(Vec::new())),
+            rules: Arc::new(RwLock::new(Vec::new())),
+            prices: Arc::new(RwLock::new(HashMap::new())),
+            user_access: Arc::new(RwLock::new(HashMap::new())),
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            admin_ids: Arc::new(RwLock::new(HashSet::new())),
+            admin_ids_gen: Arc::new(AtomicU64::new(0)),
+            disabled_models: Arc::new(RwLock::new(HashMap::new())),
+            breaker: Arc::new(crate::service::breaker::Breaker::new_with(
+                crate::service::breaker::BreakerConfig::default(),
+            )),
+            limiter: Arc::new(RateLimiter::new()),
+            concurrency: Arc::new(crate::service::ratelimit::ConcurrencyLimiter::new()),
+            ldap: Arc::new(RwLock::new(ldap)),
+            extra_body_enabled: Arc::new(RwLock::new(true)),
+            message_templates: Arc::new(RwLock::new(MessageTemplates::default())),
+            active_requests: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            active_by_user: Arc::new(Mutex::new(HashMap::new())),
+            api_endpoints: Arc::new(RwLock::new(crate::store::config::ApiEndpointSettings {
+                responses_enabled: true,
+                responses_visible: true,
+                messages_enabled: true,
+                messages_visible: true,
+            })),
+            custom_headers: Arc::new(RwLock::new(crate::store::config::HeaderSettings::default())),
+            usage: Arc::new(UsageCache::new()),
+            responses_history: Arc::new(
+                crate::service::responses::history::ResponseHistoryStore::new(),
+            ),
+            plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
+            provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        }
+    }
+
+    /// 重载 LDAP 设置（生产路径：DB 配置启用（url 非空）时字段级 DB 优先、空字段回退 env）
     /// DB 未启用（url 为空）则整体回退 env（兼容纯环境变量部署）
     pub(crate) async fn reload_ldap(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = crate::store::config::load_ldap_settings(&self.pool).await?;

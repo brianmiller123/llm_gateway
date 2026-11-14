@@ -26,7 +26,16 @@ pub async fn init(cfg: &AppConfig) -> Result<PgPool, sqlx::Error> {
         .test_before_acquire(true)
         .connect(&cfg.database_url)
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations").run(&pool).await.map_err(|e| {
+        // 连接加固：数据库 schema 比二进制新（降级部署）→ 显式拒绝而非让
+        // 后续 SQL 在缺列上半途失败，留下难以回溯的半迁移状态
+        if let sqlx::migrate::MigrateError::VersionMissing(v) = &e {
+            return sqlx::Error::Protocol(format!(
+                "DB schema 已在迁移 {v}，当前二进制更旧：不支持回滚部署；请部署匹配镜像或恢复升级前 pg_dump 快照"
+            ));
+        }
+        e.into()
+    })?;
     seed(&pool, cfg).await?;
     seed_admin(&pool, cfg).await?;
     Ok(pool)

@@ -7,5 +7,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
   -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes \
   -subj "/CN=llm-gateway" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-chmod 600 certs/key.pem
+# 容器内非 root (65532) 需组读；chgrp 失败仅告警不中断脚本
+chgrp 65532 certs/key.pem 2>/dev/null || echo "警告: chgrp 失败，请在部署机上执行 sudo chgrp 65532 certs/key.pem"
+chmod 640 certs/key.pem 2>/dev/null || true
 echo "OK: certs/cert.pem + certs/key.pem generated"

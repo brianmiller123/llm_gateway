@@ -741,6 +741,19 @@ fn empty_object() -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// 连接加固：header 等待超时（timeout_ms）仅接受 0（显式关闭 header 等待）或
+/// >= 1000（毫秒）。1..=999 的取值曾是配置事故来源（被历史兜底钳到 1s，
+/// "配了 500ms 却总超时 1s"）——新写入直接拒绝；存量脏数据由 send_upstream
+/// 的 legacy 钳制兜底
+fn validate_timeout_ms(timeout_ms: i32) -> Result<(), AppError> {
+    if timeout_ms != 0 && timeout_ms < 1000 {
+        return Err(AppError::BadRequest(
+            "timeout_ms must be 0 (disable header wait) or >= 1000".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// extra_body 配置校验：必须是 JSON 对象、不含网关管理的顶层字段、≤ 8KB
 fn validate_extra_body(v: &serde_json::Value) -> Result<(), AppError> {
     let Some(obj) = v.as_object() else {
@@ -843,6 +856,7 @@ async fn create_provider(
             "provider name must be 1-64 chars".into(),
         ));
     }
+    validate_timeout_ms(req.timeout_ms)?;
     validate_extra_body(&req.extra_body)?;
     validate_extra_headers(&req.auth_scheme, &req.extra_headers)?;
     let api_key = req
@@ -916,6 +930,9 @@ async fn update_provider(
                 "provider name must be 1-64 chars".into(),
             ));
         }
+    }
+    if let Some(timeout_ms) = req.timeout_ms {
+        validate_timeout_ms(timeout_ms)?;
     }
     if let Some(v) = req.extra_body.as_ref() {
         validate_extra_body(v)?;

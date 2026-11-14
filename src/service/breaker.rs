@@ -60,6 +60,18 @@ struct ProviderBreaker {
     window_start: Option<Instant>,
 }
 
+/// 只读快照行：供状态页/指标导出（仅聚合状态，不含敏感信息）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BreakerSnapshot {
+    pub provider_id: i64,
+    pub open: bool,
+    pub open_secs_left: u64,
+    pub consec_failures: u32,
+    pub half_open_probe_in_flight: bool,
+    pub window_requests: u64,
+    pub window_failures: u64,
+}
+
 pub struct Breaker {
     states: Mutex<HashMap<i64, ProviderBreaker>>,
     cfg: BreakerConfig,
@@ -84,7 +96,9 @@ impl Breaker {
     }
 
     /// 渠道当前是否放行：未熔断 / 熔断窗口已过且探测名额可用（M32：半开单探测，
-    /// 窗口到期不再全量放行——雷群效应；cc-switch allow_half_open_probe 同款）
+    /// 窗口到期不再全量放行——雷群效应；cc-switch allow_half_open_probe 同款）。
+    /// **半开探测名额的唯一消费者**：候选过滤（[`Self::filter_candidates`]）走
+    /// [`Self::peek_allow`] 只读判定，不在此预占名额。
     pub fn allow(&self, provider_id: i64) -> bool {
         let mut states = self.states.lock();
         let pb = states.entry(provider_id).or_default();
@@ -102,7 +116,22 @@ impl Breaker {
         }
     }
 
-    /// 至少一个候选放行时返回放行子集；全部熔断时返回 None（调用方回退全量候选）
+    /// 只读放行判定：与 [`Self::allow`] 同一开/闭语义（未熔断 / 熔断窗口已过），
+    /// 但**绝不**占用半开探测名额。探测名额的唯一消费者是候选循环内的
+    /// [`Self::allow`]——过滤是建议性的（结果可能被熔断/授权/方言校验再次修正），
+    /// 若在此预占名额，同窗口后续请求会被误判"探测已被占用"而拒绝放行。
+    pub fn peek_allow(&self, provider_id: i64) -> bool {
+        let states = self.states.lock();
+        match states.get(&provider_id).map(|pb| pb.open_until) {
+            None => true,
+            Some(Some(until)) => Instant::now() >= until,
+            Some(None) => true,
+        }
+    }
+
+    /// 至少一个候选放行时返回放行子集；全部熔断时返回 None（调用方回退全量候选）。
+    /// 过滤走 [`Self::peek_allow`]（只读，不占半开探测名额）；真正尝试上游时
+    /// 候选循环内的 [`Self::allow`] 仍是唯一探测消费者。
     pub fn filter_candidates<'a, T: Clone>(
         &self,
         candidates: &'a [T],
@@ -110,7 +139,7 @@ impl Breaker {
     ) -> Option<Vec<T>> {
         let allowed: Vec<T> = candidates
             .iter()
-            .filter(|c| self.allow(id_of(c)))
+            .filter(|c| self.peek_allow(id_of(c)))
             .cloned()
             .collect();
         if allowed.is_empty() {
@@ -118,6 +147,27 @@ impl Breaker {
         } else {
             Some(allowed)
         }
+    }
+
+    /// 只读快照：短暂持锁聚合各渠道当前状态（状态页/指标导出用；不改任何状态）
+    pub fn snapshot(&self) -> Vec<BreakerSnapshot> {
+        let states = self.states.lock();
+        let now = Instant::now();
+        states
+            .iter()
+            .map(|(id, pb)| BreakerSnapshot {
+                provider_id: *id,
+                open: pb.open_until.is_some(),
+                open_secs_left: pb
+                    .open_until
+                    .map(|u| u.saturating_duration_since(now).as_secs())
+                    .unwrap_or(0),
+                consec_failures: pb.consec_failures,
+                half_open_probe_in_flight: pb.half_open_probe_in_flight,
+                window_requests: pb.window_requests,
+                window_failures: pb.window_failures,
+            })
+            .collect()
     }
 
     pub fn record_success(&self, provider_id: i64) {
@@ -146,7 +196,10 @@ impl Breaker {
         pb.window_requests += 1;
     }
 
-    pub fn record_failure(&self, provider_id: i64) {
+    /// 记一次失败。返回本次调用是否使熔断器转为 open（closed→open，或半开探测
+    /// 失败重开窗口）——调用方据此递增 `breaker_open_total` 指标（每次跃迁 +1，
+    /// 而非每次失败 +1）。
+    pub fn record_failure(&self, provider_id: i64) -> bool {
         let mut states = self.states.lock();
         let pb = states.entry(provider_id).or_default();
         if pb.half_open_probe_in_flight {
@@ -155,7 +208,7 @@ impl Breaker {
             pb.half_open_successes = 0;
             pb.open_until = Some(Instant::now() + Duration::from_secs(self.cfg.open_secs));
             pb.consec_failures = self.cfg.failure_threshold;
-            return;
+            return true;
         }
         self.decay_window(pb);
         pb.consec_failures += 1;
@@ -170,7 +223,9 @@ impl Breaker {
             pb.window_requests = 0;
             pb.window_failures = 0;
             pb.window_start = None;
+            return true;
         }
+        false
     }
 
     /// 半开探测名额归还：探测请求既未成功也未失败就被丢弃（客户端断开、流未
@@ -299,6 +354,31 @@ mod tests {
         assert!(b.allow(1), "第二个探测放行");
         b.record_success(1);
         assert!(b.allow(1), "连续两次成功闭合");
+    }
+
+    /// 连接加固：filter_candidates 走 peek_allow 只读判定——熔断窗口到期的渠道
+    /// 被过滤放行（过滤只看开/闭，与探测名额占用无关），且**不**预占半开探测
+    /// 名额；候选循环里的 allow() 仍是唯一探测消费者（首次调用消费名额，第二次被拒）
+    #[test]
+    fn filter_candidates_peek_does_not_consume_half_open_probe() {
+        let b = Breaker::new();
+        for _ in 0..4 {
+            b.record_failure(1);
+        }
+        assert!(!b.allow(1), "熔断中");
+        expire_window(&b, 1);
+        let cands = vec![("a", 1i64), ("b", 2i64)];
+        let allowed = b
+            .filter_candidates(&cands, |c| c.1)
+            .expect("窗口到期 → peek 放行 1 号 + 未熔断的 2 号");
+        assert_eq!(
+            allowed.len(),
+            2,
+            "peek 只看开/闭：到期窗口（1 号）与未熔断（2 号）候选都在放行子集"
+        );
+        // 探测名额未被过滤预占：首个 allow 消费名额放行，紧随的 allow 被拒
+        assert!(b.allow(1), "首次 allow 消费半开探测名额");
+        assert!(!b.allow(1), "过滤不得预占名额：第二次 allow 必须被拒");
     }
 
     /// P1-16：慢性劣化（错误率 ≥ 0.6 但从不连续 4 败）→ 错误率维度熔断

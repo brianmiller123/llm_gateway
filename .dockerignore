@@ -6,6 +6,8 @@ certs*
 .env
 docs
 scripts
+vendor
+third
 node_modules
 web/node_modules
 web/dist

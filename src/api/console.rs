@@ -157,13 +157,14 @@ async fn login(
     Json(req): Json<LoginReq>,
 ) -> Result<impl IntoResponse, AppError> {
     // 暴力破解防护：每用户名 10 次/分 + 每来源 IP 30 次/分（成功后重置计数）
-    // 反代部署下对端地址是 Nginx，IP 桶用 X-Forwarded-For 首值（假定可信反代）
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next().map(str::trim))
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        .unwrap_or(addr.ip());
+    // IP 桶走受信代理判定（GATEWAY_TRUST_PROXY_CIDRS）：反代网段内取 XFF 最右
+    // 非空条目（W-1：proxy_add_x_forwarded_for 追加语义，最左可伪造），
+    // 直连/非受信对端一律用 socket 地址（XFF 可伪造，采信会绕过每 IP 限流）
+    let client_ip = crate::api::resolve_trusted_ip(
+        addr,
+        crate::api::last_xff_entry(&headers),
+        &st.cfg.trust_proxy_cidrs,
+    );
     let username = req.username.trim().to_string();
     if let Err(secs) = st
         .limiter
@@ -663,20 +664,24 @@ async fn admin_usage_realtime(
 ) -> Result<impl IntoResponse, AppError> {
     let _ = admin;
 
+    // F3（连接加固）：候选失败行（failure_class 非空，每失败候选一条零 token
+    // 零成本明细）不进全站/用户聚合——1 次客户端请求 2 个失败候选 + 1 成功此前
+    // 会计成 calls=3/errors=2。failure_class 非空 ⟺ 内部归因行；客户端可见行
+    // （含终局错误行，failure_class 恒 NULL）才是 calls/errors/延迟的分母口径
     let summary: RealtimeSummary = sqlx::query_as(
-        "SELECT COUNT(*)::bigint AS calls, \
-                COUNT(*) FILTER (WHERE status >= 400)::bigint AS errors, \
-                COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens, \
-                COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens, \
-                COALESCE(AVG(latency_ms), 0)::bigint AS avg_latency_ms, \
-                COALESCE(SUM(cost), 0)::float8 AS cost, \
+        "SELECT COUNT(*) FILTER (WHERE failure_class IS NULL)::bigint AS calls, \
+                COUNT(*) FILTER (WHERE status >= 400 AND failure_class IS NULL)::bigint AS errors, \
+                COALESCE(SUM(input_tokens) FILTER (WHERE failure_class IS NULL), 0)::bigint AS input_tokens, \
+                COALESCE(SUM(output_tokens) FILTER (WHERE failure_class IS NULL), 0)::bigint AS output_tokens, \
+                COALESCE(AVG(latency_ms) FILTER (WHERE failure_class IS NULL), 0)::bigint AS avg_latency_ms, \
+                COALESCE(SUM(cost) FILTER (WHERE failure_class IS NULL), 0)::float8 AS cost, \
                 COALESCE( \
-                  SUM(output_tokens) FILTER (WHERE streamed AND status < 400 AND output_tokens > 0 AND gen_ms > 0) \
-                  / NULLIF(SUM(gen_ms) FILTER (WHERE streamed AND status < 400 AND output_tokens > 0 AND gen_ms > 0), 0) \
+                  SUM(output_tokens) FILTER (WHERE failure_class IS NULL AND streamed AND status < 400 AND output_tokens > 0 AND gen_ms > 0) \
+                  / NULLIF(SUM(gen_ms) FILTER (WHERE failure_class IS NULL AND streamed AND status < 400 AND output_tokens > 0 AND gen_ms > 0), 0) \
                   * 1000.0, 0)::float8 AS stream_tps, \
                 COALESCE( \
-                  SUM(output_tokens) FILTER (WHERE status < 400 AND output_tokens > 0 AND gen_ms > 0) \
-                  / NULLIF(SUM(gen_ms) FILTER (WHERE status < 400 AND output_tokens > 0 AND gen_ms > 0), 0) \
+                  SUM(output_tokens) FILTER (WHERE failure_class IS NULL AND status < 400 AND output_tokens > 0 AND gen_ms > 0) \
+                  / NULLIF(SUM(gen_ms) FILTER (WHERE failure_class IS NULL AND status < 400 AND output_tokens > 0 AND gen_ms > 0), 0) \
                   * 1000.0, 0)::float8 AS throughput_tps \
          FROM usage_logs WHERE created_at >= now() - interval '5 minutes'",
     )
@@ -686,22 +691,22 @@ async fn admin_usage_realtime(
 
     let users: Vec<RealtimeUserStat> = sqlx::query_as(
         "SELECT u.id AS user_id, u.username, u.display_name, \
-                COUNT(*) FILTER (WHERE l.created_at >= now() - interval '5 minutes')::bigint AS calls_5m, \
-                COUNT(*) FILTER (WHERE l.created_at >= now() - interval '5 minutes' AND l.status >= 400)::bigint AS errors_5m, \
-                COUNT(*)::bigint AS calls_60m, \
-                COUNT(*) FILTER (WHERE l.status >= 400)::bigint AS errors_60m, \
-                COALESCE(SUM(l.input_tokens), 0)::bigint AS input_tokens, \
-                COALESCE(SUM(l.output_tokens), 0)::bigint AS output_tokens, \
-                COALESCE(SUM(l.cost), 0)::float8 AS cost, \
-                COALESCE(AVG(l.latency_ms), 0)::bigint AS avg_latency_ms, \
+                COUNT(*) FILTER (WHERE l.created_at >= now() - interval '5 minutes' AND l.failure_class IS NULL)::bigint AS calls_5m, \
+                COUNT(*) FILTER (WHERE l.created_at >= now() - interval '5 minutes' AND l.status >= 400 AND l.failure_class IS NULL)::bigint AS errors_5m, \
+                COUNT(*) FILTER (WHERE l.failure_class IS NULL)::bigint AS calls_60m, \
+                COUNT(*) FILTER (WHERE l.status >= 400 AND l.failure_class IS NULL)::bigint AS errors_60m, \
+                COALESCE(SUM(l.input_tokens) FILTER (WHERE l.failure_class IS NULL), 0)::bigint AS input_tokens, \
+                COALESCE(SUM(l.output_tokens) FILTER (WHERE l.failure_class IS NULL), 0)::bigint AS output_tokens, \
+                COALESCE(SUM(l.cost) FILTER (WHERE l.failure_class IS NULL), 0)::float8 AS cost, \
+                COALESCE(AVG(l.latency_ms) FILTER (WHERE l.failure_class IS NULL), 0)::bigint AS avg_latency_ms, \
                 MAX(l.created_at) AS last_call_at, \
                 COALESCE( \
-                  SUM(l.output_tokens) FILTER (WHERE l.streamed AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0) \
-                  / NULLIF(SUM(l.gen_ms) FILTER (WHERE l.streamed AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0), 0) \
+                  SUM(l.output_tokens) FILTER (WHERE l.failure_class IS NULL AND l.streamed AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0) \
+                  / NULLIF(SUM(l.gen_ms) FILTER (WHERE l.failure_class IS NULL AND l.streamed AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0), 0) \
                   * 1000.0, 0)::float8 AS stream_tps, \
                 COALESCE( \
-                  SUM(l.output_tokens) FILTER (WHERE l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0) \
-                  / NULLIF(SUM(l.gen_ms) FILTER (WHERE l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0), 0) \
+                  SUM(l.output_tokens) FILTER (WHERE l.failure_class IS NULL AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0) \
+                  / NULLIF(SUM(l.gen_ms) FILTER (WHERE l.failure_class IS NULL AND l.status < 400 AND l.output_tokens > 0 AND l.gen_ms > 0), 0) \
                   * 1000.0, 0)::float8 AS throughput_tps \
          FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id \
          WHERE l.created_at >= now() - interval '60 minutes' \

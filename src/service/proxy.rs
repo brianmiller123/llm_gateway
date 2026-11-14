@@ -185,11 +185,12 @@ impl PrimeDeadline {
     }
 }
 
-/// 既有超时文案（header 等待 / 首字节 / 静默）
+/// 既有超时文案（header 等待 / 首字节 / 静默 / 非流式总超时）
 fn timeout_text(text: &str) -> bool {
     text.contains("header timeout")
         || text.contains("stream first byte timeout")
         || text.contains("stream idle timeout")
+        || text.contains("request timeout")
 }
 
 fn is_timeout_node(e: &(dyn Error + 'static)) -> bool {
@@ -446,25 +447,33 @@ fn apply_system_head(body: &mut serde_json::Value, enabled: bool, merge: bool) -
 /// M9：非流式上游响应体读取上限（cc-switch hyper_client MAX_RESPONSE_BODY_BYTES 同款）
 const MAX_UPSTREAM_BODY_BYTES: usize = 128 * 1024 * 1024;
 
-/// 带上限的响应体读取：超出上限报错（防恶意上游 OOM 网关）
+/// 带上限与截止时间的响应体读取：超出上限报错（防恶意上游 OOM 网关）；
+/// deadline 兜底僵死流——响应头已回但体永不结束/停止推进时不再无限挂起
+/// （重试体预读 / 降级转换体收集同理）。超时错误文案
+/// `"upstream body read timeout"`：候选失败分类据此归因 body_timeout。
 async fn read_body_capped(
     resp: reqwest::Response,
     cap: usize,
+    deadline: Duration,
 ) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
-    let mut total = 0usize;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| -> Box<dyn Error + Send + Sync> {
-            format!("upstream body read failed: {e}").into()
-        })?;
-        total = total.saturating_add(chunk.len());
-        if total > cap {
-            return Err(format!("upstream response body exceeds {cap} bytes").into());
+    tokio::time::timeout(deadline, async move {
+        let mut total = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| -> Box<dyn Error + Send + Sync> {
+                format!("upstream body read failed: {e}").into()
+            })?;
+            total = total.saturating_add(chunk.len());
+            if total > cap {
+                return Err(format!("upstream response body exceeds {cap} bytes").into());
+            }
+            buf.extend_from_slice(&chunk);
         }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(buf))
+        Ok(Bytes::from(buf))
+    })
+    .await
+    .unwrap_or_else(|_| Err("upstream body read timeout".into()))
 }
 
 /// L8：递归剥离 `_` 前缀私有字段（cc-switch body_filter.rs:68-133 同款；
@@ -711,6 +720,26 @@ fn bind_guards_to_body(resp: Response, guards: ResponseGuards) -> Response {
     Response::from_parts(parts, Body::from_stream(bound))
 }
 
+/// 连接加固：全局在途并发兜底规则合成。`cap > 0` 时在规则快照上追加一条
+/// global 作用域、不限模型的规则——`matched_rules` 将其映射为与 DB 全局规则
+/// 相同的 "global" 桶键，`apply_concurrency_limits` 按键去重取最严（min），
+/// all-or-nothing acquire 一并覆盖全局上限。`cap == 0`（关闭）→ 原样返回。
+fn with_global_cap(
+    mut rules: Vec<crate::store::rules::RateRule>,
+    cap: usize,
+) -> Vec<crate::store::rules::RateRule> {
+    if cap == 0 {
+        return rules;
+    }
+    rules.push(crate::store::rules::RateRule {
+        scope: "global".to_string(),
+        scope_id: None,
+        model: None,
+        concurrency: cap.min(i32::MAX as usize) as i32,
+    });
+    rules
+}
+
 /// OpenAI 兼容代理入口：鉴权 → 管线
 pub async fn proxy(
     st: &AppState,
@@ -740,12 +769,30 @@ pub async fn proxy(
     let model = requested_model(&json);
     // 并发上限（管线唯一的限流维度）：guard 绑定响应体生命周期，SSE 流尽或
     // 客户端断开才归还。拒绝时并发未占坑（try_acquire 全有或全无）。
-    let conc = match crate::service::ratelimit::apply_concurrency_limits(
-        st,
-        user_id,
-        key_id,
-        model.as_deref().unwrap_or_default(),
-    ) {
+    // 连接加固：cfg.global_max_concurrency > 0 时合成一条 global 规则并入规则
+    // 快照（与 DB 全局规则同键、apply_concurrency_limits 去重取最严），超出
+    // 全局上限同样走既有 429 拒绝路径。经 AppState 副本注入（Arc 浅克隆 +
+    // 新 rules Arc），不改共享规则表；guard 持同一计数表引用，释放语义不变。
+    let conc = if st.cfg.global_max_concurrency > 0 {
+        let mut effective = st.clone();
+        let rules =
+            with_global_cap(effective.rules.read().clone(), st.cfg.global_max_concurrency);
+        effective.rules = Arc::new(parking_lot::RwLock::new(rules));
+        crate::service::ratelimit::apply_concurrency_limits(
+            &effective,
+            user_id,
+            key_id,
+            model.as_deref().unwrap_or_default(),
+        )
+    } else {
+        crate::service::ratelimit::apply_concurrency_limits(
+            st,
+            user_id,
+            key_id,
+            model.as_deref().unwrap_or_default(),
+        )
+    };
+    let conc = match conc {
         Ok(g) => g,
         Err(e) => {
             drop(active);
@@ -1186,6 +1233,14 @@ async fn proxy_authed(
             .chain(route.upstream_model.clone())
             .collect(),
         plan: plan_bill,
+        // 失败归因（连接加固/F3）：failure_class 仅内部候选失败行经
+        // usage::record_failure_row 填写（状态页聚合以 failure_class IS NULL
+        // 过滤出客户端可见行）；终局行保持 NULL，仅带 upstream_status/attempt
+        // 归因对——此前终局行也写 failure_class，会让该过滤器把客户端真实
+        // 收到的错误一并滤掉（错误率恒 0）
+        failure_class: None,
+        upstream_status: None,
+        attempt: None,
     };
 
     // 7. 转发 + 记账
@@ -1204,11 +1259,20 @@ async fn proxy_authed(
         // 尚未向客户端写出任何字节（响应流在候选选定后才返回），无重复生成风险
         //（cc-switch 流式首块失败可重试同款）。选定候选后不再重试（防重复计费）。
         let mut last_failure: Option<(u16, Vec<u8>, String, UpstreamHeaders)> = None;
+        // 终局归因对（真实上游状态, 候选序号）：必须成对更新。此前 upstream_status
+        // 取最后一次 HTTP 响应、attempt 取最后一次失败候选，两者可能错位（F4：
+        // attempt 指向无响应候选）。last_failure 元组里网关合成的状态码（priming
+        // 错误帧 / 提前断流）不进这里——归因只记真实上游状态
+        let mut last_failure_at: Option<(u16, usize)> = None;
         // L5：实际最后失败的候选（尾段错误上下文归属；默认主候选）
         let mut last_failed: Option<&Provider> = None;
         let mut saw_timeout = false;
         let mut saw_connect_error = false;
-        'candidates: for provider in candidates.iter().take(max_attempts) {
+        // 候选循环内响应体预读/错误体收集的统一截止时间（僵死流兜底）
+        let body_read_deadline = Duration::from_secs(st.cfg.stream_idle_timeout_secs.max(1));
+        'candidates: for (attempt_idx, provider) in
+            candidates.iter().enumerate().take(max_attempts)
+        {
             // M4/H5：记账与错误归属当前实际候选（此前流式固定 candidates[0]，
             // 降级切换后渠道报表/错误上下文归属错渠道）
             meta.provider_id = provider.id;
@@ -1220,7 +1284,18 @@ async fn proxy_authed(
             let anthropic_converted =
                 crate::service::anthropic::should_convert(endpoint.anthropic, provider);
             let converted = crate::service::responses::should_convert(endpoint.responses, provider);
-            let (outbound, upstream_path) = build_outbound(provider)?;
+            // F1：出站体构建失败（方言转换/序列化错误）不是渠道健康信号——此前
+            // `?` 直接上抛，已占用的半开探测名额被永久占位，该渠道窗口到期后
+            // 再也无法 allow 放行。只归还探测名额（record_failure 会把半开渠道
+            // 重开整个窗口，且这不是线路故障）后换下一候选
+            let (outbound, upstream_path) = match build_outbound(provider) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(provider = %provider.name, error = %e, "provider outbound build failed");
+                    st.breaker.release_probe(provider.id);
+                    continue;
+                }
+            };
             let provider_key = match crate::crypto::decrypt(
                 &provider.api_key_encrypted,
                 &st.cfg.master_key,
@@ -1228,7 +1303,9 @@ async fn proxy_authed(
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "provider key decrypt failed");
-                    st.breaker.record_failure(provider.id);
+                    if st.breaker.record_failure(provider.id) {
+                        st.metrics.record_breaker_open();
+                    }
                     continue;
                 }
             };
@@ -1256,6 +1333,11 @@ async fn proxy_authed(
             }) = &sent
             {
                 let latency = started.elapsed().as_millis() as i64;
+                // 终局透传上游错误体：非重试失败（客户端拿到真实状态码）——
+                // 上游错误指标 + 失败归因随记账行落库
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
                 st.breaker.record_success(provider.id);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
                 let ctx = error_context(provider, &model, request_id);
@@ -1322,7 +1404,38 @@ async fn proxy_authed(
                         saw_connect_error = true;
                     }
                     tracing::warn!(provider = %provider.name, error = %e, "upstream stream attempt failed");
-                    st.breaker.record_failure(provider.id);
+                    // 连接加固：候选失败三件套——熔断失败（开闸跃迁计指标）、
+                    // 上游错误计数、失败归因行（类别 + 候选序号）
+                    if st.breaker.record_failure(provider.id) {
+                        st.metrics.record_breaker_open();
+                    }
+                    let (class, status_out, terminal_reason) =
+                        classify_send_failure(e.as_ref(), streamed);
+                    st.metrics.record_upstream_error(provider.id);
+                    usage::record_failure_row(
+                        st,
+                        &meta,
+                        class,
+                        None,
+                        Some(attempt_idx),
+                        status_out,
+                        started.elapsed().as_millis() as i64,
+                    )
+                    .await;
+                    // 连接加固：header 等待超时默认判终局——请求体已完整写出，
+                    // 上游可能已在生成，换候选重发有双份生成/计费风险；
+                    // GATEWAY_FAILOVER_ON_HEADER_TIMEOUT=true 保留旧 failover 行为
+                    if let Some(reason) = terminal_reason
+                        && !st.cfg.failover_on_header_timeout
+                    {
+                        return header_timeout_terminal_response(
+                            provider,
+                            &model,
+                            request_id,
+                            endpoint,
+                            reason,
+                        );
+                    }
                     last_failed = Some(provider);
                     continue;
                 }
@@ -1332,13 +1445,40 @@ async fn proxy_authed(
             // P0-7：白名单限流/退避头（供本候选各返回出口附加）
             let rl = rate_limit_headers(&resp);
             if is_stream_retryable(status) {
-                let bytes = read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES)
+                // 连接加固：429/503 带明确 Retry-After 时换候选前先等待（钳 2s
+                // ——长窗口退避交由客户端 SDK；候选循环久等会拖死整条降级链）
+                let wait_secs = retry_after_secs(
+                    resp.headers(),
+                    matches!(
+                        status,
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                    ),
+                );
+                let bytes = read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES, body_read_deadline)
                     .await
                     .unwrap_or_default()
                     .to_vec();
                 tracing::warn!(provider = %provider.name, status = %status, "upstream stream retryable failure");
                 last_failure = Some((status.as_u16(), bytes, content_type, rl.clone()));
-                st.breaker.record_failure(provider.id);
+                last_failure_at = Some((status.as_u16(), attempt_idx));
+                if st.breaker.record_failure(provider.id) {
+                    st.metrics.record_breaker_open();
+                }
+                // 连接加固：上游错误指标 + 失败归因行（真实上游状态）
+                st.metrics.record_upstream_error(provider.id);
+                usage::record_failure_row(
+                    st,
+                    &meta,
+                    "upstream_status",
+                    Some(status.as_u16()),
+                    Some(attempt_idx),
+                    status.as_u16(),
+                    started.elapsed().as_millis() as i64,
+                )
+                .await;
+                if let Some(secs) = wait_secs {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                }
                 last_failed = Some(provider);
                 continue;
             }
@@ -1351,10 +1491,12 @@ async fn proxy_authed(
             // 此前仅校验首个 chunk——"200 + 首块 role delta + 次块错误 envelope"
             // 的上游会把 failed 透传给客户端且熔断器不记故障
             let is_sse = content_type.contains("text/event-stream");
-            // 透明 SSE 透传（非转换 + SSE）的熔断信号由 `SseErrorTail` 结算：
-            // 提交处不记 success，错误收尾上下文也按同一判定安装。判定只在这里
-            // 计算一次，提交点与安装点共用——避免两处各自推演条件而漂移
-            let tail_settles = !anthropic_converted && !converted && is_sse;
+            // 连接加固：所有 SSE 链路的熔断信号都由流终止结算（透传 = `SseErrorTail`；
+            // 转换链 = 各自 `wrap_chat_stream_to_*` 内部在传输错误/终态/干净 EOF
+            // 时结算），提交处不再预记 success——"2xx 后必断流 / 缺终态帧"的
+            // 供应商两种形态都按真实结果计数。判定只在这里计算一次，提交点与
+            // 错误收尾上下文安装点共用——避免两处各自推演条件而漂移
+            let tail_settles = is_sse;
             let will_stream = is_sse || (!anthropic_converted && !converted);
             let mut resp = Some(resp);
             let mut stream_opt: Option<
@@ -1423,7 +1565,21 @@ async fn proxy_authed(
                                     "application/json".to_string(),
                                     Vec::new(),
                                 ));
-                                st.breaker.record_failure(provider.id);
+                                last_failure_at = Some((status.as_u16(), attempt_idx));
+                                if st.breaker.record_failure(provider.id) {
+                                    st.metrics.record_breaker_open();
+                                }
+                                st.metrics.record_upstream_error(provider.id);
+                                usage::record_failure_row(
+                                    st,
+                                    &meta,
+                                    "upstream_status",
+                                    Some(status.as_u16()),
+                                    Some(attempt_idx),
+                                    502,
+                                    started.elapsed().as_millis() as i64,
+                                )
+                                .await;
                                 continue 'candidates;
                             }
                             buffered_bytes += chunk.len();
@@ -1444,7 +1600,21 @@ async fn proxy_authed(
                                         "application/json".to_string(),
                                         Vec::new(),
                                     ));
-                                    st.breaker.record_failure(provider.id);
+                                    last_failure_at = Some((status.as_u16(), attempt_idx));
+                                    if st.breaker.record_failure(provider.id) {
+                                        st.metrics.record_breaker_open();
+                                    }
+                                    st.metrics.record_upstream_error(provider.id);
+                                    usage::record_failure_row(
+                                        st,
+                                        &meta,
+                                        "upstream_status",
+                                        Some(status.as_u16()),
+                                        Some(attempt_idx),
+                                        502,
+                                        started.elapsed().as_millis() as i64,
+                                    )
+                                    .await;
                                     continue 'candidates;
                                 }
                                 PrimeSignal::Productive | PrimeSignal::Terminal => {
@@ -1471,7 +1641,28 @@ async fn proxy_authed(
                                 "application/json".to_string(),
                                 Vec::new(),
                             ));
-                            st.breaker.record_failure(provider.id);
+                            // 连接加固：流阶段超时归因 body_timeout（真实上游
+                            // 状态 = 已收到的 200），其余按连接错误
+                            let (class, status_out) = if timed_out {
+                                ("body_timeout", 504u16)
+                            } else {
+                                ("connect_error", 502u16)
+                            };
+                            last_failure_at = Some((status.as_u16(), attempt_idx));
+                            if st.breaker.record_failure(provider.id) {
+                                st.metrics.record_breaker_open();
+                            }
+                            st.metrics.record_upstream_error(provider.id);
+                            usage::record_failure_row(
+                                st,
+                                &meta,
+                                class,
+                                Some(status.as_u16()),
+                                Some(attempt_idx),
+                                status_out,
+                                started.elapsed().as_millis() as i64,
+                            )
+                            .await;
                             if timed_out {
                                 saw_timeout = true;
                             } else {
@@ -1528,16 +1719,34 @@ async fn proxy_authed(
                                 "application/json".to_string(),
                                 Vec::new(),
                             ));
-                            st.breaker.record_failure(provider.id);
+                            // 连接加固：体未完成即干净断流 → body_read_error
+                            //（真实上游状态 = 已收到的 200）
+                            last_failure_at = Some((status.as_u16(), attempt_idx));
+                            if st.breaker.record_failure(provider.id) {
+                                st.metrics.record_breaker_open();
+                            }
+                            st.metrics.record_upstream_error(provider.id);
+                            usage::record_failure_row(
+                                st,
+                                &meta,
+                                "body_read_error",
+                                Some(status.as_u16()),
+                                Some(attempt_idx),
+                                502,
+                                started.elapsed().as_millis() as i64,
+                            )
+                            .await;
                             continue 'candidates;
                         }
                     }
                 }
                 // 提交：熔断信号结算 + 缓冲块与剩余流拼接（字节顺序不变）
-                // 透明 SSE 透传由 `SseErrorTail` 在流终止时结算（正常 EOF →
-                // record_success，首个 Err → record_failure），此处不得再记 success：
-                // 同一请求会被计 2 次 requests / 1 次 failure，连续计数每次归零、
-                // 错误率恒 0.5 < 0.6，"2xx 后必断流"的供应商两个维度都不熔断
+                // 连接加固：SSE 链路（tail_settles = is_sse）由流终止结算——
+                // 透传链在 `SseErrorTail`（带终态 EOF → record_success；Err /
+                // 缺终态 EOF → record_failure），转换链在 wrap_*_stream 内部。
+                // 此处不得再记 success：同一请求会被计 2 次 requests / 1 次
+                // failure，连续计数每次归零、错误率恒 0.5 < 0.6，"2xx 后必断流"
+                // 的供应商两个维度都不熔断。非 SSE（缓冲路径）提交即 success。
                 settle_commit_signal(&st.breaker, provider.id, tail_settles);
                 stream_opt = Some(Box::pin(
                     futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(stream),
@@ -1586,7 +1795,19 @@ async fn proxy_authed(
             if anthropic_converted {
                 // 非 2xx / 200 非 SSE：缓冲错误体（SSE 形态从预读流收集，
                 // 防 resp 已被 preread 消费）整形为 Anthropic 错误 JSON 返回
-                let bytes = collect_stream_or_body(&mut stream_opt, &mut resp).await;
+                let bytes = collect_stream_or_body(
+                    &mut stream_opt,
+                    &mut resp,
+                    body_read_deadline,
+                )
+                .await;
+                // F1：非 2xx + SSE 走到这里时提交点结算已被推迟（tail_settles =
+                // is_sse），转换分支又不像透传链那样安装收尾流——不在此显式结算，
+                // 半开探测名额永久占位。渠道给出了明确响应（可重试状态早已换家）
+                // = 健康，与非 SSE 缓冲路径提交点 record_success 同语义
+                if will_stream {
+                    st.breaker.record_success(provider.id);
+                }
                 let response_status = if status.is_success() {
                     // 状态码统一（对齐 Responses 链路 502）：上游 200 + 不可转换体
                     // 属上游故障语义；422 会让客户端误判为请求错误重发同样的请求
@@ -1598,6 +1819,10 @@ async fn proxy_authed(
                     request_id = %request_id, status = %status,
                     content_type = %content_type, "anthropic stream upstream error"
                 );
+                // 连接加固：终局透传上游错误体 → 上游错误指标 + 失败归因
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
                 return Ok(attach_upstream_headers(
                     Response::builder()
@@ -1647,18 +1872,22 @@ async fn proxy_authed(
             if converted && status.is_success() {
                 // 200 但响应体不是 SSE：上游用 JSON 报错（或忽略 stream 参数直接回了
                 // 完整 Chat completion）。透传原始体会让 Responses SSE 客户端拿到无法
-                let bytes =
-                    read_body_capped(resp.take().expect("resp present"), MAX_UPSTREAM_BODY_BYTES)
-                        .await
-                        .unwrap_or_default();
+                let bytes = read_body_capped(
+                    resp.take().expect("resp present"),
+                    MAX_UPSTREAM_BODY_BYTES,
+                    body_read_deadline,
+                )
+                .await
+                .unwrap_or_default();
                 let usage = parse_usage(&bytes);
-                usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency).await;
                 if let Some(sse) = crate::service::responses::stream::synthesize_sse_from_chat_body(
                     &bytes,
                     &format!("resp_{request_id}"),
                     &model,
                     &tool_ctx,
                 ) {
+                    // 可合成完整 SSE：按上游真实状态记账（视为成功交付）
+                    usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency).await;
                     tracing::warn!(
                         request_id = %request_id, content_type = %content_type,
                         "responses stream: upstream returned JSON body for stream request; synthesized SSE"
@@ -1679,6 +1908,12 @@ async fn proxy_authed(
                     request_id = %request_id, status = %status, content_type = %content_type,
                     "responses stream upstream returned non-SSE body"
                 );
+                // 连接加固：200 + 不可转换体 = 上游故障 → 上游错误指标 +
+                // 失败归因（真实上游状态），按 502 记账并整形返回
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
+                usage::record(st, &meta, usage.as_ref(), 502, latency).await;
                 return Ok(attach_upstream_headers(
                     Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
@@ -1699,7 +1934,21 @@ async fn proxy_authed(
                 // P0 关联修复：converted 路径的非 2xx（此前落入下方透传分支，
                 // stream_opt 仅在 SSE 时创建 → JSON 错误体触发 expect panic）。
                 // 整形为 Responses 错误 JSON 返回；SSE 形态错误体从预读流收集。
-                let bytes = collect_stream_or_body(&mut stream_opt, &mut resp).await;
+                let bytes = collect_stream_or_body(
+                    &mut stream_opt,
+                    &mut resp,
+                    body_read_deadline,
+                )
+                .await;
+                // F1：非 2xx + SSE 的提交点结算已被推迟（tail_settles = is_sse），
+                // 转换分支不安装收尾流——显式结算一次（同 anthropic 分支语义）
+                if will_stream {
+                    st.breaker.record_success(provider.id);
+                }
+                // 连接加固：终局透传上游错误体 → 上游错误指标 + 失败归因
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
                 tracing::warn!(
                     request_id = %request_id, status = %status,
@@ -1728,8 +1977,9 @@ async fn proxy_authed(
             let capture_usage = status.is_success();
             let upstream = stream_opt.take().expect("stream preread present");
             // W1：SSE 透传流的错误在流内转成一条错误帧后正常结束（不再把 Err
-            // 交给 hyper 硬断连接）；非 SSE 字节流保持原行为
-            // 错误帧与收尾副作用（熔断计数 / 关联日志）的上下文随流创建一次。
+            // 交给 hyper 硬断连接）；非 SSE 字节流的流级 Err 同样截断为干净
+            // EOF（连接加固：尾部 Err 不再硬断连接，客户端保留已缓冲前缀）
+            // 错误帧与收尾副作用（熔断计数 / 指标 / 关联日志）的上下文随流创建一次。
             // 安装判定复用提交点的 `tail_settles`（单一来源；走到这里已排除
             // 转换链路——它们在上方分支返回）。方言跟随客户端端点：透传出口
             // 同时服务原生 Anthropic（/v1/messages + api_type=anthropic 上游）
@@ -1748,6 +1998,7 @@ async fn proxy_authed(
                 model: model.clone(),
                 provider_key: provider_key.clone(),
                 breaker: st.breaker.clone(),
+                metrics: st.metrics.clone(),
             });
             let stream = wrap_stream(
                 st.clone(),
@@ -1785,6 +2036,10 @@ async fn proxy_authed(
         // 全部候选失败/不可用：优先透传最后一次上游失败响应（按客户端方言整形）
         if let Some((status, bytes, content_type, rl)) = last_failure {
             let latency = started.elapsed().as_millis() as i64;
+            // 连接加固：终局失败行带归因——真实上游状态 + 候选序号成对落库
+            //（F4：两者取自同一 last_failure_at，不指向无响应候选）
+            meta.upstream_status = last_failure_at.map(|(s, _)| s as i16);
+            meta.attempt = last_failure_at.map(|(_, i)| i as i16);
             usage::record(st, &meta, None, status, latency).await;
             // L5：错误上下文归属实际最后失败的候选（此前固定 candidates[0]）
             let ctx = error_context(last_failed.unwrap_or(&candidates[0]), &model, request_id);
@@ -1819,6 +2074,25 @@ async fn proxy_authed(
                 &rl,
             ));
         }
+        // 连接加固：全候选耗尽且无任何上游响应可透传 → 记请求级失败行
+        //（all_candidates_failed；status 与呈现给客户端的终局错误一致）
+        let terminal_status = if saw_timeout {
+            504u16
+        } else if saw_connect_error {
+            502u16
+        } else {
+            503u16
+        };
+        usage::record_failure_row(
+            st,
+            &meta,
+            "all_candidates_failed",
+            None,
+            None,
+            terminal_status,
+            started.elapsed().as_millis() as i64,
+        )
+        .await;
         // M26：全部候选耗尽且无上游响应可透传 → 504（曾超时）/ 502（连接失败）/ 503（耗尽）
         if saw_timeout {
             Err(AppError::UpstreamTimeout(
@@ -1834,10 +2108,14 @@ async fn proxy_authed(
             ))
         }
     } else {
-        let mut last_response: Option<(u16, Vec<u8>, String, UpstreamHeaders)> = None;
+        // 终局透传候选（状态码, 候选序号, 响应体…）：状态与序号成对更新（F4），
+        // 终局归因行不得把最后 HTTP 响应的候选序号错位到无响应候选上
+        let mut last_response: Option<(u16, usize, Vec<u8>, String, UpstreamHeaders)> = None;
         // L5：实际最后失败的候选（尾段错误上下文归属）
         let mut last_failed: Option<&Provider> = None;
-        for provider in candidates.iter().take(max_attempts) {
+        // 响应体读取的统一截止时间（僵死流兜底）
+        let body_read_deadline = Duration::from_secs(st.cfg.stream_idle_timeout_secs.max(1));
+        for (attempt_idx, provider) in candidates.iter().enumerate().take(max_attempts) {
             // M4：记账归属当前实际候选（与流式循环对齐）
             meta.provider_id = provider.id;
             // M3：熔断器跳过放行窗口外的候选（全部熔断已在候选过滤时回退）
@@ -1855,14 +2133,24 @@ async fn proxy_authed(
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "provider key decrypt failed");
-                    st.breaker.record_failure(provider.id);
+                    if st.breaker.record_failure(provider.id) {
+                        st.metrics.record_breaker_open();
+                    }
                     last_failed = Some(provider);
                     continue;
                 }
             };
+            // F1：出站体构建失败（方言转换/序列化错误）不是渠道健康信号——
+            // 此前 `?` 直接上抛，半开探测名额被永久占位。归还探测名额后换下一
+            // 候选（与 decrypt 失败分支同形：last_failed 仅作尾段错误上下文归属）
             let (outbound, upstream_path) = match build_outbound(provider) {
                 Ok(v) => v,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    tracing::warn!(provider = %provider.name, error = %e, "provider outbound build failed");
+                    st.breaker.release_probe(provider.id);
+                    last_failed = Some(provider);
+                    continue;
+                }
             };
             let sent = send_with_rectify(
                 st,
@@ -1889,6 +2177,11 @@ async fn proxy_authed(
             }) = &sent
             {
                 let latency = started.elapsed().as_millis() as i64;
+                // 终局透传上游错误体：非重试失败（客户端拿到真实状态码）——
+                // 上游错误指标 + 失败归因随记账行落库
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
                 st.breaker.record_success(provider.id);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
                 let ctx = error_context(provider, &model, request_id);
@@ -1948,7 +2241,39 @@ async fn proxy_authed(
                 Ok(SentOutcome::PreRead { .. }) => unreachable!("handled above"),
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "upstream attempt failed");
-                    st.breaker.record_failure(provider.id);
+                    // 连接加固：候选失败三件套——熔断失败（开闸跃迁计指标）、
+                    // 上游错误计数、失败归因行（类别 + 候选序号）
+                    if st.breaker.record_failure(provider.id) {
+                        st.metrics.record_breaker_open();
+                    }
+                    let (class, status_out, terminal_reason) =
+                        classify_send_failure(e.as_ref(), streamed);
+                    st.metrics.record_upstream_error(provider.id);
+                    usage::record_failure_row(
+                        st,
+                        &meta,
+                        class,
+                        None,
+                        Some(attempt_idx),
+                        status_out,
+                        started.elapsed().as_millis() as i64,
+                    )
+                    .await;
+                    // 连接加固：header 等待超时 / 非流式总超时（F5，请求体已完整
+                    // 写出）默认判终局（不再换候选重发——上游可能已在生成，重发
+                    // 有双份生成/计费风险）；GATEWAY_FAILOVER_ON_HEADER_TIMEOUT
+                    // =true 保留旧行为
+                    if let Some(reason) = terminal_reason
+                        && !st.cfg.failover_on_header_timeout
+                    {
+                        return header_timeout_terminal_response(
+                            provider,
+                            &model,
+                            request_id,
+                            endpoint,
+                            reason,
+                        );
+                    }
                     last_failed = Some(provider);
                     continue;
                 }
@@ -1958,24 +2283,67 @@ async fn proxy_authed(
             // P0-7：白名单限流/退避头（供本候选各返回出口附加）
             let rl = rate_limit_headers(&resp);
             if status_retryable(status) {
+                // 连接加固：429/503 带明确 Retry-After 时换候选前先等待（钳 2s
+                // ——长窗口退避交由客户端 SDK；候选循环久等会拖死整条降级链）
+                let wait_secs = retry_after_secs(
+                    resp.headers(),
+                    matches!(
+                        status,
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                    ),
+                );
                 // 可重试：记录本次响应后尝试降级（M3：计为熔断失败）
-                let bytes = read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES)
+                let bytes = read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES, body_read_deadline)
                     .await
                     .unwrap_or_default()
                     .to_vec();
                 tracing::warn!(provider = %provider.name, status = %status, "upstream retryable failure");
-                last_response = Some((status.as_u16(), bytes, content_type, rl.clone()));
-                st.breaker.record_failure(provider.id);
+                last_response = Some((status.as_u16(), attempt_idx, bytes, content_type, rl.clone()));
+                if st.breaker.record_failure(provider.id) {
+                    st.metrics.record_breaker_open();
+                }
+                // 连接加固：上游错误指标 + 失败归因行（真实上游状态）
+                st.metrics.record_upstream_error(provider.id);
+                usage::record_failure_row(
+                    st,
+                    &meta,
+                    "upstream_status",
+                    Some(status.as_u16()),
+                    Some(attempt_idx),
+                    status.as_u16(),
+                    started.elapsed().as_millis() as i64,
+                )
+                .await;
+                if let Some(secs) = wait_secs {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                }
                 last_failed = Some(provider);
                 continue;
             }
             // M34：先完整读体再记 success（读体失败=可重试传输错误，熔断器不得
             // 误标健康；cc-switch forwarder.rs:2387-2396 同款）
-            let bytes = match read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES).await {
+            let bytes = match read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES, body_read_deadline)
+                .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "upstream body read failed");
-                    st.breaker.record_failure(provider.id);
+                    // 连接加固：读体截止 → body_timeout，其余 → body_read_error
+                    let (class, status_out) = classify_body_read_failure(e.as_ref());
+                    if st.breaker.record_failure(provider.id) {
+                        st.metrics.record_breaker_open();
+                    }
+                    st.metrics.record_upstream_error(provider.id);
+                    usage::record_failure_row(
+                        st,
+                        &meta,
+                        class,
+                        None,
+                        Some(attempt_idx),
+                        status_out,
+                        started.elapsed().as_millis() as i64,
+                    )
+                    .await;
                     last_failed = Some(provider);
                     continue;
                 }
@@ -1992,6 +2360,10 @@ async fn proxy_authed(
                     request_id = %request_id, status = %status,
                     "non-stream request received SSE body from upstream; reshaping to error"
                 );
+                // 连接加固：终局上游故障（协议违约体）→ 上游错误指标 + 失败归因
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
                 usage::record(st, &meta, None, status.as_u16(), latency).await;
                 let ctx = error_context(provider, &model, request_id);
                 let body = if endpoint.anthropic {
@@ -2030,7 +2402,6 @@ async fn proxy_authed(
                     u.fold_anthropic_input();
                 }
             }
-            usage::record(st, &meta, usage.as_ref(), status.as_u16(), latency).await;
             let mut response_status = status;
             let ctx = error_context(provider, &model, request_id);
             let response_body = if anthropic_converted {
@@ -2124,6 +2495,15 @@ async fn proxy_authed(
             } else {
                 bytes.to_vec()
             };
+            // 连接加固：非成功终局（转换失败 / 非成功状态透传）→ 上游错误指标
+            // + 失败归因（真实上游状态随归因列落库；status 列写呈现给客户端的
+            // 终局状态，状态页错误率与客户端所见一致）
+            if !response_status.is_success() {
+                st.metrics.record_upstream_error(provider.id);
+                meta.upstream_status = Some(status.as_u16() as i16);
+                meta.attempt = Some(attempt_idx as i16);
+            }
+            usage::record(st, &meta, usage.as_ref(), response_status.as_u16(), latency).await;
             return Ok(attach_upstream_headers(
                 Response::builder()
                     .status(response_status)
@@ -2134,9 +2514,13 @@ async fn proxy_authed(
                 &rl,
             ));
         }
-        // 全部候选失败：优先透传最后一次上游响应，否则 502
-        if let Some((status, bytes, content_type, rl)) = last_response {
+        // 全部候选失败：优先透传最后一次上游响应，否则 503
+        if let Some((status, attempt_idx, bytes, content_type, rl)) = last_response {
             let latency = started.elapsed().as_millis() as i64;
+            // 连接加固：终局失败行带归因——真实上游状态 + 候选序号成对落库
+            //（F4：序号来自产生该响应的同一候选，不指向无响应候选）
+            meta.upstream_status = Some(status as i16);
+            meta.attempt = Some(attempt_idx as i16);
             let usage = parse_usage(&bytes);
             usage::record(st, &meta, usage.as_ref(), status, latency).await;
             // L5：错误上下文归属实际最后失败的候选（此前固定 candidates[0]）
@@ -2165,6 +2549,17 @@ async fn proxy_authed(
                 &rl,
             ));
         }
+        // 连接加固：全候选耗尽且无任何上游响应可透传 → 记请求级失败行
+        usage::record_failure_row(
+            st,
+            &meta,
+            "all_candidates_failed",
+            None,
+            None,
+            503,
+            started.elapsed().as_millis() as i64,
+        )
+        .await;
         // M26：全部候选耗尽且无上游响应可透传 → 503（cc-switch MaxRetriesExceeded）
         Err(AppError::UpstreamExhausted(
             "all upstream attempts failed".into(),
@@ -2325,9 +2720,14 @@ async fn send_with_rectify(
     let status = resp.status();
     let content_type = content_type_of(&resp);
     let rl = rate_limit_headers(&resp);
-    let bytes = read_body_capped(resp, MAX_UPSTREAM_BODY_BYTES)
-        .await
-        .unwrap_or_default();
+    let bytes = read_body_capped(
+        resp,
+        MAX_UPSTREAM_BODY_BYTES,
+        // 连接加固：4xx 错误体预读同样有僵死流兜底
+        Duration::from_secs(st.cfg.stream_idle_timeout_secs.max(1)),
+    )
+    .await
+    .unwrap_or_default();
     let anthropic_native = provider.api_type.eq_ignore_ascii_case("anthropic");
     match crate::service::rectify::rectify_outbound(
         anthropic_native,
@@ -2387,12 +2787,14 @@ fn rate_limit_headers(
         .collect()
 }
 /// 从「预读流（SSE 错误体）或未消费响应（JSON 错误体）」收集错误体字节
-///（转换路径错误整形共用；防 resp 已被流式预读消费后的 expect panic）
+///（转换路径错误整形共用；防 resp 已被流式预读消费后的 expect panic）。
+/// deadline 兜底僵死流（连接加固）。
 async fn collect_stream_or_body(
     stream_opt: &mut Option<
         Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>>,
     >,
     resp: &mut Option<reqwest::Response>,
+    deadline: Duration,
 ) -> Vec<u8> {
     if let Some(mut stream) = stream_opt.take() {
         let mut buf = Vec::new();
@@ -2405,7 +2807,7 @@ async fn collect_stream_or_body(
         return buf;
     }
     match resp.take() {
-        Some(r) => read_body_capped(r, MAX_UPSTREAM_BODY_BYTES)
+        Some(r) => read_body_capped(r, MAX_UPSTREAM_BODY_BYTES, deadline)
             .await
             .unwrap_or_default()
             .to_vec(),
@@ -2589,6 +2991,34 @@ fn upstream_error_envelope(msg: &str) -> Vec<u8> {
     })
     .to_string()
     .into_bytes()
+}
+
+/// 连接加固：header 等待超时 / 非流式总超时且未启用 failover
+/// （GATEWAY_FAILOVER_ON_HEADER_TIMEOUT = false，默认）→ 该候选直接判终局
+/// 504，按客户端方言整形后返回，不再换候选重发——请求体已完整写出，上游
+/// 可能已在生成，重发有双份生成/计费风险。`reason` 为超时归因文案
+/// （"upstream header timeout" / "upstream request timeout"）。
+fn header_timeout_terminal_response(
+    provider: &Provider,
+    model: &str,
+    request_id: Uuid,
+    endpoint: Endpoint,
+    reason: &str,
+) -> Result<Response, AppError> {
+    let ctx = error_context(provider, model, request_id);
+    let body = if endpoint.anthropic {
+        crate::service::anthropic::reshape_upstream_error(504, reason.as_bytes(), &ctx)
+    } else if endpoint.responses {
+        crate::service::responses::reshape_upstream_error_for_responses(504, reason.as_bytes(), &ctx)
+    } else {
+        upstream_error_envelope(reason)
+    };
+    Ok(Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Request-Id", request_id.to_string())
+        .body(Body::from(body))
+        .map_err(AppError::internal)?)
 }
 
 /// P0-2：priming 窗口的跨 chunk SSE 事件分析器。事件可能被 TCP 块切开，
@@ -2819,7 +3249,81 @@ fn redact_secrets(message: String, provider_key: &str) -> String {
     }
     message.replace(provider_key, "***")
 }
-/// 发送上游请求；timeout_ms 作用于响应头等待；非流式额外施加请求总超时（含响应体）。
+/// 连接加固：header 等待时限（毫秒；None = 不等响应头）。
+/// - `timeout_ms == 0`：显式关闭 header 等待（请求体写出后无限期等头；
+///   上游慢由流式首字节 / 非流式总超时兜底）
+/// - `>= 1000`：原值
+/// - 其余（1..=999 及负值等非法配置）：钳到 1000ms（历史兜底语义）
+/// - 非流式且 `non_stream_timeout_secs > 0`（两者都启用）：等待取
+///   `max(timeout_ms, non_stream_timeout_secs*1000/2)`——缓冲型上游完整
+///   生成后才回响应头，不得被 120s header 等待在 600s 非流式预算内掐断
+fn header_wait_ms(timeout_ms: i32, streamed: bool, non_stream_timeout_secs: u64) -> Option<u64> {
+    if timeout_ms == 0 {
+        return None;
+    }
+    let mut ms = if timeout_ms >= 1000 {
+        timeout_ms as u64
+    } else {
+        1000
+    };
+    if !streamed && non_stream_timeout_secs > 0 {
+        ms = ms.max(non_stream_timeout_secs.saturating_mul(1000) / 2);
+    }
+    Some(ms)
+}
+
+/// 连接加固：429/503 的 Retry-After 秒数（仅数字秒形式；缺失 / 非法 /
+/// HTTP-date 形态 → None）。调用方在换候选前按该值等待（helper 已钳 [0, 2]，
+/// 候选循环内绝不长等）。
+fn retry_after_secs(headers: &HeaderMap, applicable: bool) -> Option<u64> {
+    if !applicable {
+        return None;
+    }
+    headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .map(|s| s.clamp(0, 2) as u64)
+}
+
+/// send 阶段候选失败归因：header 等待超时 → (header_timeout, 504, 终局)；
+/// 非流式总超时（reqwest .timeout()，请求体已完整写出后触发）→
+/// (body_timeout, 504, 终局)——换候选重发有双份生成/计费风险，同 header
+/// 超时规则终局返回（F5；此前压平成字符串后类型信息丢失，被误归
+/// connect_error/502 并继续换家）；其余（连接超时 / 拒绝 / 重置）→
+/// (connect_error, 502, 不终局)。流式路径无总超时，保持连接错误分类。
+/// 返回 (失败类别, 呈现给客户端的状态码, 终局 504 响应的错误文案)。
+fn classify_send_failure(
+    e: &(dyn Error + Send + Sync + 'static),
+    streamed: bool,
+) -> (&'static str, u16, Option<&'static str>) {
+    if e.to_string().contains("header timeout") {
+        ("header_timeout", 504, Some("upstream header timeout"))
+    } else if !streamed && is_timeout_error(e) {
+        ("body_timeout", 504, Some("upstream request timeout"))
+    } else {
+        ("connect_error", 502, None)
+    }
+}
+
+/// 读体阶段候选失败归因：读体截止（"upstream body read timeout"）→
+/// (body_timeout, 504)；其余读体错误（解码 / 连接中断 / 超限）→
+/// (body_read_error, 502)。
+fn classify_body_read_failure(
+    e: &(dyn Error + Send + Sync + 'static),
+) -> (&'static str, u16) {
+    if e.to_string().contains("body read timeout") {
+        ("body_timeout", 504)
+    } else {
+        ("body_read_error", 502)
+    }
+}
+
+/// 发送上游请求；timeout_ms 作用于响应头等待（见 [`header_wait_ms`]，0 = 不等头）；
+/// 非流式额外施加请求总超时（含响应体）。
 /// H6：原生 anthropic 上游注入 anthropic-version（客户端值优先，缺省 2023-06-01）；
 /// 认证形态支持 x-api-key / bearer。M10：客户端头白名单透传 + 渠道级 extra_headers
 /// （最高优先级，覆盖同名透传头）。
@@ -2961,11 +3465,29 @@ async fn send_upstream(
             req = req.timeout(Duration::from_secs(st.cfg.non_stream_timeout_secs));
         }
     }
-    let timeout = Duration::from_millis(provider.timeout_ms.max(1_000) as u64);
-    tokio::time::timeout(timeout, req.send())
-        .await
-        .map_err(|_| "upstream header timeout".to_string())?
-        .map_err(|e| redact_secrets(format!("upstream request failed: {e}"), provider_key).into())
+    // 连接加固：header 等待语义（见 header_wait_ms）：timeout_ms=0 → 不等头；
+    // 1..=999 钳 1000ms；非流式等待不早于非流式总预算的一半（缓冲型上游
+    // 完整生成后才回响应头）
+    let send = req.send();
+    let resp = match header_wait_ms(provider.timeout_ms, streamed, st.cfg.non_stream_timeout_secs)
+    {
+        Some(ms) => tokio::time::timeout(Duration::from_millis(ms), send)
+            .await
+            .map_err(|_| "upstream header timeout".to_string())?,
+        None => send.await,
+    };
+    resp.map_err(|e| {
+        // F5：reqwest 总超时（非流式 .timeout()，请求体已完整写出后触发）压平
+        // 成字符串时类型信息丢失——显式标注 timeout 文案，classify_send_failure
+        // / is_timeout_error 才能归入超时家族；连接阶段超时（connect_timeout，
+        // 体未写出、可安全换家）仍按连接失败归因
+        let msg = if e.is_timeout() && !e.is_connect() {
+            format!("upstream request timeout: {e}")
+        } else {
+            format!("upstream request failed: {e}")
+        };
+        redact_secrets(msg, provider_key).into()
+    })
 }
 
 fn content_type_of(resp: &reqwest::Response) -> String {
@@ -2995,7 +3517,15 @@ struct BillingOnDrop {
 
 impl Drop for BillingOnDrop {
     fn drop(&mut self) {
+        // 连接加固：半开探测名额归还——流未结算即被丢弃时只释放名额不计数
+        // 已知残留（QC 评审 S-2）：极端时序下 drop 可能清除下一位探针标记（ABA），暂不处理
+        self.st.breaker.release_probe(self.meta.provider_id);
         if !self.recorded.swap(true, Ordering::SeqCst) {
+            // 连接加固：客户端中断计数（流式响应中途断开/丢弃）
+            self.st
+                .metrics
+                .client_abort_total
+                .fetch_add(1, Ordering::Relaxed);
             let st = self.st.clone();
             let meta = self.meta.clone();
             let usage = self.captured.lock().take();
@@ -3056,6 +3586,8 @@ struct SseErrorContext {
     /// 错误 Display 可能含密钥）
     provider_key: String,
     breaker: Arc<Breaker>,
+    /// 进程内指标（上游错误 / 熔断开闸计数）
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// SSE 错误帧：透传链路在响应已提交后遇到上游错误时，用一条**客户端方言对应**
@@ -3097,10 +3629,12 @@ fn sse_error_frame(ctx: &SseErrorContext, msg: &str) -> Bytes {
     }
 }
 
-/// 提交时结算熔断信号：`tail_settles`（透明 SSE 透传——会装上 `SseErrorTail`）
-/// 为真时**不在此记 success**，成功/失败都由 tail 在流终止时各记一次，保证每个
-/// 请求只产生一个熔断信号。非 SSE / 转换链路保持原语义（转换流自行收尾，不装
-/// tail）。`tail_settles` 由调用方与错误收尾上下文的安装点共用同一判定。
+/// 提交时结算熔断信号：`tail_settles`（连接加固后 = `is_sse`——所有 SSE 链路
+/// 的信号都由流终止结算：透传链在 `SseErrorTail`，转换链在各自 `wrap_*_stream`
+/// 内部）为真时**不在此记 success**，成功/失败都由流终态各记一次，保证每个
+/// 请求只产生一个熔断信号。非 SSE（缓冲路径）保持原语义：渠道有响应且体完整
+/// 读出 = 提交即 success。`tail_settles` 由调用方与错误收尾上下文的安装点共用
+/// 同一判定。
 fn settle_commit_signal(breaker: &Breaker, provider_id: i64, tail_settles: bool) {
     if !tail_settles {
         breaker.record_success(provider_id);
@@ -3108,12 +3642,77 @@ fn settle_commit_signal(breaker: &Breaker, provider_id: i64, tail_settles: bool)
 }
 
 /// 上游流错误收尾：SSE 响应把 `Err` 转成一条方言对应的错误帧后正常结束（不再把
-/// `Err` 交给 hyper 导致 chunked body 硬断）；非 SSE（`error_ctx == None`）原样
-/// 传播 `Err`。
+/// `Err` 交给 hyper 导致 chunked body 硬断）；非 SSE（`error_ctx == None`）的
+/// `Err` 按干净 EOF 截断（连接加固：chunked JSON 体的尾部 Err 不再 hyper 硬断
+/// 连接，客户端拿到已缓冲的完整前缀）。
 struct SseErrorTail<S> {
     inner: Pin<Box<S>>,
     error_ctx: Option<SseErrorContext>,
     finished: bool,
+    /// 透传字节里是否见过方言终态标记（连接加固）：干净 EOF 但无终态 = 上游
+    /// 流未正常结束，按失败结算并给客户端补发错误帧
+    saw_terminal: bool,
+    /// F2：上一 chunk 尾部 max_marker_len-1 字节。终态标记跨 chunk 分裂时
+    ///（如 `data: [DO` | `NE]\n\n`）在边界窗口补扫——否则健康上游被误记失败
+    /// 并在真实终态帧后追加错误帧
+    carry: Vec<u8>,
+}
+
+/// 各方言流正常结束的终态标记集合（透传链扫描与跨 chunk 补扫共用）
+fn terminal_markers(dialect: SseErrorDialect) -> &'static [&'static str] {
+    const ANTHROPIC: &[&str] = &["message_stop"];
+    const CHAT: &[&str] = &["data: [DONE]"];
+    const RESPONSES: &[&str] = &[
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ];
+    match dialect {
+        SseErrorDialect::Anthropic => ANTHROPIC,
+        SseErrorDialect::Chat => CHAT,
+        SseErrorDialect::Responses => RESPONSES,
+    }
+}
+
+/// 各方言终态标记的最大长度（跨 chunk 补扫窗口保留字节数 = len - 1）
+fn max_terminal_marker_len(dialect: SseErrorDialect) -> usize {
+    terminal_markers(dialect)
+        .iter()
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// 各方言流正常结束的终态标记（字节级扫描，标记完全落入 chunk 内时命中；
+/// 跨 chunk 分裂由 [`SseErrorTail`] 的 carry 边界补扫覆盖）
+fn has_terminal_marker(dialect: SseErrorDialect, chunk: &[u8]) -> bool {
+    terminal_markers(dialect)
+        .iter()
+        .any(|m| chunk.windows(m.len()).any(|w| w == m.as_bytes()))
+}
+
+/// F2：终态标记跨 chunk 分裂补扫——标记起点落在 carry（上一 chunk 尾部
+/// max_marker_len-1 字节）内、终点落入当前 chunk 时命中。零分配：只在边界
+/// 窗口逐标记比对，不拼接缓冲
+fn marker_spans_carry_boundary(dialect: SseErrorDialect, carry: &[u8], chunk: &[u8]) -> bool {
+    if carry.is_empty() || chunk.is_empty() {
+        return false;
+    }
+    terminal_markers(dialect).iter().any(|m| {
+        let m = m.as_bytes();
+        if m.len() <= 1 {
+            return false;
+        }
+        let start_min = carry.len().saturating_sub(m.len() - 1);
+        (start_min..carry.len()).any(|start| {
+            let head = &carry[start..];
+            let tail_len = (m.len() - head.len()).min(chunk.len());
+            let tail = &chunk[..tail_len];
+            head.len() + tail.len() == m.len()
+                && head == &m[..head.len()]
+                && tail == &m[head.len()..]
+        })
+    })
 }
 
 impl<S> Stream for SseErrorTail<S>
@@ -3129,15 +3728,48 @@ where
             return Poll::Ready(None);
         }
         match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(ctx) = &this.error_ctx {
+                    // F2：终态标记跨 chunk 分裂补扫（carry = 上一 chunk 尾部）
+                    // + 全块扫描；随后把本 chunk 尾部 max_marker_len-1 字节
+                    // 滚动进 carry
+                    if marker_spans_carry_boundary(ctx.dialect, &this.carry, &chunk) {
+                        this.saw_terminal = true;
+                    }
+                    if has_terminal_marker(ctx.dialect, &chunk) {
+                        this.saw_terminal = true;
+                    }
+                    let keep = max_terminal_marker_len(ctx.dialect).saturating_sub(1);
+                    if keep == 0 {
+                        this.carry.clear();
+                    } else if chunk.len() >= keep {
+                        this.carry.clear();
+                        this.carry.extend_from_slice(&chunk[chunk.len() - keep..]);
+                    } else {
+                        this.carry.extend_from_slice(&chunk);
+                        let excess = this.carry.len().saturating_sub(keep);
+                        if excess > 0 {
+                            this.carry.drain(..excess);
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
             Poll::Ready(Some(Err(e))) => {
                 this.finished = true;
                 let Some(ctx) = &this.error_ctx else {
-                    return Poll::Ready(Some(Err(e)));
+                    // 连接加固：非 SSE chunked 体的流级 Err 不再交给 hyper 硬断
+                    // 连接——截断为干净 EOF，客户端拿到已缓冲的完整前缀
+                    tracing::warn!(%e, "non-SSE upstream stream error; truncating body cleanly");
+                    return Poll::Ready(None);
                 };
                 // 终止性流内错误 = 上游在提交后失败：记一次熔断失败，让"200 +
                 // 错误帧"的供应商在后续请求被降级链跳过（`finished` 保证只记一次）。
                 // 客户端断开时流被 drop、不会产生 `Err`，天然不计。
-                ctx.breaker.record_failure(ctx.provider_id);
+                if ctx.breaker.record_failure(ctx.provider_id) {
+                    ctx.metrics.record_breaker_open();
+                }
+                ctx.metrics.record_upstream_error(ctx.provider_id);
                 // 客户端只看到脱敏文本；日志保留可排障细节（密钥同样替换为 ***）
                 let msg = redact_secrets(e.to_string(), &ctx.provider_key);
                 tracing::warn!(
@@ -3151,12 +3783,33 @@ where
             }
             Poll::Ready(None) => {
                 this.finished = true;
-                // 正常结束（未失败）：提交时未记 success，由这里补记一次——
-                // 与 `Err` 分支的 `record_failure` 互斥，每个请求只产生一个熔断信号
-                if let Some(ctx) = &this.error_ctx {
+                let Some(ctx) = &this.error_ctx else {
+                    return Poll::Ready(None);
+                };
+                if this.saw_terminal {
+                    // 正常结束（已见终态标记）：提交时未记 success，由这里补记
+                    // 一次——与 `Err` 分支的 `record_failure` 互斥，每个请求
+                    // 只产生一个熔断信号
                     ctx.breaker.record_success(ctx.provider_id);
+                    return Poll::Ready(None);
                 }
-                Poll::Ready(None)
+                // 连接加固：干净 EOF 但未见方言终态标记 = 上游流在终态事件前
+                // 结束（"200 后静默断流"）——不得记成功；记熔断失败并给客户端
+                // 补发一条方言错误帧后正常结束
+                if ctx.breaker.record_failure(ctx.provider_id) {
+                    ctx.metrics.record_breaker_open();
+                }
+                ctx.metrics.record_upstream_error(ctx.provider_id);
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    provider = %ctx.provider,
+                    model = %ctx.model,
+                    "upstream stream ended before terminal event"
+                );
+                Poll::Ready(Some(Ok(sse_error_frame(
+                    ctx,
+                    "upstream stream ended before terminal event",
+                ))))
             }
             other => other,
         }
@@ -3182,9 +3835,10 @@ impl<S> Drop for SseErrorTail<S> {
 ///   终态事件（[DONE]/response.*/message_stop）或流尾兜底记账（仅一次），字节流原样透传
 /// - capture_usage = false（上游非 2xx）：错误体不解析不计量，按真实状态记一条零 token 明细
 /// - 流异常中断时由 chain 兜底记账（含 EOF flush 后的 captured）；客户端断开由 BillingOnDrop 兜底
-/// - `sse_error = Some(ctx)`（SSE 响应）：上游 `Err` 转成一条该方言的错误帧后正常结束，
-///   首个 `Err` 记一次熔断失败、正常 EOF 记一次成功（提交处不再记 success）；
-///   流被 drop 时归还半开探测名额。`None`（非 SSE 流）保持原行为（`Err` 交给 hyper）
+/// - `sse_error = Some(ctx)`（SSE 响应）：上游 `Err` 转成一条该方言的错误帧后正常结束
+///   （记熔断失败）；干净 EOF 未见方言终态标记同样记失败并补发错误帧，见到终态
+///   标记才记成功（提交处不再记 success）；流被 drop 时归还半开探测名额。
+///   `None`（非 SSE 流）：流级 `Err` 截断为干净 EOF（不再交给 hyper 硬断连接）
 fn wrap_stream(
     st: AppState,
     meta: UsageMeta,
@@ -3198,6 +3852,8 @@ fn wrap_stream(
         inner: Box::pin(upstream),
         error_ctx: sse_error,
         finished: false,
+        saw_terminal: false,
+        carry: Vec::new(),
     };
     // 逐 chunk 共享上下文：流适配器每帧只能克隆一个 Arc，替代此前每帧克隆
     // AppState（~20 个 Arc 原子操作）+ UsageMeta（String/Vec 堆分配）
@@ -3958,6 +4614,41 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert!(is_timeout_error(wrapped.as_ref()), "外层文案无关，source 链命中");
     }
 
+    /// QC1 F5：非流式总超时（reqwest .timeout() 在体完整写出后触发，压平后
+    /// 仅剩文案）必须归入超时家族 → 504 终局；流式路径保持连接错误分类；
+    /// header 等待超时文案优先归因
+    #[test]
+    fn classify_send_failure_non_stream_timeout_is_terminal_504() {
+        // send_upstream 压平后的总超时文案（reqwest 类型信息已丢失）
+        let total: Box<dyn Error + Send + Sync> = Box::<dyn Error + Send + Sync>::from(
+            "upstream request timeout: error sending request for url(...)",
+        );
+        assert!(is_timeout_error(total.as_ref()), "总超时文案须命中超时判定");
+        assert_eq!(
+            classify_send_failure(total.as_ref(), false),
+            ("body_timeout", 504, Some("upstream request timeout")),
+            "非流式总超时归入超时家族并判终局（不再换家）"
+        );
+        assert_eq!(
+            classify_send_failure(total.as_ref(), true),
+            ("connect_error", 502, None),
+            "流式路径无总超时，保持连接错误分类"
+        );
+        let header: Box<dyn Error + Send + Sync> = "upstream header timeout".into();
+        assert_eq!(
+            classify_send_failure(header.as_ref(), false),
+            ("header_timeout", 504, Some("upstream header timeout")),
+            "header 等待超时文案优先归因"
+        );
+        let refused: Box<dyn Error + Send + Sync> =
+            "upstream request failed: connection refused".into();
+        assert_eq!(
+            classify_send_failure(refused.as_ref(), false),
+            ("connect_error", 502, None),
+            "连接失败不终局（可换候选）"
+        );
+    }
+
     /// 熔断器（测试用）：只让连续失败计数生效，错误率维度需要 1000 个样本
     fn test_breaker(failure_threshold: u32) -> Arc<Breaker> {
         Arc::new(Breaker::new_with(crate::service::breaker::BreakerConfig {
@@ -3978,8 +4669,81 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             inner: Box::pin(futures_util::stream::iter(events)),
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
             finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
         });
         while tail.next().await.is_some() {}
+    }
+
+    /// QC1 F2：终态标记跨 chunk 分裂必须被识别——`data: [DO` | `NE]\n\n` 分
+    /// 两个 chunk 到达时 saw_terminal 置位、EOF 按成功结算且不追加错误帧。
+    /// 此前逐 chunk 整块扫描漏判分裂标记：健康上游被记熔断失败并在真实
+    /// `[DONE]` 后补发一条错误帧
+    #[tokio::test]
+    async fn split_terminal_marker_across_chunks_is_detected() {
+        let breaker = test_breaker(1);
+        settle_commit_signal(&breaker, 7, true);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(futures_util::stream::iter(vec![
+                Ok::<_, Box<dyn Error + Send + Sync>>(Bytes::from_static(b"data: [DO")),
+                Ok(Bytes::from_static(b"NE]\n\n")),
+            ])),
+            error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
+            finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
+        });
+        let mut out: Vec<Bytes> = Vec::new();
+        while let Some(item) = tail.next().await {
+            out.push(item.expect("透传 chunk 不得被错误帧替换"));
+        }
+        assert_eq!(out.len(), 2, "两个 chunk 必须原样透传（不得追加错误帧）");
+        let joined = String::from_utf8_lossy(&out.concat()).into_owned();
+        assert_eq!(joined, "data: [DONE]\n\n", "字节序不变: {joined}");
+        // EOF 结算走成功分支：threshold=1 下若误记失败会直接开闸
+        assert!(breaker.allow(7), "分裂终态标记识别后按成功结算，不得开闸");
+    }
+
+    /// F2 边界补扫纯函数：起点在 carry 内、终点在 chunk 内的各种切法
+    #[test]
+    fn marker_spans_carry_boundary_cases() {
+        // "data: [DONE]" 从 carry 第 5 字节开始，跨到 chunk 前 4 字节
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b"data: [DO",
+            b"NE]\n\n"
+        ));
+        // 仅 1 字节跨界的极端切法
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b"data: [DON",
+            b"E]\n\n"
+        ));
+        // carry 只保留尾部 max_marker_len-1 字节（"data: [DONE]" len-1 = 11）
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b": xdata: [DO",
+            b"NE]\n\n"
+        ));
+        // 不构成标记的跨界组合不误报
+        assert!(!marker_spans_carry_boundary(
+            SseErrorDialect::Chat,
+            b"data: [DO",
+            b"X]\n\n"
+        ));
+        // 空边界（首个 chunk / 标记长度 1）直接跳过
+        assert!(!marker_spans_carry_boundary(SseErrorDialect::Chat, b"", b"data: [DONE]"));
+        // Anthropic 方言只认 message_stop
+        assert!(!marker_spans_carry_boundary(
+            SseErrorDialect::Anthropic,
+            b"data: [DO",
+            b"NE]\n\n"
+        ));
+        assert!(marker_spans_carry_boundary(
+            SseErrorDialect::Anthropic,
+            b"event: message_st",
+            b"op\n\n"
+        ));
     }
 
     fn sse_ctx(dialect: SseErrorDialect, breaker: Arc<Breaker>) -> SseErrorContext {
@@ -3991,11 +4755,12 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             model: "gpt-x".into(),
             provider_key: "sk-secret".into(),
             breaker,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         }
     }
 
     /// W1：SSE 流错误 → 单条错误帧后正常结束（无 Err 泄漏、无 [DONE] 伪造）；
-    /// 非 SSE 流保持 Err 透传
+    /// 非 SSE 流级 Err 截断为干净 EOF（连接加固：不再交给 hyper 硬断连接）
     #[tokio::test]
     async fn sse_error_tail_wraps_stream_error_and_ends() {
         let head = Bytes::from_static(b"data: {\"choices\":[]}\n\n");
@@ -4010,6 +4775,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             inner: Box::pin(inner),
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, test_breaker(4))),
             finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
         });
         assert_eq!(tail.next().await.unwrap().unwrap(), head);
         let frame = tail.next().await.unwrap().expect("Err 转为错误帧");
@@ -4023,7 +4790,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(v["error"]["message"], "upstream stream idle timeout");
         assert!(tail.next().await.is_none(), "错误后流结束，后续块不透传");
 
-        // 非 SSE：Err 原样传播
+        // 非 SSE：Err 截断为干净 EOF（客户端保留已缓冲前缀，不再 Err 泄漏）
         let inner = futures_util::stream::iter(vec![Err::<Bytes, Box<dyn Error + Send + Sync>>(
             Box::from("boom"),
         )]);
@@ -4031,8 +4798,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             inner: Box::pin(inner),
             error_ctx: None,
             finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
         });
-        assert!(tail.next().await.unwrap().is_err());
+        assert!(tail.next().await.is_none(), "非 SSE Err 截断为干净 EOF");
         assert!(tail.next().await.is_none());
     }
 
@@ -4101,6 +4870,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 inner: Box::pin(inner),
                 error_ctx: Some(sse_ctx(dialect, test_breaker(4))),
                 finished: false,
+                saw_terminal: false,
+                carry: Vec::new(),
             });
             let frame = tail.next().await.unwrap().expect("Err 转为方言错误帧");
             let text = String::from_utf8(frame.to_vec()).unwrap();
@@ -4112,7 +4883,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             );
         }
 
-        // 非 SSE（error_ctx None）：Err 原样传播，不做帧转换
+        // 非 SSE（error_ctx None）：Err 截断为干净 EOF，不做帧转换
         let inner = futures_util::stream::iter(vec![Err::<Bytes, _>(
             Box::<dyn Error + Send + Sync>::from("boom"),
         )]);
@@ -4120,8 +4891,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             inner: Box::pin(inner),
             error_ctx: None,
             finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
         });
-        assert!(tail.next().await.unwrap().is_err());
+        assert!(tail.next().await.is_none(), "非 SSE Err 截断为干净 EOF");
         assert!(tail.next().await.is_none());
     }
 
@@ -4137,6 +4910,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             inner: Box::pin(inner),
             error_ctx: Some(sse_ctx(SseErrorDialect::Chat, test_breaker(4))),
             finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
         });
         let frame = tail.next().await.unwrap().expect("Err 转为错误帧");
         let text = String::from_utf8(frame.to_vec()).unwrap();
@@ -4149,7 +4924,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     }
 
     /// QC3 F-001：提交后首个 `Err` 记一次熔断失败（阈值 2：两次这样的流才熔断，
-    /// 证明每条流只记一次），且客户端断开（无 `Err`）不计数
+    /// 证明每条流只记一次）；带终态标记的正常结束记成功、不计失败
+    /// （连接加固：无终态标记的 EOF 现在按失败结算，见
+    /// sse_eof_without_terminal_marker_records_failure_and_error_frame）
     #[tokio::test]
     async fn sse_error_tail_records_one_breaker_failure_per_stream() {
         let breaker = test_breaker(2);
@@ -4163,6 +4940,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 inner: Box::pin(inner),
                 error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
                 finished: false,
+                saw_terminal: false,
+                carry: Vec::new(),
             });
             tail.next().await.unwrap().expect("错误帧");
             assert!(tail.next().await.is_none(), "错误帧后不再产出（只记一次）");
@@ -4173,22 +4952,20 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             );
         }
 
-        // 客户端断开：流直接结束（drop 或 None），不产生 Err → 不计失败
+        // 带终态标记的正常结束：EOF 记成功，不计失败
         let breaker = test_breaker(1);
-        for inner in [
-            futures_util::stream::iter(Vec::<Result<Bytes, Box<dyn Error + Send + Sync>>>::new()),
-            futures_util::stream::iter(vec![Ok::<_, Box<dyn Error + Send + Sync>>(
-                Bytes::from_static(b"data: {}\n\n"),
-            )]),
-        ] {
-            let mut tail = Box::pin(SseErrorTail {
-                inner: Box::pin(inner),
-                error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
-                finished: false,
-            });
-            while tail.next().await.is_some() {}
-        }
-        assert!(breaker.allow(7), "正常结束 / 客户端断开不记熔断失败（正常结束记成功）");
+        let inner = futures_util::stream::iter(vec![Ok::<_, Box<dyn Error + Send + Sync>>(
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        )]);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(inner),
+            error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
+            finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
+        });
+        while tail.next().await.is_some() {}
+        assert!(breaker.allow(7), "带终态标记的正常结束记成功，不熔断");
     }
 
     /// QC1 W1-new / QC2 F1：按真实调用序列（提交结算 + 尾部首个 `Err`），连续
@@ -4214,8 +4991,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
-    /// 尾部正常 EOF 记一次成功 → 连续失败复位：2 败 + 1 正常结束 + 2 败不达阈值 4，
-    /// 不得熔断（若 EOF 不记成功，累计 4 次连续失败会误熔断）
+    /// 尾部带终态标记的正常 EOF 记一次成功 → 连续失败复位：2 败 + 1 正常结束 +
+    /// 2 败不达阈值 4，不得熔断（若 EOF 不记成功，累计 4 次连续失败会误熔断）
     #[tokio::test]
     async fn committed_sse_normal_eof_resets_consecutive_failures() {
         let breaker = test_breaker(4);
@@ -4228,7 +5005,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             )
             .await;
         }
-        drive_committed_sse(&breaker, vec![Ok(Bytes::from_static(b"data: {}\n\n"))]).await;
+        drive_committed_sse(&breaker, vec![Ok(Bytes::from_static(b"data: [DONE]\n\n"))]).await;
         for _ in 0..2 {
             drive_committed_sse(
                 &breaker,
@@ -4242,6 +5019,123 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             breaker.allow(7),
             "正常结束已复位连续计数：2+2 不达阈值 4，不得熔断"
         );
+    }
+
+    /// 连接加固：SSE 流干净 EOF 但无方言终态标记 → 记熔断失败 + 给客户端补发
+    /// 方言错误帧（"200 后静默断流"不得再按成功结算）
+    #[tokio::test]
+    async fn sse_eof_without_terminal_marker_records_failure_and_error_frame() {
+        let breaker = test_breaker(1);
+        settle_commit_signal(&breaker, 7, true);
+        let inner = futures_util::stream::iter(vec![Ok::<_, Box<dyn Error + Send + Sync>>(
+            Bytes::from_static(b"data: {\"choices\":[]}\n\n"),
+        )]);
+        let mut tail = Box::pin(SseErrorTail {
+            inner: Box::pin(inner),
+            error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
+            finished: false,
+            saw_terminal: false,
+            carry: Vec::new(),
+        });
+        // 首项 = 原样透传的数据块；次项 = EOF 无终态 → 补发方言错误帧
+        let chunk = tail.next().await.unwrap().expect("透传数据块");
+        assert_eq!(chunk, Bytes::from_static(b"data: {\"choices\":[]}\n\n"));
+        let frame = tail.next().await.unwrap().expect("EOF 补发方言错误帧");
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(
+            text.contains("upstream stream ended before terminal event"),
+            "{text}"
+        );
+        assert!(tail.next().await.is_none(), "错误帧后流结束");
+        assert!(!breaker.allow(7), "EOF 无终态 → 记失败（阈值 1 即熔断）");
+    }
+
+    /// 连接加固：读体截止时间兜底僵死流——上游响应头已回但体永不推进时，
+    /// 在 deadline 处报 "upstream body read timeout"（归因 body_timeout）
+    #[tokio::test]
+    async fn read_body_capped_deadline_breaks_stalled_stream() {
+        let stalled = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .body(reqwest::Body::wrap_stream(stalled))
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let err = read_body_capped(resp, 1024, Duration::from_millis(50))
+            .await
+            .expect_err("僵死流必须在截止时间报错");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "截止时间必须及时返回"
+        );
+        assert!(
+            err.to_string().contains("upstream body read timeout"),
+            "超时文案须可归因 body_timeout: {err}"
+        );
+    }
+
+    /// 连接加固：header 等待时限推导（0 = 关闭；非法值钳 1000ms；
+    /// 非流式不早于非流式总预算的一半）
+    #[test]
+    fn header_wait_ms_semantics() {
+        // 0 = 显式关闭（流式 / 非流式一致）
+        assert_eq!(header_wait_ms(0, true, 600), None);
+        assert_eq!(header_wait_ms(0, false, 600), None);
+        // 流式：>= 1000 原值；非法值钳 1000ms
+        assert_eq!(header_wait_ms(30_000, true, 600), Some(30_000));
+        assert_eq!(header_wait_ms(500, true, 600), Some(1_000));
+        assert_eq!(header_wait_ms(-5, true, 600), Some(1_000));
+        // 非流式：非流式总超时禁用（0）→ 不放大
+        assert_eq!(header_wait_ms(120_000, false, 0), Some(120_000));
+        // 非流式：header 等待不早于非流式总预算的一半（600s → 300s 下限）——
+        // 缓冲型上游完整生成后才回响应头，不得被 120s header 等待在 600s 预算内掐断
+        assert_eq!(header_wait_ms(120_000, false, 600), Some(300_000));
+        // 非流式：header 原值更大 → 取原值
+        assert_eq!(header_wait_ms(400_000, false, 600), Some(400_000));
+        // 非流式 + 非法小值：钳 1000 后再与非流式半预算取 max
+        assert_eq!(header_wait_ms(500, false, 600), Some(300_000));
+    }
+
+    /// 连接加固：全局并发兜底——cap > 0 合成 global 规则（与 DB 全局规则同键、
+    /// apply_concurrency_limits 去重取最严），同一 all-or-nothing acquire 覆盖；
+    /// cap 耗尽后新请求必须被拒绝（拒绝复用既有 429 路径）
+    #[test]
+    fn global_concurrency_cap_rejects_when_exceeded() {
+        use crate::store::rules::RateRule;
+        // cap = 0（关闭）→ 原样返回
+        assert_eq!(with_global_cap(Vec::new(), 0).len(), 0);
+        // cap > 0 → 合成一条 global 作用域、不限模型的规则
+        let merged = with_global_cap(Vec::new(), 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].scope, "global");
+        assert_eq!(merged[0].scope_id, None);
+        assert_eq!(merged[0].model, None);
+        assert_eq!(merged[0].concurrency, 1);
+        // 与 DB 全局规则并存：合成规则原样参与（最严上限由 dedup_min_limit 取 min）
+        let merged = with_global_cap(
+            vec![RateRule {
+                scope: "global".to_string(),
+                scope_id: None,
+                model: None,
+                concurrency: 5,
+            }],
+            3,
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|r| r.concurrency == 3));
+
+        // 超限拒绝：占用唯一名额后，携带同一桶键的 acquire 必须整体拒绝
+        //（matched_rules 对 scope=global 的桶键即 "global"）
+        let limiter = crate::service::ratelimit::ConcurrencyLimiter::new();
+        let bucket = vec![("global".to_string(), 1i32)];
+        let guard = limiter.try_acquire(&bucket).expect("首个请求占坑");
+        assert!(
+            limiter.try_acquire(&bucket).is_err(),
+            "全局并发兜底：cap 耗尽后新请求必须被拒绝"
+        );
+        drop(guard);
+        assert!(limiter.try_acquire(&bucket).is_ok(), "归还后可再次占坑");
     }
 
     /// 半开探测名额：未结算的流被 drop（客户端断开）后 `release_probe` 归还名额。
@@ -4267,6 +5161,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 >()),
                 error_ctx: Some(sse_ctx(SseErrorDialect::Chat, breaker.clone())),
                 finished: false,
+                saw_terminal: false,
+                carry: Vec::new(),
             });
             // 客户端断开：流未结算（既无 EOF 也无 Err）即被 drop
             assert!(
@@ -4277,6 +5173,191 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             );
         }
         assert!(breaker.allow(7), "未结算的流被 drop 后探测名额归还");
+    }
+
+    // ---------- QC1 F1：post-allow() 退出路径的探测名额结算 ----------
+
+    /// 一次性假上游：接受单个连接，排空一次读后回写预置 HTTP 响应并断开
+    async fn spawn_one_shot_upstream(response: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            // 小请求（头+体通常一个分段）排空一次读即可；失败不影响回写
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    fn http_response(status_line: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn test_provider(
+        id: i64,
+        api_type: &str,
+        base_url: &str,
+        key: &str,
+        master_key: &[u8; 32],
+    ) -> Provider {
+        Provider {
+            id,
+            name: format!("p{id}"),
+            api_type: api_type.into(),
+            base_url: base_url.into(),
+            api_key_encrypted: crate::crypto::encrypt(key.as_bytes(), master_key).expect("encrypt"),
+            timeout_ms: 1000,
+            extra_body: serde_json::json!({}),
+            auth_scheme: "bearer".into(),
+            extra_headers: serde_json::json!({}),
+            supports_images: true,
+        }
+    }
+
+    fn test_route(
+        pattern: &str,
+        primary: i64,
+        fallbacks: Vec<i64>,
+    ) -> crate::store::upstream::ModelRoute {
+        crate::store::upstream::ModelRoute {
+            model_pattern: pattern.into(),
+            provider_id: primary,
+            fallback_ids: fallbacks,
+            upstream_model: None,
+            extra_body: serde_json::json!({}),
+            strict_system_head: false,
+            system_head_merge: false,
+            reasoning_effort_mode: None,
+            thinking_form: None,
+            responses_passthrough_fields: None,
+        }
+    }
+
+    /// 双候选链 + 立即半开的夹具：open_secs=0 让熔断窗口立刻到期，主候选
+    /// allow() 消费探测名额后暴露 post-allow() 泄漏
+    fn probe_fixture(st: &mut crate::state::AppState) {
+        st.breaker = Arc::new(Breaker::new_with(crate::service::breaker::BreakerConfig {
+            failure_threshold: 1,
+            open_secs: 0,
+            min_requests: 1_000,
+            ..Default::default()
+        }));
+    }
+
+    /// QC1 F1(a)：出站体构建失败必须归还半开探测名额——此前 `?` 直接上抛，
+    /// 名额永久占位，该渠道窗口到期后再也无法 allow 放行；降级链第二候选正常
+    /// 完成请求
+    #[tokio::test]
+    async fn outbound_build_failure_releases_half_open_probe() {
+        let mut st = crate::state::AppState::test_fixture();
+        probe_fixture(&mut st);
+        let upstream =
+            spawn_one_shot_upstream(http_response(
+                "HTTP/1.1 200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ))
+            .await;
+        // 主候选 api_type=openai + 缺 messages 的 Anthropic 请求 → build_outward
+        // 必失败（Anthropic→Chat 转换报 "missing 'messages' field"）
+        let broken = test_provider(1, "openai", "http://127.0.0.1:9", "sk-broken", &st.cfg.master_key);
+        let healthy =
+            test_provider(2, "anthropic", &format!("http://{upstream}"), "sk-ok", &st.cfg.master_key);
+        *st.providers.write() = vec![broken, healthy];
+        *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        // 半开：1 次失败即开闸（open_secs=0 → 窗口立即到期）；探测名额由
+        // 候选循环内的 allow() 消费（唯一消费者），不在夹具里预占
+        st.breaker.record_failure(1);
+
+        let json = serde_json::json!({"model": "t-model", "stream": true});
+        let resp = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/messages",
+                upstream: "/messages",
+                responses: false,
+                anthropic: true,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect("build 失败换候选后降级链必须完成请求");
+        assert_eq!(resp.status(), StatusCode::OK, "第二候选成功流式响应");
+        assert!(
+            st.breaker.allow(1),
+            "build_outward 失败后探测名额必须归还（可再次放行）"
+        );
+    }
+
+    /// QC1 F1(b)：converted 非 2xx + SSE 回退分支必须显式结算一次——此前
+    /// 提交点推迟结算（tail_settles）后分支直接整形返回，半开探测名额永久占位
+    #[tokio::test]
+    async fn converted_non2xx_sse_fallback_settles_probe_once() {
+        let mut st = crate::state::AppState::test_fixture();
+        probe_fixture(&mut st);
+        // 406：非可重试（不换家）、不可整流（不进 PreRead）→ 落入 converted
+        // 非 2xx 回退分支；SSE content-type → 提交点结算被推迟
+        let upstream =
+            spawn_one_shot_upstream(http_response(
+                "HTTP/1.1 406 Not Acceptable",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"boom\"}}]}\n\n",
+            ))
+            .await;
+        let converted =
+            test_provider(1, "openai", &format!("http://{upstream}"), "sk-c", &st.cfg.master_key);
+        let unused = test_provider(2, "anthropic", "http://127.0.0.1:9", "sk-u", &st.cfg.master_key);
+        *st.providers.write() = vec![converted, unused];
+        *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        // 半开：探测名额由候选循环内的 allow() 消费（唯一消费者）
+        st.breaker.record_failure(1);
+
+        let json = serde_json::json!({
+            "model": "t-model",
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/messages",
+                upstream: "/messages",
+                responses: false,
+                anthropic: true,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect("converted 非 2xx 回退按方言整形返回");
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE, "上游状态透传");
+        assert!(
+            st.breaker.allow(1),
+            "回退分支结算后探测名额归还（可再次放行）"
+        );
+        let snap = st
+            .breaker
+            .snapshot()
+            .into_iter()
+            .find(|s| s.provider_id == 1)
+            .expect("snapshot");
+        assert_eq!(
+            snap.window_requests, 1,
+            "必须恰好结算一次（重复结算会计 2 次窗口请求）"
+        );
     }
 
     /// QC1 W2 / QC3 F-003：持续同步就绪的中性帧洪水 + 墙钟 deadline →

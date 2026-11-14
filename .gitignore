@@ -4,6 +4,8 @@ certs/
 third/
 vendor/
 *.zip
-test_.py
+test_*.py
+__pycache__/
+backups/
 *.pyc
 .agent
