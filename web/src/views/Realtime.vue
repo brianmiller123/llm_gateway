@@ -67,7 +67,7 @@
             <span v-if="row.errors_60m > 0" class="err">（{{ row.errors_60m }} 错误）</span>
           </template>
         </el-table-column>
-        <el-table-column label="Token 入/出" align="right" width="150">
+        <el-table-column label="Token 入/出（60 分钟）" align="right" width="180">
           <template #default="{ row }">
             <span class="tok-in">{{ fmt(row.input_tokens) }}</span>
             <span class="tok-sep">/</span>
@@ -226,10 +226,10 @@ const cards = computed(() => {
       hint: '当前进行中的请求数（含流式未结束）',
     },
     {
-      label: 'Token 入/出',
+      label: '5 分钟 Token 入/出',
       value: s ? `${fmt(s.input_tokens)} / ${fmt(s.output_tokens)}` : '-',
       danger: false,
-      hint: '最近 5 分钟输入 / 输出 token',
+      hint: '最近 5 分钟全站输入 / 输出 token（不含在途未结束请求）',
     },
     {
       label: '输出速度',

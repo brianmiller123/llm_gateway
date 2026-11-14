@@ -253,12 +253,12 @@ onBeforeUnmount(() => {
       </el-col>
       <el-col :span="8">
         <el-card shadow="never">
-          <div class="stat-label">已用 / 剩余（自上次重置）</div>
+          <div class="stat-label">剩余配额（自上次重置）</div>
           <div class="stat-value">
             {{ (detail.plan.token_limit - currentUsed).toLocaleString() }}
           </div>
           <div class="stat-sub">
-            当期成员合计 {{ currentUsed.toLocaleString() }} tokens
+            当期已用 {{ currentUsed.toLocaleString() }} / {{ detail.plan.token_limit_display }} tokens
           </div>
         </el-card>
       </el-col>
