@@ -170,6 +170,23 @@ struct HourRow {
 /// health）30s 缓存同口径，状态页对 30s 级数据延迟不敏感。
 static STATUS_CACHE: Mutex<Option<(std::time::Instant, StatusResp)>> = Mutex::new(None);
 
+/// L-e（QC2-L-7）：重建单飞旗标——CAS 认领（false→true），赢家 Drop 复位。
+/// 仅在缓存过期的未命中路径触及，命中路径零开销。
+static STATUS_RECALC_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// L-e：赢家守护——持有期间单飞旗标置位，Drop（含 unwind）复位，重建
+/// panic 不再让旗标永久卡死（卡死只损失单飞合并，不阻塞请求）
+struct RecalcGuard;
+impl Drop for RecalcGuard {
+    fn drop(&mut self) {
+        STATUS_RECALC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// L-e：输家等待窗口——覆盖常规重建时长，仍未命中则自行重建兜底
+const STATUS_RECALC_LOSER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// 载荷缓存 TTL（30s，与供应商探测缓存同口径）
 const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -187,6 +204,39 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
     if let Some(payload) = cached_payload(&STATUS_CACHE.lock(), std::time::Instant::now()) {
         return Ok(Json(payload).into_response());
     }
+    // L-e（QC2-L-7）：过期窗口内的并发未命中单飞——一个赢家独占重建并回填
+    // 缓存（3×30 天窗口聚合不再被雷群重复打池），输家短暂等待缓存回填后
+    // 复查；仍未就绪（重建慢于等待窗口/赢家 panic）自行重建兜底，不卡请求
+    let resp = if STATUS_RECALC_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let _claim = RecalcGuard;
+        let resp = build_status_payload(&st).await;
+        // F3：填充 30s 载荷缓存（同结构体序列化，载荷形状不变）
+        *STATUS_CACHE.lock() = Some((std::time::Instant::now(), resp.clone()));
+        resp
+    } else {
+        tokio::time::sleep(STATUS_RECALC_LOSER_WAIT).await;
+        // 先取出结果再 match：锁临时量不得跨 await 存活（future 需 Send）
+        let cached = cached_payload(&STATUS_CACHE.lock(), std::time::Instant::now());
+        match cached {
+            Some(payload) => payload,
+            // 输家兜底：赢家仍慢/已恐慌 → 自行重建（不回填，赢家负责回填）
+            None => build_status_payload(&st).await,
+        }
+    };
+    Ok(Json(resp).into_response())
+}
+
+/// 完整状态载荷构建（实时窗口统计 + 30 天可用率 + 事故 + 探测融合）。
+/// L-e：仅单飞赢家 / 等待后仍未命中的输家兜底调用，结果由赢家回填缓存。
+async fn build_status_payload(st: &AppState) -> StatusResp {
     let started = std::time::Instant::now();
     let db_ok = sqlx::query("SELECT 1").execute(&st.pool).await.is_ok();
     let db_latency = started.elapsed().as_millis() as i64;
@@ -366,7 +416,7 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         "operational"
     };
 
-    let resp = StatusResp {
+    StatusResp {
         generated_at: Utc::now(),
         overall,
         components,
@@ -375,10 +425,7 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         active_requests: st
             .active_requests
             .load(std::sync::atomic::Ordering::Relaxed),
-    };
-    // F3：填充 30s 载荷缓存（同结构体序列化，载荷形状不变）
-    *STATUS_CACHE.lock() = Some((std::time::Instant::now(), resp.clone()));
-    Ok(Json(resp).into_response())
+    }
 }
 
 /// 供应商实时状态：按 10 分钟 → 60 分钟 → 24 小时顺序取首个样本充足的窗口
@@ -610,6 +657,30 @@ mod tests {
                 "overall",
                 "uptime"
             ]
+        );
+    }
+
+    /// L-e：单飞旗标 CAS 认领互斥（赢家唯一，输家走等待路径的前提），
+    /// RecalcGuard Drop 复位——赢家正常返回与 unwind 共用同一路径，旗标不残留
+    #[test]
+    fn recalc_single_flight_claim_exclusive_and_drop_resets() {
+        use std::sync::atomic::Ordering;
+        assert!(
+            STATUS_RECALC_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "空闲旗标必须可认领"
+        );
+        assert!(
+            STATUS_RECALC_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err(),
+            "持有中旗标必须拒绝第二认领"
+        );
+        drop(RecalcGuard);
+        assert!(
+            !STATUS_RECALC_IN_PROGRESS.load(Ordering::Acquire),
+            "守护 Drop 必须复位旗标"
         );
     }
 
