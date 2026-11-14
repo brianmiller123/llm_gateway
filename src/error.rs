@@ -28,6 +28,11 @@ pub enum AppError {
     Conflict(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// F1：解压后超出进程缓冲字节预算（413 request_too_large）。读取侧超限仍
+    /// 由 DefaultBodyLimit / reject_oversized_body 直接 413，此变体供解压膨胀
+    /// 增量超预算路径使用
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
     #[error("internal error: {0}")]
     Internal(String),
     #[error("service unavailable: {0}")]
@@ -112,6 +117,12 @@ impl IntoResponse for AppError {
                 AppError::BadRequest(m) => {
                     (StatusCode::BAD_REQUEST, "invalid_request_error", m, None)
                 }
+                AppError::PayloadTooLarge(m) => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    m,
+                    None,
+                ),
                 AppError::Internal(m) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", m, None)
                 }

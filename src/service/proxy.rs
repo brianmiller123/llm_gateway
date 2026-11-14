@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::service::breaker::Breaker;
 use crate::service::usage;
-use crate::state::AppState;
+use crate::state::{AppState, BufferGuard};
 use crate::store::upstream::Provider;
 use crate::store::usage::{Usage, UsageMeta};
 
@@ -740,11 +740,14 @@ fn with_global_cap(
     rules
 }
 
-/// OpenAI 兼容代理入口：鉴权 → 管线
+/// OpenAI 兼容代理入口：鉴权 → 管线。`guard` 为 F1 字节预算许可（BufLimitedBody
+/// 提取时按预估预留），随缓冲内存生命周期释放：流式响应 handler 结束即释放，
+/// 非流式绑定响应体流尽/断开释放（见 proxy_authed / bind_budget_to_body）。
 pub async fn proxy(
     st: &AppState,
     headers: HeaderMap,
     body: Bytes,
+    guard: BufferGuard,
     endpoint: Endpoint,
     client_ip: std::net::IpAddr,
 ) -> Result<Response, AppError> {
@@ -764,8 +767,27 @@ pub async fn proxy(
     // 优先于 body 400）：解析只做一次，解析出的 JSON 全管线复用，模型维度
     // （客户端原始 model）在挂载用户并发 guard 前即可取得
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
-    let json =
-        parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
+    // M-1 并发修复：解压上限取 min(静态预算容量, 常量上限)——瞬时余量快照
+    // 正是并发解码各自独占同一份 headroom 的聚合漏洞来源，已废除；动态余量
+    // 由解码期 ChargingReader 逐块 try_grow 互斥入账裁定，拒收即 413
+    let decode_cap = decode_ceiling(guard.capacity_bytes());
+    let (json, buffered_len, mut guard) =
+        parse_request_json(&body, &headers, guard, decode_cap)
+            .await
+            .map_err(|e| fail_with_request_id(e, request_id))?;
+    // F1：解压膨胀增量调整——解码期已逐块入账（含 raw 预留在上），此处收缩
+    // 收敛至解压后长度（释放 raw 差额；guard 失败路径已在解压内缩回 raw 后
+    // 整份 Drop 归还）。保留为 no-op/收缩 reconcile。
+    guard
+        .resize_to(buffered_len as u64)
+        .map_err(|_| {
+            fail_with_request_id(
+                AppError::PayloadTooLarge(format!(
+                    "decompressed request body ({buffered_len} bytes) exceeds the gateway buffer budget"
+                )),
+                request_id,
+            )
+        })?;
     let model = requested_model(&json);
     // 并发上限（管线唯一的限流维度）：guard 绑定响应体生命周期，SSE 流尽或
     // 客户端断开才归还。拒绝时并发未占坑（try_acquire 全有或全无）。
@@ -805,7 +827,7 @@ pub async fn proxy(
         concurrency: Some(conc),
     };
     proxy_authed(
-        st, headers, body, json, endpoint, client_ip, user_id, key_id, false, request_id,
+        st, headers, body, guard, json, endpoint, client_ip, user_id, key_id, false, request_id,
     )
     .await
     .map(|resp| bind_guards_to_body(resp, guards))
@@ -830,18 +852,67 @@ fn ensure_endpoint_enabled(st: &AppState, endpoint: Endpoint) -> Result<(), AppE
     Ok(())
 }
 
+/// F10：CPU 密集段移入阻塞线程池的字节阈值——超过该大小的请求体（解压 +
+/// serde DOM 解析 / 方言转换重建 + 重序列化 / 整流重解析）交给
+/// spawn_blocking，tokio worker 不再被百 MiB 级 JSON 解析独占；小体保持
+/// 当前任务内联，无调度开销。
+const LARGE_BODY_BLOCKING_BYTES: usize = 64 * 1024;
+
 /// M24：请求体解析（先按 Content-Encoding 解压，再解析 JSON）。
 /// 在入口挂用户并发 guard 前调用一次，结果传入管线复用——整份请求体
-/// 不做第二次解压/解析。
-fn parse_request_json(body: &Bytes, headers: &HeaderMap) -> Result<Value, AppError> {
-    let decompressed = decompress_request_body(
-        body,
-        headers
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-    )
-    .map_err(AppError::BadRequest)?;
+/// 不做第二次解压/解析。返回解压后实际长度，供 F1 字节预算增量调整
+/// （identity 体与原始长度一致，调整为 no-op）。
+/// M-1 并发修复：`guard` 所有权移入（解码期 ChargingReader 逐块 try_grow
+/// 入账其预留），成功随三元组归还（预留 = raw + 解码入账，调用方 resize_to
+/// 收敛）；失败路径 guard 就地 Drop 整份归还预算（解码中途撞预算已在
+/// decompress_request_body 内先缩回 raw）。
+/// F10：大体的解压 + DOM 解析移入阻塞线程池执行。
+/// M-1：`decode_cap` 为解压输出绝对上限（min(静态预算容量, 常量 512MiB)），
+/// 动态余量裁定在入账侧。
+async fn parse_request_json(
+    body: &Bytes,
+    headers: &HeaderMap,
+    guard: BufferGuard,
+    decode_cap: usize,
+) -> Result<(Value, usize, BufferGuard), AppError> {
+    let enc = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if body.len() > LARGE_BODY_BLOCKING_BYTES {
+        let body = body.clone();
+        let (value, len, guard) = tokio::task::spawn_blocking(move || {
+            parse_request_json_sync(&body, enc.as_deref(), guard, decode_cap)
+        })
+        .await
+        .map_err(AppError::internal)??;
+        return Ok((value, len, guard));
+    }
+    parse_request_json_sync(body, enc.as_deref(), guard, decode_cap)
+}
+
+/// 解压 + JSON 解析（同步体；大小超阈值时由调用方放进 spawn_blocking）。
+/// 返回 (解析结果, 解压后长度, guard)。解压/解析失败时解压缓冲与 guard
+/// 随局部变量释放（guard 失败路径预算整份归还）。
+/// 解压输出超预算 → 413 request_too_large（M-1）；解码失败/不支持编码 → 400。
+fn parse_request_json_sync(
+    body: &Bytes,
+    content_encoding: Option<&str>,
+    mut guard: BufferGuard,
+    decode_cap: usize,
+) -> Result<(Value, usize, BufferGuard), AppError> {
+    let decompressed =
+        decompress_request_body(body, content_encoding, &mut guard, decode_cap).map_err(
+            |e| match e {
+                DecompressError::Budget(cap) => AppError::PayloadTooLarge(format!(
+                    "decompressed request body exceeds the {cap}-byte decode budget"
+                )),
+                DecompressError::Decode(msg) => AppError::BadRequest(msg),
+            },
+        )?;
+    let decompressed_len = decompressed.len();
     serde_json::from_slice(&decompressed)
+        .map(|value| (value, decompressed_len, guard))
         .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))
 }
 
@@ -877,10 +948,19 @@ pub async fn proxy_test(
     };
     let request_id = Uuid::new_v4();
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
-    let json =
-        parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
+    // 管理员测试不经 BufLimitedBody：零记账 unbounded guard（容量不限，
+    // 解码入账恒通过；上限回落常量 512MiB）
+    let guard = BufferGuard::unbounded();
+    let decode_cap = decode_ceiling(guard.capacity_bytes());
+    let (json, buffered_len, mut guard) =
+        parse_request_json(&body, &headers, guard, decode_cap)
+            .await
+            .map_err(|e| fail_with_request_id(e, request_id))?;
+    guard
+        .resize_to(buffered_len as u64)
+        .expect("unbounded guard must absorb any decompressed size");
     proxy_authed(
-        st, headers, body, json, endpoint, client_ip, None, None, true, request_id,
+        st, headers, body, guard, json, endpoint, client_ip, None, None, true, request_id,
     )
     .await
     .map(|resp| bind_guards_to_body(resp, guards))
@@ -905,11 +985,278 @@ fn apply_extra(body: &mut Value, extra: Option<&Value>) {
     }
 }
 
+/// F10：出站体构建所需快照（大体时整体构建移入阻塞线程池；字段为
+/// owned/Arc 快照，满足 spawn_blocking 的 'static 边界）。
+#[derive(Clone)]
+struct OutboundBuildCtx {
+    st: AppState,
+    endpoint: Endpoint,
+    route: Arc<crate::store::upstream::ModelRoute>,
+    json: Arc<Value>,
+    /// 原始客户端体（零改写快路径直传；Bytes 引用计数克隆）
+    body: Arc<Bytes>,
+    /// 客户端原始模型名（needs_rebuild 判定用）
+    client_model: String,
+    outbound_model: String,
+    gating_model: String,
+    extra_enabled: bool,
+    streamed: bool,
+    roles_rewritten: bool,
+    had_content_encoding: bool,
+    system_head: bool,
+    system_head_merge: bool,
+    plan_downgraded: bool,
+    large_body: bool,
+}
+
+/// F10/F8：出站体构建（同步体；大体时由 [`build_outbound`] 放进
+/// spawn_blocking 执行）。返回 (出站体字节, 上游路径)——出站体全链路
+/// Bytes：多候选重试复用同一引用计数缓冲，不再逐次深拷贝。
+fn build_outbound_sync(
+    ctx: &OutboundBuildCtx,
+    provider: &Provider,
+) -> Result<(Bytes, &'static str), AppError> {
+    // extra_body 透传：渠道级 + 路由级（模型级覆盖同名叶键）深合并进出站体；
+    // 全局开关关闭时保留配置但不合并（临时停用不丢配置）
+    let extra = if ctx.extra_enabled {
+        effective_extra(&ctx.route.extra_body, &provider.extra_body)
+    } else {
+        None
+    };
+    // B-anthropic：/v1/messages + 非原生 anthropic 上游 → Anthropic 请求转 Chat
+    //（system/tool_use/tool_result/thinking 映射见 service::anthropic::transform）
+    if crate::service::anthropic::should_convert(ctx.endpoint.anthropic, provider) {
+        let mut chat = crate::service::anthropic::convert_request(
+            &ctx.json,
+            &ctx.gating_model,
+            &provider.base_url,
+        )
+        .map_err(AppError::BadRequest)?;
+        ensure_include_usage(&mut chat, ctx.streamed);
+        apply_extra(&mut chat, extra.as_ref());
+        // P1-7：MiniMax 系模型强制收拢 system 到头部（多条 system 400 防护，
+        // cc-switch 无条件收拢的具名动机；其余上游维持路由开关语义）
+        apply_system_head(&mut chat, ctx.system_head, ctx.system_head_merge);
+        apply_reasoning_config(&mut chat, &ctx.route, &ctx.gating_model);
+        // 出站模型名统一在此改写（路由映射 upstream_model / [1m] 剥离）——
+        // transform 只写客户端模型，四个出站分支都必须补写，漏写会把
+        // claude-* 原名发给 Chat 上游（400/404 model-not-found）
+        chat["model"] = serde_json::Value::String(ctx.outbound_model.clone());
+        return Ok((
+            Bytes::from(serde_json::to_vec(&chat).map_err(AppError::internal)?),
+            "/chat/completions",
+        ));
+    }
+    let converted = crate::service::responses::should_convert(ctx.endpoint.responses, provider);
+    if converted {
+        // B：降级转换 Responses 请求 → Chat 请求（上游只支持 /v1/chat/completions）
+        // P0-1：previous_response_id 桥接——命中网关历史则把先前 output items
+        // 前插进 input（原生 openai-responses 透传不走此分支，引用原样转发）
+        let mut enriched = (*ctx.json).clone();
+        crate::service::responses::history::enrich_request_with_history(
+            &ctx.st.responses_history,
+            &mut enriched,
+        )
+        .map_err(AppError::BadRequest)?;
+        let mut chat = crate::service::responses::convert_request(&enriched, &ctx.gating_model)
+            .map_err(AppError::BadRequest)?;
+        ensure_include_usage(&mut chat, ctx.streamed);
+        apply_extra(&mut chat, extra.as_ref());
+        apply_system_head(&mut chat, ctx.system_head, ctx.system_head_merge);
+        apply_dialect_field_gate(&mut chat, &ctx.route);
+        apply_reasoning_config(&mut chat, &ctx.route, &ctx.gating_model);
+        chat["model"] = serde_json::Value::String(ctx.outbound_model.clone());
+        Ok((
+            Bytes::from(serde_json::to_vec(&chat).map_err(AppError::internal)?),
+            "/chat/completions",
+        ))
+    } else if ctx.streamed && !ctx.endpoint.responses && !ctx.endpoint.anthropic {
+        let mut json = (*ctx.json).clone();
+        ensure_include_usage(&mut json, ctx.streamed);
+        apply_extra(&mut json, extra.as_ref());
+        apply_system_head(&mut json, ctx.system_head, ctx.system_head_merge);
+        apply_reasoning_config(&mut json, &ctx.route, &ctx.gating_model);
+        // L8：剥离客户端 `_` 前缀私有字段（cc-switch body_filter 同款）
+        strip_underscore_fields(&mut json);
+        json["model"] = serde_json::Value::String(ctx.outbound_model.clone());
+        Ok((
+            Bytes::from(serde_json::to_vec(&json).map_err(AppError::internal)?),
+            ctx.endpoint.upstream,
+        ))
+    } else {
+        // extra_body 合并 / role 归一化 / 模型名映射 / 私有字段剥离 → 需重建请求体；
+        // 全都未发生时保持原始字节直传（零改写快路径）
+        let needs_rebuild = extra.is_some()
+            || ctx.roles_rewritten
+            || ctx.had_content_encoding
+            || ctx.system_head
+            || ctx.outbound_model != ctx.client_model
+            || has_underscore_fields(&ctx.json)
+            // Plan 降级改写了 json["model"]：快路径直传原始字节会绕过改写
+            || ctx.plan_downgraded;
+        if needs_rebuild {
+            let mut json = (*ctx.json).clone();
+            apply_extra(&mut json, extra.as_ref());
+            apply_system_head(&mut json, ctx.system_head, ctx.system_head_merge);
+            // 原生 anthropic 透传体是 Anthropic 方言：apply_thinking_form 会
+            // 无条件剥 thinking 再按 Chat 形态重造（未配置 form 时不还原），
+            // 客户端的 thinking 配置被静默丢弃——方言改写仅对 Chat 体执行
+            let native_anthropic =
+                ctx.endpoint.anthropic && provider.api_type.eq_ignore_ascii_case("anthropic");
+            if !native_anthropic {
+                apply_reasoning_config(&mut json, &ctx.route, &ctx.gating_model);
+            }
+            strip_underscore_fields(&mut json);
+            json["model"] = serde_json::Value::String(ctx.outbound_model.clone());
+            Ok((
+                Bytes::from(serde_json::to_vec(&json).map_err(AppError::internal)?),
+                ctx.endpoint.upstream,
+            ))
+        } else {
+            // F8：零改写快路径直传原始字节——Bytes 引用计数克隆，无 memcpy
+            Ok((Bytes::clone(&ctx.body), ctx.endpoint.upstream))
+        }
+    }
+}
+
+/// F10：出站体构建分发——大体时构建移入阻塞线程池（tokio worker 不被
+/// 大 JSON 重建独占），小体内联执行；H6 媒体降级属构建的一部分（重解析
+/// 同样不占 worker）。
+async fn build_outbound(
+    ctx: &OutboundBuildCtx,
+    provider: Arc<Provider>,
+) -> Result<(Bytes, &'static str), AppError> {
+    let (bytes, upstream_path) = if ctx.large_body {
+        let ctx = ctx.clone();
+        // Arc 克隆进闭包（引用计数）：外层 provider 在 H6 媒体降级检查仍要用
+        let provider = Arc::clone(&provider);
+        tokio::task::spawn_blocking(move || build_outbound_sync(&ctx, &provider))
+            .await
+            .map_err(AppError::internal)??
+    } else {
+        build_outbound_sync(ctx, &provider)?
+    };
+    // H6：渠道声明不支持图像 → 发前主动降级图片 part 为文本标记
+    //（纯文本上游不再每轮首请求必失败一次；rectify 反应式路径保留兜底）
+    // F10：大体时媒体降级重解析移入阻塞线程池
+    if !provider.supports_images {
+        if let Some(stripped) = strip_media_outbound_maybe_blocking(&bytes).await? {
+            tracing::debug!(provider = %provider.name, "proactively stripped media from outbound body");
+            return Ok((Bytes::from(stripped), upstream_path));
+        }
+    }
+    Ok((bytes, upstream_path))
+}
+
+/// F10：反应式整流分发——出站体超 [`LARGE_BODY_BLOCKING_BYTES`] 时把同步
+/// 整流（outbound DOM 重解析 + 改写 + 重序列化）放进阻塞线程池，tokio
+/// worker 不被大体重解析独占；小体内联执行。Bytes 传参仅引用计数克隆。
+async fn rectify_outbound_maybe_blocking(
+    anthropic_native: bool,
+    outbound: &Bytes,
+    error_body: &Bytes,
+    status: u16,
+) -> Result<Option<Vec<u8>>, AppError> {
+    if outbound.len() > LARGE_BODY_BLOCKING_BYTES {
+        let outbound = outbound.clone();
+        let error_body = error_body.clone();
+        let fixed = tokio::task::spawn_blocking(move || {
+            crate::service::rectify::rectify_outbound(
+                anthropic_native,
+                &outbound,
+                &error_body,
+                status,
+            )
+        })
+        .await
+        .map_err(AppError::internal)?;
+        Ok(fixed)
+    } else {
+        Ok(crate::service::rectify::rectify_outbound(
+            anthropic_native,
+            outbound,
+            error_body,
+            status,
+        ))
+    }
+}
+
+/// F10：主动媒体降级分发——大体时移入阻塞线程池（同上）。
+async fn strip_media_outbound_maybe_blocking(outbound: &Bytes) -> Result<Option<Vec<u8>>, AppError> {
+    if outbound.len() > LARGE_BODY_BLOCKING_BYTES {
+        let outbound = outbound.clone();
+        let stripped = tokio::task::spawn_blocking(move || {
+            crate::service::rectify::strip_media_outbound(&outbound)
+        })
+        .await
+        .map_err(AppError::internal)?;
+        Ok(stripped)
+    } else {
+        Ok(crate::service::rectify::strip_media_outbound(outbound))
+    }
+}
+
+/// 已鉴权代理管线入口：F1 字节预算 guard 的生命周期绑定层。流式响应无整包
+/// 缓冲驻留（请求体缓冲随 handler 结束释放）；非流式响应是整包缓冲体——
+/// guard 绑进响应体流，流尽/客户端断开时释放（bind_guards_to_body 同款
+/// unfold 形状）。缓冲内存活多久，预算占多久。
+async fn proxy_authed(
+    st: &AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    guard: BufferGuard,
+    json: Value,
+    endpoint: Endpoint,
+    client_ip: std::net::IpAddr,
+    user_id: Option<i64>,
+    key_id: Option<i64>,
+    test_call: bool,
+    request_id: Uuid,
+) -> Result<Response, AppError> {
+    let streamed = json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let resp = proxy_authed_inner(
+        st,
+        headers,
+        body,
+        json,
+        endpoint,
+        client_ip,
+        user_id,
+        key_id,
+        streamed,
+        test_call,
+        request_id,
+    )
+    .await?;
+    if streamed {
+        Ok(resp)
+    } else {
+        Ok(bind_budget_to_body(resp, guard))
+    }
+}
+
+/// F1：字节预算 guard 绑定整包缓冲响应体。体流尽（正常发完）或 body 被丢弃
+/// （客户端断开）时 guard 随 unfold 状态一并 Drop，预算归还。
+fn bind_budget_to_body(resp: Response, guard: BufferGuard) -> Response {
+    let (parts, body) = resp.into_parts();
+    let bound = futures_util::stream::unfold(
+        (body.into_data_stream(), Some(guard)),
+        |(mut stream, guard)| async move {
+            let item = stream.next().await?;
+            Some((item, (stream, guard)))
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(bound))
+}
+
 /// 已鉴权代理管线：Plan 配额 → 路由 → 转发（含降级）→ 记账
 /// （并发上限已在入口 proxy 占坑、guard 绑定响应体；proxy_test 不占坑）。
 /// 端点开关检查与请求体解压/解析已在入口（proxy / proxy_test）完成，
 /// `json` 为解析结果、`body` 为原始字节（零改写快路径直传用）。
-async fn proxy_authed(
+async fn proxy_authed_inner(
     st: &AppState,
     headers: HeaderMap,
     body: Bytes,
@@ -918,6 +1265,7 @@ async fn proxy_authed(
     client_ip: std::net::IpAddr,
     user_id: Option<i64>,
     key_id: Option<i64>,
+    streamed: bool,
     test_call: bool,
     request_id: Uuid,
 ) -> Result<Response, AppError> {
@@ -951,10 +1299,6 @@ async fn proxy_authed(
         .filter(|m| !m.is_empty())
         .map(str::to_string)
         .ok_or_else(|| AppError::BadRequest("missing 'model' field".into()))?;
-    let streamed = json
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
 
     // 3. Coding Plan 配额：超出按策略拦截(429)/降级改写模型/仅告警放行。
     // 降级改写 json["model"] 并标记 plan_downgraded——零改写快路径直传原始
@@ -975,15 +1319,27 @@ async fn proxy_authed(
     }
 
     // 5. 路由解析 → 候选上游（主 + 降级链）
+    // F10：route/json/body 收进 Arc 共享——大体构建移入 spawn_blocking 时以
+    // 廉价引用计数传入（'static 边界），候选 Provider 同样 Arc 化供逐候选
+    // 克隆传递；后续所有读取处经 Deref 透明访问
+    let json = Arc::new(json);
+    let body = Arc::new(body);
     let route = {
         let routes = st.routes.read();
-        crate::service::routing::resolve_route(&routes, &model)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::BadRequest(format!("model '{model}' is not routed to any provider"))
-            })?
+        Arc::new(
+            crate::service::routing::resolve_route(&routes, &model)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "model '{model}' is not routed to any provider"
+                    ))
+                })?,
+        )
     };
-    let candidates = resolve_candidates(st, &route);
+    let candidates: Vec<Arc<Provider>> = resolve_candidates(st, &route)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     if candidates.is_empty() {
         return Err(AppError::Internal(format!(
             "no enabled provider for route '{}'",
@@ -1086,119 +1442,26 @@ async fn proxy_authed(
         route.strict_system_head || crate::service::model_family::is_mini_max(&gating_model);
     let system_head_merge =
         route.system_head_merge || crate::service::model_family::is_mini_max(&gating_model);
-    let build_outbound_raw = |provider: &Provider| -> Result<(Vec<u8>, &'static str), AppError> {
-        // extra_body 透传：渠道级 + 路由级（模型级覆盖同名叶键）深合并进出站体；
-        // 全局开关关闭时保留配置但不合并（临时停用不丢配置）
-        let extra = if extra_enabled {
-            effective_extra(&route.extra_body, &provider.extra_body)
-        } else {
-            None
-        };
-        // B-anthropic：/v1/messages + 非原生 anthropic 上游 → Anthropic 请求转 Chat
-        //（system/tool_use/tool_result/thinking 映射见 service::anthropic::transform）
-        if crate::service::anthropic::should_convert(endpoint.anthropic, provider) {
-            let mut chat = crate::service::anthropic::convert_request(
-                &json,
-                &gating_model,
-                &provider.base_url,
-            )
-            .map_err(AppError::BadRequest)?;
-            ensure_include_usage(&mut chat, streamed);
-            apply_extra(&mut chat, extra.as_ref());
-            // P1-7：MiniMax 系模型强制收拢 system 到头部（多条 system 400 防护，
-            // cc-switch 无条件收拢的具名动机；其余上游维持路由开关语义）
-            apply_system_head(&mut chat, system_head, system_head_merge);
-            apply_reasoning_config(&mut chat, &route, &gating_model);
-            // 出站模型名统一在此改写（路由映射 upstream_model / [1m] 剥离）——
-            // transform 只写客户端模型，四个出站分支都必须补写，漏写会把
-            // claude-* 原名发给 Chat 上游（400/404 model-not-found）
-            chat["model"] = serde_json::Value::String(outbound_model.clone());
-            return Ok((
-                serde_json::to_vec(&chat).map_err(AppError::internal)?,
-                "/chat/completions",
-            ));
-        }
-        let converted = crate::service::responses::should_convert(endpoint.responses, provider);
-        if converted {
-            // B：降级转换 Responses 请求 → Chat 请求（上游只支持 /v1/chat/completions）
-            // P0-1：previous_response_id 桥接——命中网关历史则把先前 output items
-            // 前插进 input（原生 openai-responses 透传不走此分支，引用原样转发）
-            let mut enriched = json.clone();
-            crate::service::responses::history::enrich_request_with_history(
-                &st.responses_history,
-                &mut enriched,
-            )
-            .map_err(AppError::BadRequest)?;
-            let mut chat = crate::service::responses::convert_request(&enriched, &gating_model)
-                .map_err(AppError::BadRequest)?;
-            ensure_include_usage(&mut chat, streamed);
-            apply_extra(&mut chat, extra.as_ref());
-            apply_system_head(&mut chat, system_head, system_head_merge);
-            apply_dialect_field_gate(&mut chat, &route);
-            apply_reasoning_config(&mut chat, &route, &gating_model);
-            chat["model"] = serde_json::Value::String(outbound_model.clone());
-            Ok((
-                serde_json::to_vec(&chat).map_err(AppError::internal)?,
-                "/chat/completions",
-            ))
-        } else if streamed && !endpoint.responses && !endpoint.anthropic {
-            let mut json = json.clone();
-            ensure_include_usage(&mut json, streamed);
-            apply_extra(&mut json, extra.as_ref());
-            apply_system_head(&mut json, system_head, system_head_merge);
-            apply_reasoning_config(&mut json, &route, &gating_model);
-            // L8：剥离客户端 `_` 前缀私有字段（cc-switch body_filter 同款）
-            strip_underscore_fields(&mut json);
-            json["model"] = serde_json::Value::String(outbound_model.clone());
-            Ok((
-                serde_json::to_vec(&json).map_err(AppError::internal)?,
-                endpoint.upstream,
-            ))
-        } else {
-            // extra_body 合并 / role 归一化 / 模型名映射 / 私有字段剥离 → 需重建请求体；
-            // 全都未发生时保持原始字节直传（零改写快路径）
-            let needs_rebuild = extra.is_some()
-                || roles_rewritten
-                || had_content_encoding
-                || system_head
-                || outbound_model != model
-                || has_underscore_fields(&json)
-                // Plan 降级改写了 json["model"]：快路径直传原始字节会绕过改写
-                || plan_downgraded;
-            if needs_rebuild {
-                let mut json = json.clone();
-                apply_extra(&mut json, extra.as_ref());
-                apply_system_head(&mut json, system_head, system_head_merge);
-                // 原生 anthropic 透传体是 Anthropic 方言：apply_thinking_form 会
-                // 无条件剥 thinking 再按 Chat 形态重造（未配置 form 时不还原），
-                // 客户端的 thinking 配置被静默丢弃——方言改写仅对 Chat 体执行
-                let native_anthropic =
-                    endpoint.anthropic && provider.api_type.eq_ignore_ascii_case("anthropic");
-                if !native_anthropic {
-                    apply_reasoning_config(&mut json, &route, &gating_model);
-                }
-                strip_underscore_fields(&mut json);
-                json["model"] = serde_json::Value::String(outbound_model.clone());
-                Ok((
-                    serde_json::to_vec(&json).map_err(AppError::internal)?,
-                    endpoint.upstream,
-                ))
-            } else {
-                Ok((body.to_vec(), endpoint.upstream))
-            }
-        }
-    };
-    let build_outbound = |provider: &Provider| -> Result<(Vec<u8>, &'static str), AppError> {
-        let (bytes, upstream_path) = build_outbound_raw(provider)?;
-        // H6：渠道声明不支持图像 → 发前主动降级图片 part 为文本标记
-        //（纯文本上游不再每轮首请求必失败一次；rectify 反应式路径保留兜底）
-        if !provider.supports_images {
-            if let Some(stripped) = crate::service::rectify::strip_media_outbound(&bytes) {
-                tracing::debug!(provider = %provider.name, "proactively stripped media from outbound body");
-                return Ok((stripped, upstream_path));
-            }
-        }
-        Ok((bytes, upstream_path))
+    // F10：出站体构建快照——大体（> LARGE_BODY_BLOCKING_BYTES）时构建
+    // （方言转换 DOM 改写 + 重序列化 + 媒体降级重解析）整体移入阻塞线程池。
+    // 字段全为 owned/Arc 快照，满足 spawn_blocking 的 'static 边界
+    let ctx = OutboundBuildCtx {
+        st: st.clone(),
+        endpoint,
+        route: Arc::clone(&route),
+        json: Arc::clone(&json),
+        body: Arc::clone(&body),
+        client_model: model.clone(),
+        outbound_model: outbound_model.clone(),
+        gating_model: gating_model.clone(),
+        extra_enabled,
+        streamed,
+        roles_rewritten,
+        had_content_encoding,
+        system_head,
+        system_head_merge,
+        plan_downgraded,
+        large_body: body.len() > LARGE_BODY_BLOCKING_BYTES,
     };
 
     // Coding Plan 计量载荷：检查期已按当前模型解析（模型作用域感知），
@@ -1288,7 +1551,8 @@ async fn proxy_authed(
             // `?` 直接上抛，已占用的半开探测名额被永久占位，该渠道窗口到期后
             // 再也无法 allow 放行。只归还探测名额（record_failure 会把半开渠道
             // 重开整个窗口，且这不是线路故障）后换下一候选
-            let (outbound, upstream_path) = match build_outbound(provider) {
+            let (outbound, upstream_path) = match build_outbound(&ctx, Arc::clone(provider)).await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "provider outbound build failed");
@@ -1296,13 +1560,12 @@ async fn proxy_authed(
                     continue;
                 }
             };
-            let provider_key = match crate::crypto::decrypt(
-                &provider.api_key_encrypted,
-                &st.cfg.master_key,
-            ) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(provider = %provider.name, error = %e, "provider key decrypt failed");
+            // F8：热路径只查解密快照（reload 全量解密重建、指针整体交换），
+            // 不再逐候选解密；快照缺钥渠道走既有候选失败归因换家
+            let provider_key = match st.provider_keys.read().get(&provider.id).cloned() {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(provider = %provider.name, "provider key missing from snapshot; skipping candidate");
                     if st.breaker.record_failure(provider.id) {
                         st.metrics.record_breaker_open();
                     }
@@ -1388,7 +1651,7 @@ async fn proxy_authed(
                         .status(*status)
                         .header(header::CONTENT_TYPE, content_type.clone())
                         .header("X-Request-Id", request_id.to_string())
-                        .body(Body::from(bytes.to_vec()))
+                        .body(Body::from(bytes.clone()))
                         .map_err(AppError::internal)?,
                     rl,
                 ));
@@ -1795,12 +2058,40 @@ async fn proxy_authed(
             if anthropic_converted {
                 // 非 2xx / 200 非 SSE：缓冲错误体（SSE 形态从预读流收集，
                 // 防 resp 已被 preread 消费）整形为 Anthropic 错误 JSON 返回
-                let bytes = collect_stream_or_body(
+                let bytes = match collect_stream_or_body(
                     &mut stream_opt,
                     &mut resp,
                     body_read_deadline,
                 )
-                .await;
+                .await
+                {
+                    Ok(b) => b,
+                    // F5：SSE 预读错误体超读体上限/读体失败 → 按读体失败归因
+                    // 换家（与非 SSE 读体失败同语义：熔断失败 + body_read_error
+                    // 家族归因行），不再把超限体当可整形错误继续管线
+                    Err(e) => {
+                        tracing::warn!(provider = %provider.name, error = %e, "upstream stream error body read failed");
+                        let (class, status_out) = classify_body_read_failure(e.as_ref());
+                        if st.breaker.record_failure(provider.id) {
+                            st.metrics.record_breaker_open();
+                        }
+                        st.metrics.record_upstream_error(provider.id);
+                        usage::record_failure_row(
+                            st,
+                            &meta,
+                            class,
+                            None,
+                            Some(attempt_idx),
+                            status_out,
+                            started.elapsed().as_millis() as i64,
+                        )
+                        .await;
+                        // M-4（QC1-M-1）：读体失败归因本候选（与非 SSE 读体失败
+                        // 分支同形）——缺失会让尾段错误上下文落回 candidates[0]
+                        last_failed = Some(provider);
+                        continue;
+                    }
+                };
                 // F1：非 2xx + SSE 走到这里时提交点结算已被推迟（tail_settles =
                 // is_sse），转换分支又不像透传链那样安装收尾流——不在此显式结算，
                 // 半开探测名额永久占位。渠道给出了明确响应（可重试状态早已换家）
@@ -1934,12 +2225,40 @@ async fn proxy_authed(
                 // P0 关联修复：converted 路径的非 2xx（此前落入下方透传分支，
                 // stream_opt 仅在 SSE 时创建 → JSON 错误体触发 expect panic）。
                 // 整形为 Responses 错误 JSON 返回；SSE 形态错误体从预读流收集。
-                let bytes = collect_stream_or_body(
+                let bytes = match collect_stream_or_body(
                     &mut stream_opt,
                     &mut resp,
                     body_read_deadline,
                 )
-                .await;
+                .await
+                {
+                    Ok(b) => b,
+                    // F5：SSE 预读错误体超读体上限/读体失败 → 按读体失败归因
+                    // 换家（与非 SSE 读体失败同语义：熔断失败 + body_read_error
+                    // 家族归因行），不再把超限体当可整形错误继续管线
+                    Err(e) => {
+                        tracing::warn!(provider = %provider.name, error = %e, "upstream stream error body read failed");
+                        let (class, status_out) = classify_body_read_failure(e.as_ref());
+                        if st.breaker.record_failure(provider.id) {
+                            st.metrics.record_breaker_open();
+                        }
+                        st.metrics.record_upstream_error(provider.id);
+                        usage::record_failure_row(
+                            st,
+                            &meta,
+                            class,
+                            None,
+                            Some(attempt_idx),
+                            status_out,
+                            started.elapsed().as_millis() as i64,
+                        )
+                        .await;
+                        // M-4（QC1-M-1）：读体失败归因本候选（与非 SSE 读体失败
+                        // 分支同形）——缺失会让尾段错误上下文落回 candidates[0]
+                        last_failed = Some(provider);
+                        continue;
+                    }
+                };
                 // F1：非 2xx + SSE 的提交点结算已被推迟（tail_settles = is_sse），
                 // 转换分支不安装收尾流——显式结算一次（同 anthropic 分支语义）
                 if will_stream {
@@ -2126,13 +2445,12 @@ async fn proxy_authed(
             let anthropic_converted =
                 crate::service::anthropic::should_convert(endpoint.anthropic, provider);
             let converted = crate::service::responses::should_convert(endpoint.responses, provider);
-            let provider_key = match crate::crypto::decrypt(
-                &provider.api_key_encrypted,
-                &st.cfg.master_key,
-            ) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(provider = %provider.name, error = %e, "provider key decrypt failed");
+            // F8：热路径只查解密快照（同上）；快照缺钥渠道走既有候选失败
+            // 归因换家（last_failed 仅作尾段错误上下文归属）
+            let provider_key = match st.provider_keys.read().get(&provider.id).cloned() {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(provider = %provider.name, "provider key missing from snapshot; skipping candidate");
                     if st.breaker.record_failure(provider.id) {
                         st.metrics.record_breaker_open();
                     }
@@ -2143,7 +2461,8 @@ async fn proxy_authed(
             // F1：出站体构建失败（方言转换/序列化错误）不是渠道健康信号——
             // 此前 `?` 直接上抛，半开探测名额被永久占位。归还探测名额后换下一
             // 候选（与 decrypt 失败分支同形：last_failed 仅作尾段错误上下文归属）
-            let (outbound, upstream_path) = match build_outbound(provider) {
+            let (outbound, upstream_path) = match build_outbound(&ctx, Arc::clone(provider)).await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(provider = %provider.name, error = %e, "provider outbound build failed");
@@ -2231,7 +2550,7 @@ async fn proxy_authed(
                         .status(*status)
                         .header(header::CONTENT_TYPE, content_type.clone())
                         .header("X-Request-Id", request_id.to_string())
-                        .body(Body::from(bytes.to_vec()))
+                        .body(Body::from(bytes.clone()))
                         .map_err(AppError::internal)?,
                     rl,
                 ));
@@ -2572,7 +2891,20 @@ async fn proxy_authed(
 /// raw）/ br / zstd / zst；identity/缺失直通；不支持编码返回错误信息（调用方 400）。
 /// L1：逗号分隔的堆叠编码按逆序解码（cc-switch content_encoding.rs:126-131 同款），
 /// 且解压输出受预算约束（防 zip bomb——解压后超限直接报错）。
-fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>, String> {
+/// 解压阶段错误分型（M-1）：Budget = 解压输出超预算上限（413 request_too_large，
+/// 与解码入账 try_grow 拒收同语义）；Decode = 解码失败/不支持编码（400）
+#[derive(Debug)]
+enum DecompressError {
+    Budget(usize),
+    Decode(String),
+}
+
+fn decompress_request_body(
+    body: &[u8],
+    content_encoding: Option<&str>,
+    guard: &mut BufferGuard,
+    cap: usize,
+) -> Result<Vec<u8>, DecompressError> {
     let Some(enc) = content_encoding.map(|s| s.trim().to_ascii_lowercase()) else {
         return Ok(body.to_vec());
     };
@@ -2587,12 +2919,28 @@ fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Resul
     if encodings.is_empty() {
         return Ok(body.to_vec());
     }
+    // 堆叠编码：应用顺序 a,b,c 表示原始数据先经 a 编码；还原需逆序 c→b→a。
+    // 预算逐步生效：每步解码输出各自以 cap 为限，逐块原子入账 guard（guard
+    // 预留 = raw + 各步输出，跨步累计），无步间累加豁免
     let mut data = body.to_vec();
-    // 堆叠编码：应用顺序 a,b,c 表示原始数据先经 a 编码；还原需逆序 c→b→a
+    let mut failure: Option<DecompressError> = None;
     for enc in encodings.iter().rev() {
-        let mut out = Vec::with_capacity(data.len().min(MAX_DECOMPRESSED_BODY_BYTES) * 2);
-        decode_single_coding(&data, enc, &mut out)?;
-        data = out;
+        let mut out = Vec::with_capacity(data.len().min(cap) * 2);
+        match decode_single_coding(&data, enc, &mut out, guard, cap) {
+            Ok(()) => data = out,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = failure {
+        // 解码中途失败：释放解码期入账，缩回 raw（压缩原始体仍由调用方持有
+        // 并预留）——失败的炸弹即刻让出预算，不占坑到 guard Drop
+        guard
+            .resize_to(body.len() as u64)
+            .expect("shrink-to-raw cannot fail");
+        return Err(e);
     }
     Ok(data)
 }
@@ -2600,51 +2948,133 @@ fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Resul
 /// L1：解压输出预算（防 zip bomb；客户端原始体 200MB 上限下留充足裕量）
 const MAX_DECOMPRESSED_BODY_BYTES: usize = 512 * 1024 * 1024;
 
-/// 单一编码解码到 out（带输出预算；超限报错）。`input` 为已按前置编码解出的数据。
-fn decode_single_coding(input: &[u8], enc: &str, out: &mut Vec<u8>) -> Result<(), String> {
-    use std::io::Read;
-    let limited: &mut dyn Read = &mut input.take((MAX_DECOMPRESSED_BODY_BYTES + 1) as u64);
-    match enc {
-        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(limited)
-            .read_to_end(out)
-            .map(|_| ())
-            .map_err(|e| format!("gzip decode failed: {e}")),
-        "deflate" => {
-            // zlib 容器优先，失败回退 raw deflate（部分客户端发裸流）
-            if flate2::read::ZlibDecoder::new(limited)
-                .read_to_end(out)
-                .is_err()
-            {
-                out.clear();
-                let raw_limited: &mut dyn Read =
-                    &mut input.take((MAX_DECOMPRESSED_BODY_BYTES + 1) as u64);
-                flate2::read::DeflateDecoder::new(raw_limited)
-                    .read_to_end(out)
-                    .map(|_| ())
-                    .map_err(|e| format!("deflate decode failed: {e}"))?;
-            }
-            Ok(())
+/// M-1 并发修复：解压上限取 min(静态预算容量, 常量上限)——容量是静态配置，
+/// 只钳单次解码的绝对上限（预算关闭/unbounded → 常量 512MiB）；不再快照
+/// 瞬时余量（N 个并发解码各自独占同一份余量 → 聚合 N×512MiB 的 OOM 根因），
+/// 动态余量改由 ChargingReader 解码期逐块 try_grow 互斥裁定
+fn decode_ceiling(capacity: u64) -> usize {
+    usize::try_from(capacity)
+        .unwrap_or(usize::MAX)
+        .min(MAX_DECOMPRESSED_BODY_BYTES)
+}
+
+/// 解压输出侧预算入账 reader（M-1 并发修复）：包住 take 后的解码器输出，
+/// 每读出一块即 [`BufferGuard::try_grow`] 原子入账请求 guard 的预留（单次
+/// 互斥 check-and-inc）；剩余预算不足 → 置位 refused 并以 io 错误中止解码
+/// （上层映射 Budget → 413）。N 个并发解码各自逐块入账，任一瞬时
+/// Σ预留 ≤ 容量，无窗口双记账同一份余量。
+struct ChargingReader<'a, R> {
+    inner: R,
+    guard: &'a mut BufferGuard,
+    refused: bool,
+}
+
+impl<R: std::io::Read> std::io::Read for ChargingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 && self.guard.try_grow(n as u64).is_err() {
+            self.refused = true;
+            // 错误仅作中止信号（read_to_end 即刻上抛），上层按 refused 映射
+            return Err(std::io::Error::other(
+                "decompressed output exceeds the gateway buffer budget",
+            ));
         }
-        "br" => brotli::Decompressor::new(limited, 4096)
-            .read_to_end(out)
-            .map(|_| ())
-            .map_err(|e| format!("brotli decode failed: {e}")),
-        "zstd" | "zst" => zstd::stream::read::Decoder::new(limited)
-            .map_err(|e| format!("zstd decode init failed: {e}"))
-            .and_then(|mut d| {
-                d.read_to_end(out)
-                    .map(|_| ())
-                    .map_err(|e| format!("zstd decode failed: {e}"))
-            }),
-        other => Err(format!(
+        Ok(n)
+    }
+}
+
+/// 读尽单个解码器输出并逐块入账：预算拒收 → Budget(cap)（413），解码失败 →
+/// Decode(label)（400）。拒收读侧已 take(out_cap) 兜底单次解码绝对上限。
+fn read_charged<R: std::io::Read>(
+    reader: R,
+    out_cap: u64,
+    out: &mut Vec<u8>,
+    guard: &mut BufferGuard,
+    cap: usize,
+    label: &str,
+) -> Result<(), DecompressError> {
+    use std::io::Read;
+    let mut charged = ChargingReader {
+        inner: reader.take(out_cap),
+        guard,
+        refused: false,
+    };
+    if let Err(e) = charged.read_to_end(out) {
+        if charged.refused {
+            return Err(DecompressError::Budget(cap));
+        }
+        return Err(DecompressError::Decode(format!("{label} decode failed: {e}")));
+    }
+    Ok(())
+}
+
+/// 单一编码解码到 out。M-1：输出预算 cap 作用于解码输出侧 take（单次解码
+/// 绝对上限，膨胀到 cap 附近即中止读取，分配停在 cap+ε）；共享预算余量由
+/// ChargingReader 逐块 try_grow 动态裁定——拒收即刻中止（413 request_too_large）；
+/// 越限报 Budget(cap)，解码失败/不支持编码报 Decode。`input` 为已按前置
+/// 编码解出的数据。
+fn decode_single_coding(
+    input: &[u8],
+    enc: &str,
+    out: &mut Vec<u8>,
+    guard: &mut BufferGuard,
+    cap: usize,
+) -> Result<(), DecompressError> {
+    // cap+1：读到恰好越限一字节即停，供下方统一越限判定
+    let out_cap = (cap as u64).saturating_add(1);
+    match enc {
+        "gzip" | "x-gzip" => read_charged(
+            flate2::read::GzDecoder::new(input),
+            out_cap,
+            out,
+            guard,
+            cap,
+            "gzip",
+        ),
+        "deflate" => {
+            // zlib 容器优先，解码失败回退 raw deflate（部分客户端发裸流）；
+            // 预算拒收不是解码失败——直接上抛，不再回退重解（同样撞预算）
+            match read_charged(
+                flate2::read::ZlibDecoder::new(input),
+                out_cap,
+                out,
+                guard,
+                cap,
+                "deflate",
+            ) {
+                Err(DecompressError::Decode(_)) => {
+                    out.clear();
+                    read_charged(
+                        flate2::read::DeflateDecoder::new(input),
+                        out_cap,
+                        out,
+                        guard,
+                        cap,
+                        "deflate",
+                    )
+                }
+                other => other,
+            }
+        }
+        "br" => read_charged(
+            brotli::Decompressor::new(input, 4096),
+            out_cap,
+            out,
+            guard,
+            cap,
+            "br",
+        ),
+        "zstd" | "zst" => {
+            let decoder = zstd::stream::read::Decoder::new(input)
+                .map_err(|e| DecompressError::Decode(format!("zstd decode init failed: {e}")))?;
+            read_charged(decoder, out_cap, out, guard, cap, "zstd")
+        }
+        other => Err(DecompressError::Decode(format!(
             "unsupported content-encoding: {other} (supported: gzip, deflate, br, zstd)"
-        )),
+        ))),
     }?;
-    if out.len() > MAX_DECOMPRESSED_BODY_BYTES {
-        return Err(format!(
-            "decompressed body exceeds {} bytes limit",
-            MAX_DECOMPRESSED_BODY_BYTES
-        ));
+    if out.len() > cap {
+        return Err(DecompressError::Budget(cap));
     }
     Ok(())
 }
@@ -2693,7 +3123,7 @@ async fn send_with_rectify(
     st: &AppState,
     provider: &Provider,
     provider_key: &str,
-    outbound: &[u8],
+    outbound: &Bytes,
     endpoint: Endpoint,
     request_id: Uuid,
     streamed: bool,
@@ -2729,12 +3159,11 @@ async fn send_with_rectify(
     .await
     .unwrap_or_default();
     let anthropic_native = provider.api_type.eq_ignore_ascii_case("anthropic");
-    match crate::service::rectify::rectify_outbound(
-        anthropic_native,
-        outbound,
-        &bytes,
-        status.as_u16(),
-    ) {
+    // F10：出站体重解析（DOM 读改）在大体时移入阻塞线程池（同步签名不变，
+    // 分发层按大小分派；Bytes 传入仅引用计数克隆）
+    match rectify_outbound_maybe_blocking(anthropic_native, outbound, &bytes, status.as_u16())
+        .await?
+    {
         Some(fixed) => {
             tracing::info!(
                 provider = %provider.name, status = %status.as_u16(),
@@ -2744,6 +3173,7 @@ async fn send_with_rectify(
             // 「同 key 不同体」冲突拒绝（Anthropic 幂等语义），改写腿必须换键
             let mut retry_headers = client_headers.clone();
             retry_headers.remove("idempotency-key");
+            let fixed = Bytes::from(fixed);
             let retried = send_upstream(
                 st,
                 provider,
@@ -2786,32 +3216,56 @@ fn rate_limit_headers(
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
+/// F5：SSE 预读流累积（上限 cap）——此前无上限累积，恶意上游可无限流式
+/// 错误体拖爆网关内存；超限返回 Err（文案带 "exceeds {cap} bytes"，调用方
+/// classify_body_read_failure 归因 body_read_error 家族）。cap 参数化以便
+/// 单测以小覆盖验证上限语义。
+async fn collect_capped_stream(
+    mut stream: Pin<
+        Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>,
+    >,
+    cap: usize,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let mut buf = Vec::new();
+    let mut total = 0usize;
+    while let Some(chunk) = StreamExt::next(&mut stream).await {
+        match chunk {
+            Ok(b) => {
+                total = total.saturating_add(b.len());
+                if total > cap {
+                    return Err(format!("upstream response body exceeds {cap} bytes").into());
+                }
+                buf.extend_from_slice(&b);
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(buf)
+}
+
 /// 从「预读流（SSE 错误体）或未消费响应（JSON 错误体）」收集错误体字节
 ///（转换路径错误整形共用；防 resp 已被流式预读消费后的 expect panic）。
 /// deadline 兜底僵死流（连接加固）。
+/// F5：SSE 预读流分支同样受 [`MAX_UPSTREAM_BODY_BYTES`] 上限约束——超限返回
+/// Err，调用方按读体失败归因（body_read_error 家族）换候选；resp 分支沿用
+/// read_body_capped 语义（读失败/超限 → 空体，错误整形路径容错，终局状态码
+/// 不失真）。
 async fn collect_stream_or_body(
     stream_opt: &mut Option<
         Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error + Send + Sync>>> + Send>>,
     >,
     resp: &mut Option<reqwest::Response>,
     deadline: Duration,
-) -> Vec<u8> {
-    if let Some(mut stream) = stream_opt.take() {
-        let mut buf = Vec::new();
-        while let Some(chunk) = StreamExt::next(&mut stream).await {
-            match chunk {
-                Ok(b) => buf.extend_from_slice(&b),
-                Err(_) => break,
-            }
-        }
-        return buf;
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    if let Some(stream) = stream_opt.take() {
+        return collect_capped_stream(stream, MAX_UPSTREAM_BODY_BYTES).await;
     }
     match resp.take() {
-        Some(r) => read_body_capped(r, MAX_UPSTREAM_BODY_BYTES, deadline)
+        Some(r) => Ok(read_body_capped(r, MAX_UPSTREAM_BODY_BYTES, deadline)
             .await
             .unwrap_or_default()
-            .to_vec(),
-        None => Vec::new(),
+            .to_vec()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -3335,7 +3789,7 @@ async fn send_upstream(
     st: &AppState,
     provider: &Provider,
     provider_key: &str,
-    body: &[u8],
+    body: &Bytes,
     endpoint: Endpoint,
     request_id: Uuid,
     streamed: bool,
@@ -3448,7 +3902,9 @@ async fn send_upstream(
             }
         }
     }
-    req = req.body(body.to_vec());
+    // F8/F9：出站体全链路 Bytes——reqwest body 直收 Bytes（引用计数，无
+    // memcpy），多候选重试不再逐次 to_vec 深拷贝整份请求体
+    req = req.body(body.clone());
     if streamed {
         req = req.header(header::ACCEPT, "text/event-stream");
     } else {
@@ -3884,7 +4340,18 @@ fn wrap_stream(
                 // 记账只在终态事件（[DONE]/response.*/message_stop）触发一次
                 if done && !ctx.recorded.swap(true, Ordering::SeqCst) {
                     let u = ctx.captured.lock().take();
-                    usage::record(&ctx.st, &ctx.meta, u.as_ref(), record_status, latency).await;
+                    // F4（连接加固）：最终记账 spawn 化——记账 await 卡在半途随流
+                    // 被取消（客户端断开/轮询器丢弃）会丢账；owned 副本进 spawned
+                    // task 脱离流生命周期，尽力落库（BillingOnDrop 同款）。gen_ms
+                    // spawn 前锁定，调度延迟不计入生成长度；swap-first 守卫保持
+                    // 不变（happy path 幂等）
+                    let st = ctx.st.clone();
+                    let meta = ctx.meta.clone();
+                    let gen_ms = usage::gen_ms_at(&meta, latency);
+                    tokio::spawn(async move {
+                        usage::record_with_gen_ms(&st, &meta, u.as_ref(), record_status, latency, gen_ms)
+                            .await;
+                    });
                 }
                 Ok::<Bytes, Box<dyn Error + Send + Sync>>(chunk)
             }
@@ -3905,7 +4372,14 @@ fn wrap_stream(
             // 上游未正常结束（无 [DONE]/usage）时兜底记账
             if !ctx.recorded.swap(true, Ordering::SeqCst) {
                 let u = ctx.captured.lock().take();
-                usage::record(&ctx.st, &ctx.meta, u.as_ref(), record_status, latency).await;
+                // F4：最终记账 spawn 化（同上）——gen_ms 先锁定，流取消不再丢账
+                let st = ctx.st.clone();
+                let meta = ctx.meta.clone();
+                let gen_ms = usage::gen_ms_at(&meta, latency);
+                tokio::spawn(async move {
+                    usage::record_with_gen_ms(&st, &meta, u.as_ref(), record_status, latency, gen_ms)
+                        .await;
+                });
             }
             Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::new())
         }
@@ -5202,6 +5676,31 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         )
     }
 
+    /// 一次性假上游（洪流变体）：回写预置头 + 帧后持续写同一帧，直至客户端
+    /// 断开（M-4 测试用：驱动 collect 错误体 128MiB 上限 Err 分支；读满断开
+    /// 后 write 失败即退出，不要求发满声明的 Content-Length）
+    async fn spawn_flooding_upstream(head: String, frame: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(frame.as_bytes()).await;
+            for _ in 0..60_000 {
+                if sock.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
     fn test_provider(
         id: i64,
         api_type: &str,
@@ -5274,6 +5773,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             test_provider(2, "anthropic", &format!("http://{upstream}"), "sk-ok", &st.cfg.master_key);
         *st.providers.write() = vec![broken, healthy];
         *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        st.rebuild_provider_keys_from_memory();
         // 半开：1 次失败即开闸（open_secs=0 → 窗口立即到期）；探测名额由
         // 候选循环内的 allow() 消费（唯一消费者），不在夹具里预占
         st.breaker.record_failure(1);
@@ -5320,6 +5820,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         let unused = test_provider(2, "anthropic", "http://127.0.0.1:9", "sk-u", &st.cfg.master_key);
         *st.providers.write() = vec![converted, unused];
         *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        st.rebuild_provider_keys_from_memory();
         // 半开：探测名额由候选循环内的 allow() 消费（唯一消费者）
         st.breaker.record_failure(1);
 
@@ -5357,6 +5858,75 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(
             snap.window_requests, 1,
             "必须恰好结算一次（重复结算会计 2 次窗口请求）"
+        );
+    }
+
+    /// M-4（QC1-M-1）：converted SSE 错误体读失败（超 128MiB 读体上限）换家后，
+    /// 尾段错误上下文必须归属实际最后失败的候选——此前该 Err 分支不写
+    /// last_failed，上下文落回 candidates[0]。p1 先以「首字节前断流」臂归因
+    /// （last_failed=p1 + last_failure=502 信封）；p2 预读提交首帧后错误体洪流
+    /// 超读体上限 → 走被修的 collect Err 臂换家；终局透传 p1 的 502 信封按
+    /// Anthropic 方言整形，provider 上下文必须指向 p2（修复前为 p1）。
+    #[tokio::test]
+    async fn converted_sse_body_read_failure_attributes_last_candidate() {
+        let mut st = crate::state::AppState::test_fixture();
+        probe_fixture(&mut st);
+        // p1：SSE content-type + 空体 → 预读「首字节前断流」臂（既有归因）
+        let p1_upstream = spawn_one_shot_upstream(http_response(
+            "HTTP/1.1 406 Not Acceptable",
+            "text/event-stream",
+            "",
+        ))
+        .await;
+        // p2：首帧可提交（与既有 406 SSE 测试同形），错误体洪流超读体上限
+        let frame = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+            "x".repeat(3072),
+        );
+        let head = "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/event-stream\r\n\
+                    Content-Length: 1073741824\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let p2_upstream = spawn_flooding_upstream(head, frame).await;
+        let p1 = test_provider(1, "openai", &format!("http://{p1_upstream}"), "sk-1", &st.cfg.master_key);
+        let p2 = test_provider(2, "openai", &format!("http://{p2_upstream}"), "sk-2", &st.cfg.master_key);
+        *st.providers.write() = vec![p1, p2];
+        *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        st.rebuild_provider_keys_from_memory();
+
+        let json = serde_json::json!({
+            "model": "t-model",
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/messages",
+                upstream: "/messages",
+                responses: false,
+                anthropic: true,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect("全候选耗尽经 last_failure 透传终局响应");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "p1 的 502 信封状态透传");
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        let body = String::from_utf8(body).expect("utf8 body");
+        assert!(
+            body.contains("provider=p2"),
+            "尾段错误上下文必须归属实际最后失败的 p2：{body}"
+        );
+        assert!(
+            !body.contains("provider=p1"),
+            "不得落回 candidates[0]（p1 非最后失败候选）：{body}"
         );
     }
 
@@ -5484,34 +6054,64 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     }
 
     /// 入口解析（挂用户并发 guard 前的唯一一次解压+解析）：identity 直通、
-    /// gzip 解压、坏 JSON / 不支持编码 → 400；模型提取空/缺失 → None
-    #[test]
-    fn parse_request_json_at_entry_and_requested_model() {
+    /// gzip 解压、坏 JSON / 不支持编码 → 400；模型提取空/缺失 → None。
+    /// F1：返回解压后长度（identity 与原始一致）；M-1 并发修复：guard 随
+    /// 三元组归还，解码期逐块入账其预留。
+    #[tokio::test]
+    async fn parse_request_json_at_entry_and_requested_model() {
         use std::io::Write;
         let raw = br#"{"model":"gpt-x","messages":[]}"#;
-        let json = parse_request_json(&Bytes::from_static(raw), &HeaderMap::new()).unwrap();
+        let (json, len, _guard) = parse_request_json(
+            &Bytes::from_static(raw),
+            &HeaderMap::new(),
+            BufferGuard::unbounded(),
+            MAX_DECOMPRESSED_BODY_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(requested_model(&json).as_deref(), Some("gpt-x"));
+        assert_eq!(len, raw.len(), "identity 体解压后长度不变");
 
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         enc.write_all(raw).unwrap();
         let gz = enc.finish().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let json = parse_request_json(&Bytes::from(gz.clone()), &headers).unwrap();
+        let (json, len, _guard) = parse_request_json(
+            &Bytes::from(gz.clone()),
+            &headers,
+            BufferGuard::unbounded(),
+            MAX_DECOMPRESSED_BODY_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             requested_model(&json).as_deref(),
             Some("gpt-x"),
             "gzip 请求体解压后解析"
         );
+        assert_eq!(len, raw.len(), "解压后长度为明文长度");
 
         assert!(matches!(
-            parse_request_json(&Bytes::from_static(b"{not json"), &HeaderMap::new()),
+            parse_request_json(
+                &Bytes::from_static(b"{not json"),
+                &HeaderMap::new(),
+                BufferGuard::unbounded(),
+                MAX_DECOMPRESSED_BODY_BYTES
+            )
+            .await,
             Err(AppError::BadRequest(_))
         ));
         let mut bad = HeaderMap::new();
         bad.insert(header::CONTENT_ENCODING, "lzma".parse().unwrap());
         assert!(matches!(
-            parse_request_json(&Bytes::from(gz), &bad),
+            parse_request_json(
+                &Bytes::from(gz),
+                &bad,
+                BufferGuard::unbounded(),
+                MAX_DECOMPRESSED_BODY_BYTES
+            )
+            .await,
             Err(AppError::BadRequest(_))
         ));
 
@@ -5521,5 +6121,240 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             None
         );
         assert_eq!(requested_model(&serde_json::json!({ "model": 1 })), None);
+    }
+
+    /// M-1：解压上限接静态预算容量——绝对上限作用于解码输出侧 take（膨胀到
+    /// 上限附近即中止读取，不再先物化完整明文再事后校验）：超预算膨胀 → 413
+    /// request_too_large（不再伪装 400）；上限内正常解压；identity 直通体
+    /// 不膨胀，不受上限约束。动态余量裁定在解码期逐块入账侧。
+    #[tokio::test]
+    async fn parse_request_json_decode_cap_aborts_over_budget_inflate() {
+        use std::io::Write;
+        // 高压缩比载荷（1MiB 全零填充的合法 JSON，gzip 后 ~1KiB）模拟 gzip 炸弹
+        let raw = format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(1024 * 1024))
+            .into_bytes();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let gz = Bytes::from(enc.finish().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        // 上限充足（常量上限）：完整解压解析
+        let (json, len, _guard) = parse_request_json(
+            &gz,
+            &headers,
+            BufferGuard::unbounded(),
+            MAX_DECOMPRESSED_BODY_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(len, raw.len(), "上限内解压出完整明文");
+        assert_eq!(requested_model(&json).as_deref(), Some("m"));
+
+        // 上限不足（小上限注入）：解码中途撞上限 → 413，错误带上限信息
+        let cap = 16 * 1024;
+        let err = parse_request_json(
+            &gz,
+            &headers,
+            BufferGuard::unbounded(),
+            cap,
+        )
+        .await
+        .unwrap_err();
+        let AppError::PayloadTooLarge(msg) = &err else {
+            panic!("超预算解压必须 413 request_too_large：{err:?}");
+        };
+        assert!(msg.contains(&cap.to_string()), "错误须带上限信息：{msg}");
+
+        // identity 直通体不膨胀：上限只约束解压膨胀，不误伤直通体
+        //（无 Content-Encoding 时整体跳过解码，返回原始体）
+        let passthrough =
+            decompress_request_body(&raw, None, &mut BufferGuard::unbounded(), 4)
+                .expect("identity 直通不受解压上限约束");
+        assert_eq!(passthrough.len(), raw.len());
+    }
+
+    /// M-1 并发修复回归（跨请求聚合，原套件缺失的覆盖）：N=8 并发任务对同一份
+    /// 共享预算解码 gzip 炸弹——解码输出逐块 try_grow 互斥入账，任一瞬时
+    /// Σ预留 ≤ 容量（peak 结构化断言），全部 413 且失败炸弹即刻让出预算。
+    /// 旧实现（已废除）：各解码器独立快照同一份余量 take，聚合 N×余量物化
+    /// 后才事后 resize——并发炸弹 OOM 根因，单请求测试不可见。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_bombs_aggregate_charges_against_shared_budget() {
+        use std::io::Write;
+
+        const CAP: u64 = 64 * 1024 * 1024;
+        let budget = crate::state::BufferBudget::new(CAP);
+        // 预占 56MiB（模拟其他在途请求）：余量 ~8MiB < 单弹 16MiB 膨胀——
+        // 每个解码器都无法完整解出，「全部 413」与调度时序无关（确定性）
+        let hold = budget.try_acquire(56 * 1024 * 1024).expect("预占不应被拒");
+        let raw = format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(16 * 1024 * 1024))
+            .into_bytes();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let gz = Bytes::from(enc.finish().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let budget = budget.clone();
+                let gz = gz.clone();
+                let headers = headers.clone();
+                tokio::spawn(async move {
+                    // 与 BufLimitedBody 同款：入口按 wire（Content-Length）预留
+                    let Some(guard) = budget.try_acquire(gz.len() as u64) else {
+                        panic!("wire 预留不应被拒");
+                    };
+                    let decode_cap = decode_ceiling(guard.capacity_bytes());
+                    parse_request_json(&gz, &headers, guard, decode_cap).await
+                })
+            })
+            .collect();
+        for h in handles {
+            let err = h
+                .await
+                .expect("任务不应 panic")
+                .expect_err("余量 ~8MiB < 16MiB 膨胀，必须全部 413");
+            assert!(
+                matches!(err, AppError::PayloadTooLarge(_)),
+                "并发炸弹必须 413 request_too_large：{err:?}"
+            );
+        }
+        // 任一瞬时 Σ预留 ≤ 容量（峰值在互斥临界区内采样，无双记账瞬窗）；
+        // 且解码期入账确实发生（峰值越过预占线）
+        assert!(
+            budget.peak_in_use() <= CAP,
+            "Σ预留峰值 {} 不得超过容量 {CAP}",
+            budget.peak_in_use()
+        );
+        assert!(
+            budget.peak_in_use() > 56 * 1024 * 1024,
+            "解码期入账未发生（峰值 {} 未越过预占线）",
+            budget.peak_in_use()
+        );
+        // 失败炸弹已让出全部入账与 raw 预留：仅剩主任务预占
+        assert_eq!(budget.in_use(), 56 * 1024 * 1024, "失败炸弹即刻释放");
+        drop(hold);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// 顺序炸弹仍逐次 413（每次失败后预算归零，可反复拒绝）；预算内解码
+    /// 通过且 guard 预留精确收敛至明文长度（解码期入账 + 入口 resize 收缩）。
+    #[tokio::test]
+    async fn sequential_bombs_still_413_and_within_budget_decode_reconciles() {
+        use std::io::Write;
+        let make_bomb = |pad: usize| -> (Bytes, HeaderMap) {
+            let raw =
+                format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(pad)).into_bytes();
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&raw).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+            (Bytes::from(enc.finish().unwrap()), headers)
+        };
+
+        // 顺序两弹：4MiB 预算 < 16MiB 膨胀，逐次 413
+        let budget = crate::state::BufferBudget::new(4 * 1024 * 1024);
+        let (gz, headers) = make_bomb(16 * 1024 * 1024);
+        for _ in 0..2 {
+            let guard = budget
+                .try_acquire(gz.len() as u64)
+                .expect("wire 预留不应被拒");
+            let decode_cap = decode_ceiling(guard.capacity_bytes());
+            let err = parse_request_json(&gz, &headers, guard, decode_cap)
+                .await
+                .expect_err("超预算膨胀必须 413");
+            assert!(matches!(err, AppError::PayloadTooLarge(_)));
+            assert_eq!(budget.in_use(), 0, "失败炸弹不占坑，下一弹同判");
+        }
+
+        // 预算内解码：guard 预留 = raw + 解码入账，入口 resize 收缩后精确
+        // 等于明文长度（raw 差额即刻归还）
+        let budget = crate::state::BufferBudget::new(64 * 1024 * 1024);
+        let (gz, headers) = make_bomb(4 * 1024 * 1024);
+        let guard = budget
+            .try_acquire(gz.len() as u64)
+            .expect("wire 预留不应被拒");
+        let decode_cap = decode_ceiling(guard.capacity_bytes());
+        let (json, plain_len, mut guard) =
+            parse_request_json(&gz, &headers, guard, decode_cap)
+                .await
+                .expect("预算内解码必须通过");
+        assert_eq!(requested_model(&json).as_deref(), Some("m"));
+        guard
+            .resize_to(plain_len as u64)
+            .expect("收缩收敛不应失败");
+        assert_eq!(
+            budget.in_use(),
+            plain_len as u64,
+            "成功路径预留精确收敛至明文长度"
+        );
+        drop(guard);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// 解码错误释放解码期入账：CRC 损坏的 gzip 膨胀出部分明文（入账已发生）
+    /// 后报 Decode（非预算拒收），guard 预留缩回 raw（压缩 wire 长度）——
+    /// 失败的炸弹即刻让出预算，不占坑到 guard Drop。
+    #[test]
+    fn decode_error_releases_decode_time_charges_to_raw() {
+        use std::io::Write;
+        let budget = crate::state::BufferBudget::new(64 * 1024 * 1024);
+        let raw = format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(4 * 1024 * 1024))
+            .into_bytes();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let mut gz = enc.finish().unwrap();
+        // 损坏 gzip 尾部 CRC32（末 8 字节 = CRC32 + ISIZE）：解码全程膨胀后
+        // 校验失败 → Decode 错误
+        let last = gz.len() - 8;
+        gz[last] ^= 0xff;
+
+        let mut guard = budget
+            .try_acquire(gz.len() as u64)
+            .expect("wire 预留不应被拒");
+        let cap = decode_ceiling(guard.capacity_bytes());
+        let err = decompress_request_body(&gz, Some("gzip"), &mut guard, cap)
+            .expect_err("CRC 损坏必须解码失败");
+        assert!(
+            matches!(err, DecompressError::Decode(_)),
+            "CRC 损坏归因解码错误而非预算拒收：{err:?}"
+        );
+        // 解码期入账已释放，guard 缩回 raw：预算占用恰为压缩 wire 长度
+        assert_eq!(
+            budget.in_use(),
+            gz.len() as u64,
+            "失败炸弹缩回 raw wire 预留"
+        );
+        drop(guard);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// F5：SSE 预读错误体累积受上限约束——超限返回 Err（文案带上限，调用方
+    /// classify_body_read_failure 归因 body_read_error 家族换家）；上限内的
+    /// 体正常拼接收集。
+    #[tokio::test]
+    async fn collect_capped_stream_enforces_cap() {
+        let over: Vec<Result<Bytes, Box<dyn Error + Send + Sync>>> = vec![
+            Ok(Bytes::from(vec![b'a'; 600])),
+            Ok(Bytes::from(vec![b'b'; 600])),
+        ];
+        let err = collect_capped_stream(Box::pin(futures_util::stream::iter(over)), 1024)
+            .await
+            .expect_err("超限必须返回 Err");
+        assert!(
+            err.to_string().contains("exceeds 1024 bytes"),
+            "超限错误须带上限信息：{err}"
+        );
+
+        let within: Vec<Result<Bytes, Box<dyn Error + Send + Sync>>> = vec![
+            Ok(Bytes::from_static(b"hello")),
+            Ok(Bytes::from_static(b" world")),
+        ];
+        let ok = collect_capped_stream(Box::pin(futures_util::stream::iter(within)), 1024)
+            .await
+            .expect("上限内应正常收集");
+        assert_eq!(ok, b"hello world");
     }
 }

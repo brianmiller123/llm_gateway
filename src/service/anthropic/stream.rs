@@ -790,14 +790,25 @@ pub fn wrap_chat_stream_to_anthropic(
                                 (frames, state.billing_usage())
                             };
                             if !ctx.recorded.swap(true, Ordering::SeqCst) {
-                                crate::service::usage::record(
-                                    &ctx.st,
-                                    &ctx.meta,
-                                    usage.as_ref(),
-                                    record_status,
-                                    latency,
-                                )
-                                .await;
+                                // F4（连接加固）：最终记账 spawn 化——记账 await 卡在半途
+                                // 随流被取消（客户端断开/轮询器丢弃）会丢账；owned 副本
+                                // 进 spawned task 脱离流生命周期，尽力落库（BillingOnDrop
+                                // 同款）。gen_ms spawn 前锁定，调度延迟不计入生成长度；
+                                // swap-first 守卫保持不变（happy path 幂等）
+                                let st = ctx.st.clone();
+                                let meta = ctx.meta.clone();
+                                let gen_ms = crate::service::usage::gen_ms_at(&meta, latency);
+                                tokio::spawn(async move {
+                                    crate::service::usage::record_with_gen_ms(
+                                        &st,
+                                        &meta,
+                                        usage.as_ref(),
+                                        record_status,
+                                        latency,
+                                        gen_ms,
+                                    )
+                                    .await;
+                                });
                             }
                             return Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::from(frames));
                         }
@@ -852,14 +863,21 @@ pub fn wrap_chat_stream_to_anthropic(
                     };
                     out.extend_from_slice(&final_frames);
                     if !ctx.recorded.swap(true, Ordering::SeqCst) {
-                        crate::service::usage::record(
-                            &ctx.st,
-                            &ctx.meta,
-                            usage.as_ref(),
-                            record_status,
-                            latency,
-                        )
-                        .await;
+                        // F4：最终记账 spawn 化（同上）——gen_ms 先锁定，流取消不再丢账
+                        let st = ctx.st.clone();
+                        let meta = ctx.meta.clone();
+                        let gen_ms = crate::service::usage::gen_ms_at(&meta, latency);
+                        tokio::spawn(async move {
+                            crate::service::usage::record_with_gen_ms(
+                                &st,
+                                &meta,
+                                usage.as_ref(),
+                                record_status,
+                                latency,
+                                gen_ms,
+                            )
+                            .await;
+                        });
                     }
                 }
                 Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::from(out))
@@ -885,14 +903,21 @@ pub fn wrap_chat_stream_to_anthropic(
                     (frames, state.billing_usage())
                 };
                 if !ctx.recorded.swap(true, Ordering::SeqCst) {
-                    crate::service::usage::record(
-                        &ctx.st,
-                        &ctx.meta,
-                        usage.as_ref(),
-                        record_status,
-                        latency,
-                    )
-                    .await;
+                    // F4：最终记账 spawn 化（同上）——gen_ms 先锁定，流取消不再丢账
+                    let st = ctx.st.clone();
+                    let meta = ctx.meta.clone();
+                    let gen_ms = crate::service::usage::gen_ms_at(&meta, latency);
+                    tokio::spawn(async move {
+                        crate::service::usage::record_with_gen_ms(
+                            &st,
+                            &meta,
+                            usage.as_ref(),
+                            record_status,
+                            latency,
+                            gen_ms,
+                        )
+                        .await;
+                    });
                 }
                 Ok::<Bytes, Box<dyn Error + Send + Sync>>(Bytes::from(final_frames))
             } else {

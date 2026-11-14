@@ -25,6 +25,8 @@ use serde_json::json;
 use sqlx::FromRow;
 use std::collections::HashMap;
 
+use parking_lot::Mutex;
+
 use crate::error::AppError;
 use crate::service::health::{self, ProbeResult, Verdict};
 use crate::state::AppState;
@@ -67,7 +69,7 @@ const INCIDENT_RATE: f64 = 0.5;
 const UPTIME_DAYS: i64 = 30;
 const MAX_INCIDENTS: usize = 20;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct StatusResp {
     generated_at: DateTime<Utc>,
     overall: &'static str,
@@ -78,7 +80,7 @@ struct StatusResp {
     active_requests: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ComponentOut {
     key: String,
     name: String,
@@ -93,7 +95,7 @@ struct ComponentOut {
 }
 
 /// 主动健康探测元数据（前端据此展示「探测正常/异常」与依据）
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ProbeMeta {
     endpoint: String,
     http_status: Option<u16>,
@@ -102,14 +104,14 @@ struct ProbeMeta {
     verdict: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct UptimeSeries {
     key: String,
     name: String,
     days: Vec<DayPoint>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct DayPoint {
     date: NaiveDate,
     success_rate: Option<f64>,
@@ -117,7 +119,7 @@ struct DayPoint {
     errors: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct IncidentOut {
     provider_id: i64,
     provider_name: String,
@@ -158,7 +160,83 @@ struct HourRow {
     errors: i64,
 }
 
+// ---------------------------------------------------------------------------
+// F3（连接加固）：/status 载荷 30s TTL 缓存
+// ---------------------------------------------------------------------------
+
+/// /status 无鉴权，任何观察者都能高频轮询；每次未命中都要跑 3 个 30 天窗口
+/// 聚合（usage_logs GROUP BY）+ providers 快照，直接挤占代理主链路的连接池
+/// （连接池饥饿）。完整载荷缓存 30s——命中零 SQL；与供应商探测（service::
+/// health）30s 缓存同口径，状态页对 30s 级数据延迟不敏感。
+static STATUS_CACHE: Mutex<Option<(std::time::Instant, StatusResp)>> = Mutex::new(None);
+
+/// L-e（QC2-L-7）：重建单飞旗标——CAS 认领（false→true），赢家 Drop 复位。
+/// 仅在缓存过期的未命中路径触及，命中路径零开销。
+static STATUS_RECALC_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// L-e：赢家守护——持有期间单飞旗标置位，Drop（含 unwind）复位，重建
+/// panic 不再让旗标永久卡死（卡死只损失单飞合并，不阻塞请求）
+struct RecalcGuard;
+impl Drop for RecalcGuard {
+    fn drop(&mut self) {
+        STATUS_RECALC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// L-e：输家等待窗口——覆盖常规重建时长，仍未命中则自行重建兜底
+const STATUS_RECALC_LOSER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 载荷缓存 TTL（30s，与供应商探测缓存同口径）
+const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TTL 判定 + 载荷取出（now 由调用方注入，sleep-free 单测）
+fn cached_payload(
+    cache: &Option<(std::time::Instant, StatusResp)>,
+    now: std::time::Instant,
+) -> Option<StatusResp> {
+    let (at, payload) = cache.as_ref()?;
+    (now.saturating_duration_since(*at) < STATUS_CACHE_TTL).then(|| payload.clone())
+}
+
 async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
+    // F3：命中 30s 载荷缓存直接返回——无鉴权轮询不再打连接池（零 SQL）
+    if let Some(payload) = cached_payload(&STATUS_CACHE.lock(), std::time::Instant::now()) {
+        return Ok(Json(payload).into_response());
+    }
+    // L-e（QC2-L-7）：过期窗口内的并发未命中单飞——一个赢家独占重建并回填
+    // 缓存（3×30 天窗口聚合不再被雷群重复打池），输家短暂等待缓存回填后
+    // 复查；仍未就绪（重建慢于等待窗口/赢家 panic）自行重建兜底，不卡请求
+    let resp = if STATUS_RECALC_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let _claim = RecalcGuard;
+        let resp = build_status_payload(&st).await;
+        // F3：填充 30s 载荷缓存（同结构体序列化，载荷形状不变）
+        *STATUS_CACHE.lock() = Some((std::time::Instant::now(), resp.clone()));
+        resp
+    } else {
+        tokio::time::sleep(STATUS_RECALC_LOSER_WAIT).await;
+        // 先取出结果再 match：锁临时量不得跨 await 存活（future 需 Send）
+        let cached = cached_payload(&STATUS_CACHE.lock(), std::time::Instant::now());
+        match cached {
+            Some(payload) => payload,
+            // 输家兜底：赢家仍慢/已恐慌 → 自行重建（不回填，赢家负责回填）
+            None => build_status_payload(&st).await,
+        }
+    };
+    Ok(Json(resp).into_response())
+}
+
+/// 完整状态载荷构建（实时窗口统计 + 30 天可用率 + 事故 + 探测融合）。
+/// L-e：仅单飞赢家 / 等待后仍未命中的输家兜底调用，结果由赢家回填缓存。
+async fn build_status_payload(st: &AppState) -> StatusResp {
     let started = std::time::Instant::now();
     let db_ok = sqlx::query("SELECT 1").execute(&st.pool).await.is_ok();
     let db_latency = started.elapsed().as_millis() as i64;
@@ -338,7 +416,7 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         "operational"
     };
 
-    Ok(Json(StatusResp {
+    StatusResp {
         generated_at: Utc::now(),
         overall,
         components,
@@ -347,8 +425,7 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         active_requests: st
             .active_requests
             .load(std::sync::atomic::Ordering::Relaxed),
-    })
-    .into_response())
+    }
 }
 
 /// 供应商实时状态：按 10 分钟 → 60 分钟 → 24 小时顺序取首个样本充足的窗口
@@ -529,6 +606,83 @@ fn build_incidents(rows: Vec<HourRow>, names: &HashMap<i64, String>) -> Vec<Inci
 mod tests {
     use super::*;
     use crate::service::health::Verdict;
+    use std::time::Duration as StdDuration;
+    use std::time::Instant as StdInstant;
+
+    // ---------- F3：载荷缓存 TTL（now 注入，sleep-free） ----------
+
+    fn payload() -> StatusResp {
+        StatusResp {
+            generated_at: Utc::now(),
+            overall: "operational",
+            components: Vec::new(),
+            uptime: Vec::new(),
+            incidents: Vec::new(),
+            active_requests: 0,
+        }
+    }
+
+    #[test]
+    fn cache_misses_empty_then_hits_within_ttl() {
+        let mut cache: Option<(StdInstant, StatusResp)> = None;
+        assert!(cached_payload(&cache, StdInstant::now()).is_none(), "空缓存未命中");
+
+        let at = StdInstant::now();
+        cache = Some((at, payload()));
+        // TTL 内命中（含边界前一瞬）
+        assert!(cached_payload(&cache, at + StdDuration::from_secs(1)).is_some());
+        assert!(
+            cached_payload(&cache, at + STATUS_CACHE_TTL - StdDuration::from_secs(1)).is_some()
+        );
+        // 越过 TTL 未命中
+        assert!(cached_payload(&cache, at + STATUS_CACHE_TTL).is_none());
+        assert!(
+            cached_payload(&cache, at + STATUS_CACHE_TTL + StdDuration::from_secs(1)).is_none()
+        );
+    }
+
+    #[test]
+    fn status_payload_json_shape_stable() {
+        // 公开端点载荷形状是契约：顶层键集合不得因缓存改动
+        let v = serde_json::to_value(&payload()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "active_requests",
+                "components",
+                "generated_at",
+                "incidents",
+                "overall",
+                "uptime"
+            ]
+        );
+    }
+
+    /// L-e：单飞旗标 CAS 认领互斥（赢家唯一，输家走等待路径的前提），
+    /// RecalcGuard Drop 复位——赢家正常返回与 unwind 共用同一路径，旗标不残留
+    #[test]
+    fn recalc_single_flight_claim_exclusive_and_drop_resets() {
+        use std::sync::atomic::Ordering;
+        assert!(
+            STATUS_RECALC_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "空闲旗标必须可认领"
+        );
+        assert!(
+            STATUS_RECALC_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err(),
+            "持有中旗标必须拒绝第二认领"
+        );
+        drop(RecalcGuard);
+        assert!(
+            !STATUS_RECALC_IN_PROGRESS.load(Ordering::Acquire),
+            "守护 Drop 必须复位旗标"
+        );
+    }
 
     fn probe(v: Verdict) -> ProbeResult {
         ProbeResult {

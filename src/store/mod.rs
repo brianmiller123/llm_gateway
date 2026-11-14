@@ -20,10 +20,17 @@ use crate::crypto::encrypt;
 /// 初始化连接池 + 执行迁移 + 种子上游（providers 为空时）
 pub async fn init(cfg: &AppConfig) -> Result<PgPool, sqlx::Error> {
     let pool = PgPoolOptions::new()
-        .max_connections(10)
-        // 池满时快速失败而非挂约 30s（sqlx 默认 acquire_timeout）；取连接前校验健康
+        // F2（连接加固）：池上限接配置（默认 32），代理主链路与状态页/聚合等
+        // 后台任务共享池时不再挤在硬编码的 10 上
+        .max_connections(cfg.db_max_conns)
+        // 池满时快速失败而非挂约 30s（sqlx 默认 acquire_timeout）；不做
+        // test_before_acquire（每次取连接多一个往返，故障风暴下放大池压力）
         .acquire_timeout(Duration::from_secs(5))
-        .test_before_acquire(true)
+        // L-b（QC2-L-5）：连接寿命/闲置回收——PG 重启、NAT/LB 静默丢弃后的
+        // 僵死连接靠 max_lifetime（30min，错峰重建）与 idle_timeout（5min）
+        // 兜底淘汰，首次使用才撞错
+        .max_lifetime(Duration::from_secs(30 * 60))
+        .idle_timeout(Duration::from_secs(5 * 60))
         .connect(&cfg.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await.map_err(|e| {
@@ -116,4 +123,43 @@ pub async fn force_logout(pool: &PgPool, user_id: i64) -> Result<(), sqlx::Error
     .execute(&mut *tx)
     .await?;
     tx.commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init;
+    use crate::config::AppConfig;
+
+    /// F2 契约：池上限接 cfg.db_max_conns——max=2 时前两个并发获取恰好建满
+    /// 配置上限，第三个获取在窗口内拿不到连接（acquire 阻塞等待而非新建），
+    /// 证明上限不再硬编码 10、也不受未配置默认影响。断连验证同时覆盖
+    /// test_before_acquire 移除：获取路径不再附加每连接健康校验往返。
+    #[tokio::test]
+    async fn pool_caps_at_configured_max_conns() {
+        // 同 state::test_fixture 约定：测试环境无 GATEWAY_MASTER_KEY 时注入
+        // （from_env 强依赖；一次性写入，其余测试只读）
+        if std::env::var("GATEWAY_MASTER_KEY").is_err() {
+            // SAFETY: 单测进程内一次性 env 写入、无并发读者依赖旧值
+            unsafe {
+                std::env::set_var("GATEWAY_MASTER_KEY", "ab".repeat(32));
+            }
+        }
+        let mut cfg = AppConfig::from_env().expect("测试环境配置可用");
+        cfg.database_url =
+            std::env::var("DATABASE_URL").expect("套件运行须设 DATABASE_URL（house 约定）");
+        cfg.db_max_conns = 2;
+        let pool = init(&cfg).await.expect("池构建成功（迁移幂等）");
+
+        let c1 = pool.acquire().await.expect("第一个获取成功");
+        let c2 = pool.acquire().await.expect("第二个获取成功");
+        assert_eq!(pool.size(), 2, "两个并发获取恰好建满配置上限 db_max_conns");
+
+        let third =
+            tokio::time::timeout(std::time::Duration::from_millis(300), pool.acquire()).await;
+        assert!(
+            third.is_err(),
+            "db_max_conns=2 时第三个获取必须等待而非拿到连接（上限未硬编码）"
+        );
+        drop((c1, c2));
+    }
 }

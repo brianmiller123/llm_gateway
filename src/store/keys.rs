@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
-/// API Key 行（仅用于鉴权查询）
-#[derive(Debug, FromRow)]
+/// API Key 行（仅用于鉴权查询；F11 前缀缓存按前缀缓存整组候选行，需 Clone）
+#[derive(Debug, Clone, FromRow)]
 pub struct ApiKeyRow {
     pub id: i64,
     pub user_id: i64,

@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 
 use crate::state::AppState;
-use crate::store::usage::{Usage, UsageMeta, record_usage};
+use crate::store::usage::{Usage, UsageMeta, record_failure_log, record_usage};
 
 /// Plan 当期用量缓存：key = (user_id, plan_id) → (period_key, tokens)。
 /// 记账事务提交后更新；Plan 配额预检查读取；启动/周期从 DB 重载兜底。
@@ -104,6 +104,8 @@ pub async fn record(
 /// NULL）。F3：本函数是 failure_class 非空的唯一入口——状态页/实时聚合以
 /// `failure_class IS NULL` 排除这些内部归因行，只计客户端可见行（含终局
 /// 错误行；终局行保持 failure_class NULL，仅带 upstream_status/attempt）。
+/// F6：归因行走单条 INSERT（record_failure_log），不开记账事务、不推进
+/// 月度/Plan 计数——零 token 行无账可记，故障风暴下免逐行 UPSERT 写放大。
 pub async fn record_failure_row(
     st: &AppState,
     meta: &UsageMeta,
@@ -113,11 +115,30 @@ pub async fn record_failure_row(
     status_out: u16,
     latency_ms: i64,
 ) {
+    // 管理员测试调用不落任何行（与 record 的 test_call 闸门同一语义）
+    if meta.test_call {
+        return;
+    }
     let mut m = meta.clone();
     m.failure_class = Some(class);
     m.upstream_status = upstream_status.map(|s| s as i16);
     m.attempt = attempt.map(|a| a as i16);
-    record(st, &m, None, status_out, latency_ms).await;
+    let gen_ms = gen_ms_at(&m, latency_ms);
+    match record_failure_log(&st.pool, &m, status_out, latency_ms, gen_ms).await {
+        Ok(()) => tracing::info!(
+            request_id = %m.request_id,
+            failure_class = class,
+            upstream_status = ?m.upstream_status,
+            attempt = ?m.attempt,
+            status = status_out,
+            latency_ms,
+            "failure attribution row recorded"
+        ),
+        // 归因行失败不影响客户端响应，仅告警（request_id 保证可对账）
+        Err(e) => {
+            tracing::error!(request_id = %m.request_id, error = %e, "failure attribution record failed")
+        }
+    }
 }
 
 /// 带显式生成阶段耗时的记账（客户端断开兜底在断开时点先算好 gen_ms）。
