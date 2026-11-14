@@ -25,6 +25,8 @@ use serde_json::json;
 use sqlx::FromRow;
 use std::collections::HashMap;
 
+use parking_lot::Mutex;
+
 use crate::error::AppError;
 use crate::service::health::{self, ProbeResult, Verdict};
 use crate::state::AppState;
@@ -67,7 +69,7 @@ const INCIDENT_RATE: f64 = 0.5;
 const UPTIME_DAYS: i64 = 30;
 const MAX_INCIDENTS: usize = 20;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct StatusResp {
     generated_at: DateTime<Utc>,
     overall: &'static str,
@@ -78,7 +80,7 @@ struct StatusResp {
     active_requests: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ComponentOut {
     key: String,
     name: String,
@@ -93,7 +95,7 @@ struct ComponentOut {
 }
 
 /// 主动健康探测元数据（前端据此展示「探测正常/异常」与依据）
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ProbeMeta {
     endpoint: String,
     http_status: Option<u16>,
@@ -102,14 +104,14 @@ struct ProbeMeta {
     verdict: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct UptimeSeries {
     key: String,
     name: String,
     days: Vec<DayPoint>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct DayPoint {
     date: NaiveDate,
     success_rate: Option<f64>,
@@ -117,7 +119,7 @@ struct DayPoint {
     errors: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct IncidentOut {
     provider_id: i64,
     provider_name: String,
@@ -158,7 +160,33 @@ struct HourRow {
     errors: i64,
 }
 
+// ---------------------------------------------------------------------------
+// F3（连接加固）：/status 载荷 30s TTL 缓存
+// ---------------------------------------------------------------------------
+
+/// /status 无鉴权，任何观察者都能高频轮询；每次未命中都要跑 3 个 30 天窗口
+/// 聚合（usage_logs GROUP BY）+ providers 快照，直接挤占代理主链路的连接池
+/// （连接池饥饿）。完整载荷缓存 30s——命中零 SQL；与供应商探测（service::
+/// health）30s 缓存同口径，状态页对 30s 级数据延迟不敏感。
+static STATUS_CACHE: Mutex<Option<(std::time::Instant, StatusResp)>> = Mutex::new(None);
+
+/// 载荷缓存 TTL（30s，与供应商探测缓存同口径）
+const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TTL 判定 + 载荷取出（now 由调用方注入，sleep-free 单测）
+fn cached_payload(
+    cache: &Option<(std::time::Instant, StatusResp)>,
+    now: std::time::Instant,
+) -> Option<StatusResp> {
+    let (at, payload) = cache.as_ref()?;
+    (now.saturating_duration_since(*at) < STATUS_CACHE_TTL).then(|| payload.clone())
+}
+
 async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
+    // F3：命中 30s 载荷缓存直接返回——无鉴权轮询不再打连接池（零 SQL）
+    if let Some(payload) = cached_payload(&STATUS_CACHE.lock(), std::time::Instant::now()) {
+        return Ok(Json(payload).into_response());
+    }
     let started = std::time::Instant::now();
     let db_ok = sqlx::query("SELECT 1").execute(&st.pool).await.is_ok();
     let db_latency = started.elapsed().as_millis() as i64;
@@ -338,7 +366,7 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         "operational"
     };
 
-    Ok(Json(StatusResp {
+    let resp = StatusResp {
         generated_at: Utc::now(),
         overall,
         components,
@@ -347,8 +375,10 @@ async fn status(State(st): State<AppState>) -> Result<Response, AppError> {
         active_requests: st
             .active_requests
             .load(std::sync::atomic::Ordering::Relaxed),
-    })
-    .into_response())
+    };
+    // F3：填充 30s 载荷缓存（同结构体序列化，载荷形状不变）
+    *STATUS_CACHE.lock() = Some((std::time::Instant::now(), resp.clone()));
+    Ok(Json(resp).into_response())
 }
 
 /// 供应商实时状态：按 10 分钟 → 60 分钟 → 24 小时顺序取首个样本充足的窗口
@@ -529,6 +559,59 @@ fn build_incidents(rows: Vec<HourRow>, names: &HashMap<i64, String>) -> Vec<Inci
 mod tests {
     use super::*;
     use crate::service::health::Verdict;
+    use std::time::Duration as StdDuration;
+    use std::time::Instant as StdInstant;
+
+    // ---------- F3：载荷缓存 TTL（now 注入，sleep-free） ----------
+
+    fn payload() -> StatusResp {
+        StatusResp {
+            generated_at: Utc::now(),
+            overall: "operational",
+            components: Vec::new(),
+            uptime: Vec::new(),
+            incidents: Vec::new(),
+            active_requests: 0,
+        }
+    }
+
+    #[test]
+    fn cache_misses_empty_then_hits_within_ttl() {
+        let mut cache: Option<(StdInstant, StatusResp)> = None;
+        assert!(cached_payload(&cache, StdInstant::now()).is_none(), "空缓存未命中");
+
+        let at = StdInstant::now();
+        cache = Some((at, payload()));
+        // TTL 内命中（含边界前一瞬）
+        assert!(cached_payload(&cache, at + StdDuration::from_secs(1)).is_some());
+        assert!(
+            cached_payload(&cache, at + STATUS_CACHE_TTL - StdDuration::from_secs(1)).is_some()
+        );
+        // 越过 TTL 未命中
+        assert!(cached_payload(&cache, at + STATUS_CACHE_TTL).is_none());
+        assert!(
+            cached_payload(&cache, at + STATUS_CACHE_TTL + StdDuration::from_secs(1)).is_none()
+        );
+    }
+
+    #[test]
+    fn status_payload_json_shape_stable() {
+        // 公开端点载荷形状是契约：顶层键集合不得因缓存改动
+        let v = serde_json::to_value(&payload()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "active_requests",
+                "components",
+                "generated_at",
+                "incidents",
+                "overall",
+                "uptime"
+            ]
+        );
+    }
 
     fn probe(v: Verdict) -> ProbeResult {
         ProbeResult {

@@ -252,6 +252,53 @@ pub async fn record_usage(
     tx.commit().await
 }
 
+/// 失败归因行直写（连接加固/F6）：单条 INSERT，不开事务、不推进
+/// user_monthly_usage / plan_usage_counters——归因行零 token 零成本，月度/
+/// Plan 计数无账可记，此前的逐行事务 UPSERT 是纯写放大（上游故障风暴下
+/// 每请求可产生多条候选归因行，全部挤在共享池上）。列集合与 record_usage
+/// 的明细 INSERT 保持一致；成功/终局记账仍走 record_usage 全量事务。
+pub async fn record_failure_log(
+    pool: &PgPool,
+    meta: &UsageMeta,
+    status: u16,
+    latency_ms: i64,
+    gen_ms: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO usage_logs
+           (request_id, user_id, api_key_id, model, provider_id, endpoint, streamed,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            latency_ms, status, cost, client_ip, session_id, first_token_ms, gen_ms,
+            failure_class, upstream_status, attempt)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::inet,$16,$17,$18,$19,$20,$21)",
+    )
+    .bind(meta.request_id)
+    .bind(meta.user_id)
+    .bind(meta.api_key_id)
+    .bind(&meta.model)
+    .bind(meta.provider_id)
+    .bind(meta.endpoint)
+    .bind(meta.streamed)
+    // 归因行零 token 零成本（usage 恒 None，cost 恒 0）
+    .bind(None::<i64>)
+    .bind(None::<i64>)
+    .bind(None::<i64>)
+    .bind(None::<i64>)
+    .bind(latency_ms as i32)
+    .bind(status as i16)
+    .bind(0.0_f64)
+    .bind(meta.client_ip.map(|ip| ip.to_string()))
+    .bind(meta.session_id.as_deref())
+    .bind(meta.first_token_ms)
+    .bind(gen_ms)
+    .bind(meta.failure_class)
+    .bind(meta.upstream_status)
+    .bind(meta.attempt)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 聚合任务：将增量 usage_logs 汇总进 usage_daily（水位线防重复）
 ///
 /// 修复两个并发缺陷：
@@ -298,9 +345,36 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
     tx.commit().await
 }
 
+/// 用量明细保留期清理（连接加固/F7）：usage_logs 只增不减，查询随表龄退化。
+/// 按 created_at 批量删除（单批 10000 行，避免长事务/大范围锁拖垮共享池），
+/// 循环至删空；调用方以 `usage_retention_days > 0` 与 24h 节流控制节奏。
+pub async fn purge_usage_logs(pool: &PgPool, retention_days: i64) -> Result<u64, sqlx::Error> {
+    const BATCH: i64 = 10_000;
+    let mut total = 0u64;
+    loop {
+        let res = sqlx::query(
+            "DELETE FROM usage_logs WHERE id IN (
+                 SELECT id FROM usage_logs
+                 WHERE created_at < now() - make_interval(days => $1::int)
+                 LIMIT $2)",
+        )
+        .bind(retention_days)
+        .bind(BATCH)
+        .execute(pool)
+        .await?;
+        let deleted = res.rows_affected();
+        total += deleted;
+        if deleted == 0 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{record_usage, Usage, UsageMeta};
+    use super::{PlanBill, Usage, UsageMeta, purge_usage_logs, record_failure_log, record_usage};
+    use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
     #[test]
@@ -444,5 +518,157 @@ mod tests {
             Some("usage_logs_request_id_client_visible_key"),
             "违例应来自部分唯一索引而非其它约束"
         );
+    }
+
+    // ---------- F6：失败归因行直写，不推进任何计数器 ----------
+
+    /// 建最小用户（user_monthly_usage / plan_usage_counters 的 FK 归属）
+    async fn seed_user(pool: &sqlx::PgPool) -> i64 {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO users (username, source) VALUES ('f6-user', 'local') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// F6 契约：归因行走 record_failure_log 单条 INSERT——落库带归因列、
+    /// 零 token 零成本，且 user_monthly_usage / plan_usage_counters 完全不动；
+    /// 同一用户的 record_usage 终局路径仍正常推进计数（对照组）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn failure_row_insert_skips_monthly_and_plan_counters(pool: sqlx::PgPool) {
+        let uid = seed_user(&pool).await;
+        let mut m = meta(Uuid::new_v4(), Some("upstream_status"));
+        m.user_id = Some(uid);
+        m.upstream_status = Some(502);
+        m.attempt = Some(0);
+
+        record_failure_log(&pool, &m, 502, 10, 1).await.unwrap();
+
+        let row: (Option<i64>, Option<i64>, f64, Option<String>, Option<i32>, Option<i16>) =
+            sqlx::query_as(
+                "SELECT input_tokens, output_tokens, cost::float8, failure_class, \
+                        upstream_status, attempt FROM usage_logs WHERE request_id = $1",
+            )
+            .bind(m.request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, None, "归因行零输入 token");
+        assert_eq!(row.1, None, "归因行零输出 token");
+        assert_eq!(row.2, 0.0, "归因行零成本");
+        assert_eq!(row.3.as_deref(), Some("upstream_status"), "归因列随行落库");
+        assert_eq!(row.4, Some(502));
+        assert_eq!(row.5, Some(0));
+
+        let monthly: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM user_monthly_usage WHERE user_id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(monthly.0, 0, "归因行不得推进月度计数");
+        let counters: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM plan_usage_counters WHERE user_id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counters.0, 0, "归因行不得推进 Plan 计数");
+
+        // 对照组：终局记账路径（record_usage）推进月度 + Plan 计数
+        let mut terminal = meta(Uuid::new_v4(), None);
+        terminal.user_id = Some(uid);
+        terminal.plan = Some(PlanBill {
+            plan_id: 7,
+            period_start: Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap(),
+            period_key: "2026-11".into(),
+        });
+        let usage = Usage {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(20),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        record_usage(&pool, &terminal, Some(&usage), 200, 10, 1, 0.5)
+            .await
+            .unwrap();
+        let monthly: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(tokens), 0)::bigint FROM user_monthly_usage WHERE user_id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(monthly, (1, 120), "终局记账推进月度计数（对照组）");
+        let counters: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(tokens), 0)::bigint FROM plan_usage_counters WHERE user_id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counters, (1, 120), "终局记账推进 Plan 计数（对照组）");
+    }
+
+    // ---------- F7：保留期批量清理 ----------
+
+    /// 插入指定龄期的 usage_logs 行（days 用 i32——make_interval(days => int)）
+    async fn insert_usage_at(pool: &sqlx::PgPool, age_days: i32) -> Uuid {
+        let rid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO usage_logs (request_id, model, provider_id, created_at) \
+             VALUES ($1, 'purge-test', 1, now() - make_interval(days => $2))",
+        )
+        .bind(rid)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .unwrap();
+        rid
+    }
+
+    /// F7 契约：仅删除超过保留期的行，保留期内行不动
+    #[sqlx::test(migrations = "./migrations")]
+    async fn purge_usage_logs_removes_only_expired_rows(pool: sqlx::PgPool) {
+        let old = insert_usage_at(&pool, 100).await;
+        let fresh = insert_usage_at(&pool, 1).await;
+
+        let removed = purge_usage_logs(&pool, 90).await.unwrap();
+        assert_eq!(removed, 1, "仅清理超过保留期的行");
+        assert_ne!(old, fresh);
+        let remaining: (Uuid,) = sqlx::query_as("SELECT request_id FROM usage_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.0, fresh, "保留期内行不动");
+    }
+
+    /// F7 契约：超过单批 10000 行时循环删空（10000 + 1 两批），
+    /// 汇总删除总数
+    #[sqlx::test(migrations = "./migrations")]
+    async fn purge_usage_logs_batches_until_empty(pool: sqlx::PgPool) {
+        sqlx::query(
+            "INSERT INTO usage_logs (request_id, model, provider_id, created_at) \
+             SELECT ('11111111-1111-1111-1111-' || lpad(g::text, 12, '0'))::uuid, \
+                    'purge-bulk', 1, now() - interval '2 days' \
+             FROM generate_series(1, 10001) AS g",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed = purge_usage_logs(&pool, 1).await.unwrap();
+        assert_eq!(removed, 10001, "批量循环删空并汇总总数");
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM usage_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.0, 0);
     }
 }

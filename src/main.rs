@@ -51,7 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 后台任务：配置热加载 + 用量日聚合
     state.spawn_reload_tasks();
-    tokio::spawn(worker::aggregator::run(state.pool.clone()));
+    tokio::spawn(worker::aggregator::run(
+        state.pool.clone(),
+        state.cfg.usage_retention_days,
+    ));
     tokio::spawn(worker::plan_sync::run(state.clone()));
 
     // 关停：SIGINT/SIGTERM 统一走 watch 通道（docker stop 发 SIGTERM，只听 ctrl_c 会被硬杀、
