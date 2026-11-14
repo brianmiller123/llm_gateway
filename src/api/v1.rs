@@ -3,7 +3,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -26,14 +27,21 @@ pub(crate) fn resolve_client_ip(
 
 /// /v1 代理端点的请求体提取器（F1）：进程级字节预算受限的整包缓冲。提取前
 /// 按预估大小 try-acquire 缓冲预算（Content-Length 可估时按实际值；chunked
-/// 无长度头按 cfg.max_body_bytes 最坏情形）；预算耗尽 → 429（try_acquire
-/// 语义，永不排队，大请求并发不再可 OOM）。许可以 [`BufferGuard`] 随 body
-/// 传递给 proxy：流式请求 handler 结束即释放；非流式由 proxy 绑定响应体，
-/// 流尽/客户端断开释放（缓冲内存活多久预算占多久）。实际占用差额（估算
-/// 偏差/解压膨胀）由 proxy 入口 resize_to(解压后长度) 增量调整。读取侧
-/// 超限仍由路由 DefaultBodyLimit（cfg.max_body_bytes）413，失败路径 guard
+/// 无长度头初始预留 [`CHUNKED_INITIAL_RESERVE_BYTES`]，见 collect_chunked）；
+/// 预算耗尽 → 429（try_acquire 语义，永不排队，大请求并发不再可 OOM）。许可
+/// 以 [`BufferGuard`] 随 body 传递给 proxy：流式请求 handler 结束即释放；
+/// 非流式由 proxy 绑定响应体，流尽/客户端断开释放（缓冲内存活多久预算占
+/// 多久）。实际占用差额（估算偏差/解压膨胀）由 proxy 入口
+/// resize_to(解压后长度) 增量调整。读取侧超限 413（Content-Length 体由路由
+/// DefaultBodyLimit，chunked 由 collect_chunked 本地判定），失败路径 guard
 /// 随局部变量 Drop 即刻归还预算。
 struct BufLimitedBody(Bytes, BufferGuard);
+
+/// chunked/无有效 Content-Length 请求的初始预留（M-2）：不再按 max_body_bytes
+/// 最坏情形整段预留——慢速 trickle 不再以 200MiB 预算/连接长期占坑（2 个
+/// chunked 慢连接即可冻结整个预算）；随字节到达经 [`BufferGuard::resize_to`]
+/// 增长，收集完成后缩至实际长度。
+const CHUNKED_INITIAL_RESERVE_BYTES: u64 = 1024 * 1024;
 
 impl axum::extract::FromRequest<AppState> for BufLimitedBody {
     type Rejection = axum::response::Response;
@@ -42,12 +50,15 @@ impl axum::extract::FromRequest<AppState> for BufLimitedBody {
         req: axum::extract::Request,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let estimate = req
+        let content_length = req
             .headers()
             .get(axum::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(state.cfg.max_body_bytes as u64);
+            .and_then(|v| v.parse::<u64>().ok());
+        let Some(estimate) = content_length else {
+            // M-2：无有效 Content-Length（chunked）→ 初始 ≤1MiB 增量预留收集
+            return collect_chunked(req, state).await;
+        };
         let guard = state.buffer_budget.try_acquire(estimate).ok_or_else(|| {
             tracing::warn!(estimate, "buffer byte budget exhausted; rejecting with 429");
             AppError::RateLimited(1.0).into_response()
@@ -61,6 +72,70 @@ impl axum::extract::FromRequest<AppState> for BufLimitedBody {
             }
         }
     }
+}
+
+/// M-2：chunked 请求体的增量预留收集。初始预留
+/// [`CHUNKED_INITIAL_RESERVE_BYTES`]，字节到达按块经 guard.resize_to 增长：
+/// 预算余量耗尽 → 413 request_too_large 中止收集（体超出预算可容纳量，非
+/// 429——429 仅保留给初始 try-acquire 耗尽），完成后缩至实际长度（富余即刻
+/// 归还预算）。读取侧上限（cfg.max_body_bytes）本地判定：poll_frame 直读
+/// 不经过 with_limited_body，路由 DefaultBodyLimit 不代为限量。传输错误 →
+/// 400，预算随 guard Drop 即刻归还。
+async fn collect_chunked(
+    req: axum::extract::Request,
+    state: &AppState,
+) -> Result<BufLimitedBody, axum::response::Response> {
+    let mut guard = state
+        .buffer_budget
+        .try_acquire(CHUNKED_INITIAL_RESERVE_BYTES)
+        .ok_or_else(|| {
+            tracing::warn!(
+                estimate = CHUNKED_INITIAL_RESERVE_BYTES,
+                "buffer byte budget exhausted; rejecting with 429"
+            );
+            AppError::RateLimited(1.0).into_response()
+        })?;
+    let max_bytes = state.cfg.max_body_bytes as u64;
+    let mut buf = BytesMut::new();
+    let mut reserved = CHUNKED_INITIAL_RESERVE_BYTES;
+    let mut stream = req.into_body().into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "chunked request body read failed");
+                drop(guard);
+                return Err(
+                    AppError::BadRequest("failed to read request body".into()).into_response(),
+                );
+            }
+        };
+        let new_len = buf.len() as u64 + chunk.len() as u64;
+        if new_len > max_bytes {
+            drop(guard);
+            return Err(AppError::PayloadTooLarge(format!(
+                "request body exceeds the {max_bytes}-byte limit"
+            ))
+            .into_response());
+        }
+        // 只增长不收缩（逐块收缩会把已释放的预算反复重占，白耗记账）
+        if new_len > reserved {
+            if guard.resize_to(new_len).is_err() {
+                drop(guard);
+                return Err(AppError::PayloadTooLarge(
+                    "request body exceeds the gateway buffer budget".into(),
+                )
+                .into_response());
+            }
+            reserved = new_len;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    // 缩至实际长度（收缩路径不失败；预留富余即刻归还预算）
+    guard
+        .resize_to(buf.len() as u64)
+        .expect("shrink-to-actual cannot fail");
+    Ok(BufLimitedBody(buf.freeze(), guard))
 }
 
 pub fn routes(state: AppState) -> Router<AppState> {
@@ -376,7 +451,7 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{BufLimitedBody, merge_capability, merge_min_opt};
+    use super::{BufLimitedBody, Bytes, merge_capability, merge_min_opt};
     use crate::state::{AppState, BufferBudget};
     use axum::body::{Body, to_bytes};
     use axum::extract::{DefaultBodyLimit, FromRequest, Request};
@@ -465,6 +540,104 @@ mod tests {
             "取最小：请求可能落到任一候选渠道"
         );
         assert_eq!(merge_min_opt(Some(128_000), Some(384_000)), Some(128_000));
+    }
+
+    /// M-2：chunked（无 Content-Length）增量预留——初始 ≤1MiB 随字节到达增长，
+    /// 完成后缩至实际长度；增长被预算拒绝 → 413 request_too_large（非 429）；
+    /// 超读取上限 → 413；初始预留耗尽仍 429（Retry-After）。预算实例为测试
+    /// 局部，无跨测共享状态。
+    #[tokio::test]
+    async fn chunked_body_reserves_incrementally_and_enforces_budget() {
+        // 1) 小 chunked 体：初始 1MiB 预留，完成缩至实际长度
+        let mut st = AppState::test_fixture();
+        st.buffer_budget = BufferBudget::new(2 * 1024 * 1024);
+        let body = BufLimitedBody::from_request(
+            Request::builder().body(Body::from("hello")).unwrap(),
+            &st,
+        )
+        .await
+        .expect("预算充足时应正常收集");
+        assert_eq!(body.0, "hello");
+        assert_eq!(st.buffer_budget.in_use(), 5, "收集完成缩至实际长度");
+        drop(body);
+        assert_eq!(st.buffer_budget.in_use(), 0);
+
+        // 2) 多块 chunked：预留随字节到达从 1MiB 增长到实际长度
+        let chunk1 = Bytes::from(vec![b'a'; 1024 * 1024]);
+        let chunk2 = Bytes::from(vec![b'b'; 512]);
+        let body = BufLimitedBody::from_request(
+            Request::builder()
+                .body(Body::from_stream(futures_util::stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(chunk1),
+                    Ok(chunk2),
+                ])))
+                .unwrap(),
+            &st,
+        )
+        .await
+        .expect("预算（2MiB）足以承载增量增长");
+        assert_eq!(body.0.len(), 1024 * 1024 + 512);
+        assert_eq!(
+            st.buffer_budget.in_use(),
+            (1024 * 1024 + 512) as u64,
+            "增长后缩至实际长度"
+        );
+        drop(body);
+        assert_eq!(st.buffer_budget.in_use(), 0);
+
+        // 3) 增长拒绝 → 413：预算 1MiB+1024，体 1MiB+2048（初始预留可得，
+        //    跨块增长超剩余预算被拒——体超出预算可容纳量，非 429）
+        st.buffer_budget = BufferBudget::new(1024 * 1024 + 1024);
+        let chunk1 = Bytes::from(vec![b'a'; 1024 * 1024]);
+        let chunk2 = Bytes::from(vec![b'b'; 2048]);
+        let Err(resp) = BufLimitedBody::from_request(
+            Request::builder()
+                .body(Body::from_stream(futures_util::stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(chunk1),
+                    Ok(chunk2),
+                ])))
+                .unwrap(),
+            &st,
+        )
+        .await
+        else {
+            panic!("增长被预算拒绝必须 413");
+        };
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body_bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["error"]["code"], "request_too_large");
+        assert_eq!(st.buffer_budget.in_use(), 0, "413 失败路径即刻归还");
+
+        // 4) 超读取上限 → 413：poll_frame 直读不经过 DefaultBodyLimit，本地判定
+        st.buffer_budget = BufferBudget::new(2 * 1024 * 1024);
+        let mut cfg = (*st.cfg).clone();
+        cfg.max_body_bytes = 8;
+        st.cfg = std::sync::Arc::new(cfg);
+        let Err(resp) = BufLimitedBody::from_request(
+            Request::builder().body(Body::from(vec![b'x'; 9])).unwrap(),
+            &st,
+        )
+        .await
+        else {
+            panic!("超读取上限必须 413");
+        };
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(st.buffer_budget.in_use(), 0, "超上限失败路径即刻归还");
+
+        // 5) 初始预留耗尽 → 429（预算 < 初始 1MiB，try_acquire 失败不排队）
+        st.buffer_budget = BufferBudget::new(64);
+        let Err(resp) = BufLimitedBody::from_request(
+            Request::builder().body(Body::from("hello")).unwrap(),
+            &st,
+        )
+        .await
+        else {
+            panic!("初始预留耗尽必须 429");
+        };
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        assert_eq!(st.buffer_budget.in_use(), 0);
     }
 
     #[test]

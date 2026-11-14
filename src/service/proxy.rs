@@ -768,7 +768,7 @@ pub async fn proxy(
     // （客户端原始 model）在挂载用户并发 guard 前即可取得
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
     let (json, buffered_len) =
-        parse_request_json(&body, &headers)
+        parse_request_json(&body, &headers, decode_ceiling(guard.headroom()))
             .await
             .map_err(|e| fail_with_request_id(e, request_id))?;
     // F1：解压膨胀增量调整——gzip 等解压后超出剩余预算 → 413 request_too_large，
@@ -858,30 +858,44 @@ const LARGE_BODY_BLOCKING_BYTES: usize = 64 * 1024;
 /// 不做第二次解压/解析。返回解压后实际长度，供 F1 字节预算增量调整
 /// （identity 体与原始长度一致，调整为 no-op）。
 /// F10：大体的解压 + DOM 解析移入阻塞线程池执行。
-async fn parse_request_json(body: &Bytes, headers: &HeaderMap) -> Result<(Value, usize), AppError> {
+/// M-1：`decode_cap` 为解压输出上限（min(常量 512MiB, 预算余量)）——gzip
+/// 炸弹在解码中途撞上限即中止（413），不再先物化完整明文再事后校验。
+async fn parse_request_json(
+    body: &Bytes,
+    headers: &HeaderMap,
+    decode_cap: usize,
+) -> Result<(Value, usize), AppError> {
     let enc = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if body.len() > LARGE_BODY_BLOCKING_BYTES {
         let body = body.clone();
-        let (value, len) =
-            tokio::task::spawn_blocking(move || parse_request_json_sync(&body, enc.as_deref()))
-                .await
-                .map_err(AppError::internal)??;
+        let (value, len) = tokio::task::spawn_blocking(move || {
+            parse_request_json_sync(&body, enc.as_deref(), decode_cap)
+        })
+        .await
+        .map_err(AppError::internal)??;
         return Ok((value, len));
     }
-    parse_request_json_sync(body, enc.as_deref())
+    parse_request_json_sync(body, enc.as_deref(), decode_cap)
 }
 
 /// 解压 + JSON 解析（同步体；大小超阈值时由调用方放进 spawn_blocking）。
 /// 返回 (解析结果, 解压后长度)。解压/解析失败时解压缓冲随局部变量释放。
+/// 解压输出超预算 → 413 request_too_large（M-1）；解码失败/不支持编码 → 400。
 fn parse_request_json_sync(
     body: &Bytes,
     content_encoding: Option<&str>,
+    decode_cap: usize,
 ) -> Result<(Value, usize), AppError> {
     let decompressed =
-        decompress_request_body(body, content_encoding).map_err(AppError::BadRequest)?;
+        decompress_request_body(body, content_encoding, decode_cap).map_err(|e| match e {
+            DecompressError::Budget(cap) => AppError::PayloadTooLarge(format!(
+                "decompressed request body exceeds the {cap}-byte decode budget"
+            )),
+            DecompressError::Decode(msg) => AppError::BadRequest(msg),
+        })?;
     let decompressed_len = decompressed.len();
     serde_json::from_slice(&decompressed)
         .map(|value| (value, decompressed_len))
@@ -921,7 +935,7 @@ pub async fn proxy_test(
     let request_id = Uuid::new_v4();
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
     let (json, buffered_len) =
-        parse_request_json(&body, &headers)
+        parse_request_json(&body, &headers, MAX_DECOMPRESSED_BODY_BYTES)
             .await
             .map_err(|e| fail_with_request_id(e, request_id))?;
     // 管理员测试不经 BufLimitedBody：零记账 guard（解压增量调整恒通过）
@@ -2855,7 +2869,19 @@ async fn proxy_authed_inner(
 /// raw）/ br / zstd / zst；identity/缺失直通；不支持编码返回错误信息（调用方 400）。
 /// L1：逗号分隔的堆叠编码按逆序解码（cc-switch content_encoding.rs:126-131 同款），
 /// 且解压输出受预算约束（防 zip bomb——解压后超限直接报错）。
-fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>, String> {
+/// 解压阶段错误分型（M-1）：Budget = 解压输出超预算上限（413 request_too_large，
+/// 与 resize_to 超预算同语义）；Decode = 解码失败/不支持编码（400）
+#[derive(Debug)]
+enum DecompressError {
+    Budget(usize),
+    Decode(String),
+}
+
+fn decompress_request_body(
+    body: &[u8],
+    content_encoding: Option<&str>,
+    cap: usize,
+) -> Result<Vec<u8>, DecompressError> {
     let Some(enc) = content_encoding.map(|s| s.trim().to_ascii_lowercase()) else {
         return Ok(body.to_vec());
     };
@@ -2871,10 +2897,11 @@ fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Resul
         return Ok(body.to_vec());
     }
     let mut data = body.to_vec();
-    // 堆叠编码：应用顺序 a,b,c 表示原始数据先经 a 编码；还原需逆序 c→b→a
+    // 堆叠编码：应用顺序 a,b,c 表示原始数据先经 a 编码；还原需逆序 c→b→a。
+    // 预算逐步生效：每步解码输出各自以 cap 为限（无步间累加豁免）
     for enc in encodings.iter().rev() {
-        let mut out = Vec::with_capacity(data.len().min(MAX_DECOMPRESSED_BODY_BYTES) * 2);
-        decode_single_coding(&data, enc, &mut out)?;
+        let mut out = Vec::with_capacity(data.len().min(cap) * 2);
+        decode_single_coding(&data, enc, &mut out, cap)?;
         data = out;
     }
     Ok(data)
@@ -2883,51 +2910,70 @@ fn decompress_request_body(body: &[u8], content_encoding: Option<&str>) -> Resul
 /// L1：解压输出预算（防 zip bomb；客户端原始体 200MB 上限下留充足裕量）
 const MAX_DECOMPRESSED_BODY_BYTES: usize = 512 * 1024 * 1024;
 
-/// 单一编码解码到 out（带输出预算；超限报错）。`input` 为已按前置编码解出的数据。
-fn decode_single_coding(input: &[u8], enc: &str, out: &mut Vec<u8>) -> Result<(), String> {
+/// M-1：解压上限取 min(常量上限, 预算余量)——预算余量优先（解码中途撞预算
+/// 中止）；余量不限（预算关闭/unbounded guard）时回落常量上限
+fn decode_ceiling(headroom: u64) -> usize {
+    usize::try_from(headroom)
+        .unwrap_or(usize::MAX)
+        .min(MAX_DECOMPRESSED_BODY_BYTES)
+}
+
+/// 单一编码解码到 out。M-1：输出预算 cap 作用于解码输出侧 take——膨胀到
+/// cap 附近即中止读取（分配停在 cap+ε），不再先物化完整明文再事后校验；
+/// 越限报 Budget(cap)，解码失败/不支持编码报 Decode。`input` 为已按前置
+/// 编码解出的数据。
+fn decode_single_coding(
+    input: &[u8],
+    enc: &str,
+    out: &mut Vec<u8>,
+    cap: usize,
+) -> Result<(), DecompressError> {
     use std::io::Read;
-    let limited: &mut dyn Read = &mut input.take((MAX_DECOMPRESSED_BODY_BYTES + 1) as u64);
+    // cap+1：读到恰好越限一字节即停，供下方统一越限判定
+    let out_cap = (cap as u64).saturating_add(1);
     match enc {
-        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(limited)
+        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(input)
+            .take(out_cap)
             .read_to_end(out)
             .map(|_| ())
-            .map_err(|e| format!("gzip decode failed: {e}")),
+            .map_err(|e| DecompressError::Decode(format!("gzip decode failed: {e}"))),
         "deflate" => {
             // zlib 容器优先，失败回退 raw deflate（部分客户端发裸流）
-            if flate2::read::ZlibDecoder::new(limited)
+            if flate2::read::ZlibDecoder::new(input)
+                .take(out_cap)
                 .read_to_end(out)
                 .is_err()
             {
                 out.clear();
-                let raw_limited: &mut dyn Read =
-                    &mut input.take((MAX_DECOMPRESSED_BODY_BYTES + 1) as u64);
-                flate2::read::DeflateDecoder::new(raw_limited)
+                flate2::read::DeflateDecoder::new(input)
+                    .take(out_cap)
                     .read_to_end(out)
                     .map(|_| ())
-                    .map_err(|e| format!("deflate decode failed: {e}"))?;
+                    .map_err(|e| {
+                        DecompressError::Decode(format!("deflate decode failed: {e}"))
+                    })?;
             }
             Ok(())
         }
-        "br" => brotli::Decompressor::new(limited, 4096)
+        "br" => brotli::Decompressor::new(input, 4096)
+            .take(out_cap)
             .read_to_end(out)
             .map(|_| ())
-            .map_err(|e| format!("brotli decode failed: {e}")),
-        "zstd" | "zst" => zstd::stream::read::Decoder::new(limited)
-            .map_err(|e| format!("zstd decode init failed: {e}"))
-            .and_then(|mut d| {
-                d.read_to_end(out)
+            .map_err(|e| DecompressError::Decode(format!("brotli decode failed: {e}"))),
+        "zstd" | "zst" => zstd::stream::read::Decoder::new(input)
+            .map_err(|e| DecompressError::Decode(format!("zstd decode init failed: {e}")))
+            .and_then(|d| {
+                d.take(out_cap)
+                    .read_to_end(out)
                     .map(|_| ())
-                    .map_err(|e| format!("zstd decode failed: {e}"))
+                    .map_err(|e| DecompressError::Decode(format!("zstd decode failed: {e}")))
             }),
-        other => Err(format!(
+        other => Err(DecompressError::Decode(format!(
             "unsupported content-encoding: {other} (supported: gzip, deflate, br, zstd)"
-        )),
+        ))),
     }?;
-    if out.len() > MAX_DECOMPRESSED_BODY_BYTES {
-        return Err(format!(
-            "decompressed body exceeds {} bytes limit",
-            MAX_DECOMPRESSED_BODY_BYTES
-        ));
+    if out.len() > cap {
+        return Err(DecompressError::Budget(cap));
     }
     Ok(())
 }
@@ -5819,9 +5865,13 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     async fn parse_request_json_at_entry_and_requested_model() {
         use std::io::Write;
         let raw = br#"{"model":"gpt-x","messages":[]}"#;
-        let (json, len) = parse_request_json(&Bytes::from_static(raw), &HeaderMap::new())
-            .await
-            .unwrap();
+        let (json, len) = parse_request_json(
+            &Bytes::from_static(raw),
+            &HeaderMap::new(),
+            MAX_DECOMPRESSED_BODY_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(requested_model(&json).as_deref(), Some("gpt-x"));
         assert_eq!(len, raw.len(), "identity 体解压后长度不变");
 
@@ -5830,9 +5880,13 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         let gz = enc.finish().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let (json, len) = parse_request_json(&Bytes::from(gz.clone()), &headers)
-            .await
-            .unwrap();
+        let (json, len) = parse_request_json(
+            &Bytes::from(gz.clone()),
+            &headers,
+            MAX_DECOMPRESSED_BODY_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             requested_model(&json).as_deref(),
             Some("gpt-x"),
@@ -5841,13 +5895,18 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(len, raw.len(), "解压后长度为明文长度");
 
         assert!(matches!(
-            parse_request_json(&Bytes::from_static(b"{not json"), &HeaderMap::new()).await,
+            parse_request_json(
+                &Bytes::from_static(b"{not json"),
+                &HeaderMap::new(),
+                MAX_DECOMPRESSED_BODY_BYTES
+            )
+            .await,
             Err(AppError::BadRequest(_))
         ));
         let mut bad = HeaderMap::new();
         bad.insert(header::CONTENT_ENCODING, "lzma".parse().unwrap());
         assert!(matches!(
-            parse_request_json(&Bytes::from(gz), &bad).await,
+            parse_request_json(&Bytes::from(gz), &bad, MAX_DECOMPRESSED_BODY_BYTES).await,
             Err(AppError::BadRequest(_))
         ));
 
@@ -5857,6 +5916,47 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             None
         );
         assert_eq!(requested_model(&serde_json::json!({ "model": 1 })), None);
+    }
+
+    /// M-1：解压上限接预算余量——上限作用于解码输出侧（膨胀到上限附近即中止
+    /// 读取，不再先物化完整明文再事后校验）：超预算膨胀 → 413 request_too_large
+    /// （不再伪装 400）；上限内正常解压；identity 直通体不膨胀，不受上限约束。
+    #[tokio::test]
+    async fn parse_request_json_decode_cap_aborts_over_budget_inflate() {
+        use std::io::Write;
+        // 高压缩比载荷（1MiB 全零填充的合法 JSON，gzip 后 ~1KiB）模拟 gzip 炸弹
+        let raw = format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(1024 * 1024))
+            .into_bytes();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let gz = Bytes::from(enc.finish().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        // 余量充足（常量上限）：完整解压解析
+        let (json, len) = parse_request_json(
+            &gz,
+            &headers,
+            MAX_DECOMPRESSED_BODY_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(len, raw.len(), "上限内解压出完整明文");
+        assert_eq!(requested_model(&json).as_deref(), Some("m"));
+
+        // 余量不足（小上限注入）：解码中途撞上限 → 413，错误带上限信息
+        let cap = 16 * 1024;
+        let err = parse_request_json(&gz, &headers, cap).await.unwrap_err();
+        let AppError::PayloadTooLarge(msg) = &err else {
+            panic!("超预算解压必须 413 request_too_large：{err:?}");
+        };
+        assert!(msg.contains(&cap.to_string()), "错误须带上限信息：{msg}");
+
+        // identity 直通体不膨胀：上限只约束解压膨胀，不误伤直通体
+        //（无 Content-Encoding 时整体跳过解码，返回原始体）
+        let passthrough = decompress_request_body(&raw, None, 4)
+            .expect("identity 直通不受解压上限约束");
+        assert_eq!(passthrough.len(), raw.len());
     }
 
     /// F5：SSE 预读错误体累积受上限约束——超限返回 Err（文案带上限，调用方

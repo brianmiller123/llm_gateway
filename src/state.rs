@@ -124,6 +124,14 @@ impl BufferBudget {
         true
     }
 
+    /// 当前预算余量（capacity − used）：解压上限钳制用（min(常量上限, 余量)），
+    /// 使 gzip 炸弹在解码中途撞预算中止，不再先物化完整明文再事后校验
+    fn headroom(&self) -> u64 {
+        self.inner
+            .capacity_bytes
+            .saturating_sub(*self.inner.used.lock())
+    }
+
     fn release(&self, bytes: u64) {
         *self.inner.used.lock() -= bytes;
     }
@@ -143,6 +151,12 @@ impl BufferGuard {
             budget: BufferBudget::new(0),
             reserved: 0,
         }
+    }
+
+    /// 当前预算余量（capacity − used，本 guard 已预留部分计入占用）：解压
+    /// 上限取 min(常量上限, 余量)（M-1）
+    pub(crate) fn headroom(&self) -> u64 {
+        self.budget.headroom()
     }
 
     /// 预留调整到 new_size：收缩 → 立即释放富余；增长 → try-acquire 增量，
