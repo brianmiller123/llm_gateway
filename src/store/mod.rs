@@ -26,6 +26,11 @@ pub async fn init(cfg: &AppConfig) -> Result<PgPool, sqlx::Error> {
         // 池满时快速失败而非挂约 30s（sqlx 默认 acquire_timeout）；不做
         // test_before_acquire（每次取连接多一个往返，故障风暴下放大池压力）
         .acquire_timeout(Duration::from_secs(5))
+        // L-b（QC2-L-5）：连接寿命/闲置回收——PG 重启、NAT/LB 静默丢弃后的
+        // 僵死连接靠 max_lifetime（30min，错峰重建）与 idle_timeout（5min）
+        // 兜底淘汰，首次使用才撞错
+        .max_lifetime(Duration::from_secs(30 * 60))
+        .idle_timeout(Duration::from_secs(5 * 60))
         .connect(&cfg.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await.map_err(|e| {

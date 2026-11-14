@@ -346,11 +346,32 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 /// 用量明细保留期清理（连接加固/F7）：usage_logs 只增不减，查询随表龄退化。
-/// 按 created_at 批量删除（单批 10000 行，避免长事务/大范围锁拖垮共享池），
-/// 循环至删空；调用方以 `usage_retention_days > 0` 与 24h 节流控制节奏。
+/// 按 created_at 批量删除（单批 10000 行，避免长事务/大范围锁拖垮共享池）。
+/// M-3：单次调用限幅——最多 [`PURGE_MAX_BATCHES`] 批（20 万行）、批间
+/// [`PURGE_BATCH_PAUSE`] 间歇，积压表（数百万行）的首跑不再在单个 aggregator
+/// tick 内打数千个背靠背 DELETE（索引/锁churn + WAL 尖峰 + 池连接被长期占住，
+/// 拖延下一轮聚合）；剩余积压由 24h 节流的后续周期收敛。调用方以
+/// `usage_retention_days > 0` 与 24h 节流控制节奏。
 pub async fn purge_usage_logs(pool: &PgPool, retention_days: i64) -> Result<u64, sqlx::Error> {
+    purge_usage_logs_capped(pool, retention_days, PURGE_MAX_BATCHES, PURGE_BATCH_PAUSE).await
+}
+
+/// M-3：单 tick 清理限幅——20 批 × 10000 行/批
+const PURGE_MAX_BATCHES: u32 = 20;
+/// M-3：批间间歇（给同池的记账/聚合写入留出喘息窗口）
+const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 清理实现（max_batches/pause 注入供测试；生产经 [`purge_usage_logs`]）。
+/// 触及批数上限时 info 留痕（已删行数 + 积压未清提示），未触上限视为删空。
+async fn purge_usage_logs_capped(
+    pool: &PgPool,
+    retention_days: i64,
+    max_batches: u32,
+    pause: std::time::Duration,
+) -> Result<u64, sqlx::Error> {
     const BATCH: i64 = 10_000;
     let mut total = 0u64;
+    let mut batches = 0u32;
     loop {
         let res = sqlx::query(
             "DELETE FROM usage_logs WHERE id IN (
@@ -367,13 +388,26 @@ pub async fn purge_usage_logs(pool: &PgPool, retention_days: i64) -> Result<u64,
         if deleted == 0 {
             break;
         }
+        batches += 1;
+        if batches >= max_batches {
+            tracing::info!(
+                deleted = total,
+                cap_rows = max_batches as u64 * BATCH as u64,
+                "usage_logs purge hit per-tick batch cap; remaining backlog continues next cycle"
+            );
+            break;
+        }
+        tokio::time::sleep(pause).await;
     }
     Ok(total)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PlanBill, Usage, UsageMeta, purge_usage_logs, record_failure_log, record_usage};
+    use super::{
+        PlanBill, Usage, UsageMeta, purge_usage_logs, purge_usage_logs_capped,
+        record_failure_log, record_usage,
+    };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
@@ -670,5 +704,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.0, 0);
+    }
+
+    /// M-3 契约：单次调用触及批数上限即止——注入 max_batches=1，10001 行积压
+    /// 只清首批 10000 行，余量留给 24h 节流的下一周期
+    #[sqlx::test(migrations = "./migrations")]
+    async fn purge_usage_logs_stops_at_batch_cap(pool: sqlx::PgPool) {
+        sqlx::query(
+            "INSERT INTO usage_logs (request_id, model, provider_id, created_at) \
+             SELECT ('22222222-2222-2222-2222-' || lpad(g::text, 12, '0'))::uuid, \
+                    'purge-cap', 1, now() - interval '2 days' \
+             FROM generate_series(1, 10001) AS g",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed =
+            purge_usage_logs_capped(&pool, 1, 1, std::time::Duration::from_millis(1))
+                .await
+                .unwrap();
+        assert_eq!(removed, 10_000, "触及批数上限即止，不越界清空");
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM usage_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.0, 1, "剩余积压留给下一周期");
     }
 }
