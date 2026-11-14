@@ -505,37 +505,40 @@ impl AppState {
                 }
             };
         }
-        section!("providers", async {
-            let v = load_providers(&self.pool).await?;
-            *self.providers.write() = v;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        });
-        section!("provider_keys", async {
-            // F8：渠道密钥解密快照——reload 期一次性解密，热路径仅查表。
-            // 解密失败的渠道不入快照（留痕），热路径按缺钥走既有候选失败
-            // 归因，其余渠道不受影响；换钥随下一轮 reload 重建生效
-            let providers = load_providers(&self.pool).await?;
-            let mut keys: HashMap<i64, String> = HashMap::with_capacity(providers.len());
-            for p in providers {
-                match crate::crypto::decrypt(&p.api_key_encrypted, &self.cfg.master_key) {
-                    Ok(k) => {
-                        keys.insert(p.id, k);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            provider_id = p.id,
-                            provider = %p.name,
-                            error = %e,
-                            "provider key decrypt failed; provider excluded from key snapshot"
-                        );
+        // L-c（QC1-L-2）：providers 全表单次加载，providers 写表与 provider_keys
+        // 密钥快照共享同一份读取（此前每 tick 两次全表 SELECT）；加载失败两节
+        // 共用同一留痕——providers 沿用旧值、密钥快照不重建（两节同源同失败域）
+        match load_providers(&self.pool).await {
+            Ok(providers) => {
+                *self.providers.write() = providers.clone();
+                // F8：渠道密钥解密快照——reload 期一次性解密，热路径仅查表。
+                // 解密失败的渠道不入快照（留痕），热路径按缺钥走既有候选失败
+                // 归因，其余渠道不受影响；换钥随下一轮 reload 重建生效
+                let mut keys: HashMap<i64, String> = HashMap::with_capacity(providers.len());
+                for p in providers {
+                    match crate::crypto::decrypt(&p.api_key_encrypted, &self.cfg.master_key) {
+                        Ok(k) => {
+                            keys.insert(p.id, k);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                provider_id = p.id,
+                                provider = %p.name,
+                                error = %e,
+                                "provider key decrypt failed; provider excluded from key snapshot"
+                            );
+                        }
                     }
                 }
+                // 指针整体交换：读路径拿旧 Arc 短暂存续（进行中请求用旧钥完成），
+                // 新请求立即可见新快照
+                *self.provider_keys.write() = Arc::new(keys);
             }
-            // 指针整体交换：读路径拿旧 Arc 短暂存续（进行中请求用旧钥完成），
-            // 新请求立即可见新快照
-            *self.provider_keys.write() = Arc::new(keys);
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        });
+            Err(e) => {
+                tracing::error!(section = "providers", error = %e, "config reload section failed; keeping previous values");
+                first_err.get_or_insert(Box::new(e));
+            }
+        };
         section!("routes", async {
             let v = load_routes(&self.pool).await?;
             *self.routes.write() = v;
