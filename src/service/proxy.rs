@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::service::breaker::Breaker;
 use crate::service::usage;
-use crate::state::AppState;
+use crate::state::{AppState, BufferGuard};
 use crate::store::upstream::Provider;
 use crate::store::usage::{Usage, UsageMeta};
 
@@ -740,11 +740,14 @@ fn with_global_cap(
     rules
 }
 
-/// OpenAI 兼容代理入口：鉴权 → 管线
+/// OpenAI 兼容代理入口：鉴权 → 管线。`guard` 为 F1 字节预算许可（BufLimitedBody
+/// 提取时按预估预留），随缓冲内存生命周期释放：流式响应 handler 结束即释放，
+/// 非流式绑定响应体流尽/断开释放（见 proxy_authed / bind_budget_to_body）。
 pub async fn proxy(
     st: &AppState,
     headers: HeaderMap,
     body: Bytes,
+    mut guard: BufferGuard,
     endpoint: Endpoint,
     client_ip: std::net::IpAddr,
 ) -> Result<Response, AppError> {
@@ -764,8 +767,22 @@ pub async fn proxy(
     // 优先于 body 400）：解析只做一次，解析出的 JSON 全管线复用，模型维度
     // （客户端原始 model）在挂载用户并发 guard 前即可取得
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
-    let json =
-        parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
+    let (json, buffered_len) =
+        parse_request_json(&body, &headers)
+            .await
+            .map_err(|e| fail_with_request_id(e, request_id))?;
+    // F1：解压膨胀增量调整——gzip 等解压后超出剩余预算 → 413 request_too_large，
+    // 不再继续缓冲（失败路径 guard 保持原预估预留，随即 Drop 整份归还）
+    guard
+        .resize_to(buffered_len as u64)
+        .map_err(|_| {
+            fail_with_request_id(
+                AppError::PayloadTooLarge(format!(
+                    "decompressed request body ({buffered_len} bytes) exceeds the gateway buffer budget"
+                )),
+                request_id,
+            )
+        })?;
     let model = requested_model(&json);
     // 并发上限（管线唯一的限流维度）：guard 绑定响应体生命周期，SSE 流尽或
     // 客户端断开才归还。拒绝时并发未占坑（try_acquire 全有或全无）。
@@ -805,7 +822,7 @@ pub async fn proxy(
         concurrency: Some(conc),
     };
     proxy_authed(
-        st, headers, body, json, endpoint, client_ip, user_id, key_id, false, request_id,
+        st, headers, body, guard, json, endpoint, client_ip, user_id, key_id, false, request_id,
     )
     .await
     .map(|resp| bind_guards_to_body(resp, guards))
@@ -832,16 +849,27 @@ fn ensure_endpoint_enabled(st: &AppState, endpoint: Endpoint) -> Result<(), AppE
 
 /// M24：请求体解析（先按 Content-Encoding 解压，再解析 JSON）。
 /// 在入口挂用户并发 guard 前调用一次，结果传入管线复用——整份请求体
-/// 不做第二次解压/解析。
-fn parse_request_json(body: &Bytes, headers: &HeaderMap) -> Result<Value, AppError> {
-    let decompressed = decompress_request_body(
-        body,
-        headers
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-    )
-    .map_err(AppError::BadRequest)?;
+/// 不做第二次解压/解析。返回解压后实际长度，供 F1 字节预算增量调整
+/// （identity 体与原始长度一致，调整为 no-op）。
+async fn parse_request_json(body: &Bytes, headers: &HeaderMap) -> Result<(Value, usize), AppError> {
+    let enc = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    parse_request_json_sync(body, enc.as_deref())
+}
+
+/// 解压 + JSON 解析（同步体）。返回 (解析结果, 解压后长度)。解压/解析失败时
+/// 解压缓冲随局部变量释放。
+fn parse_request_json_sync(
+    body: &Bytes,
+    content_encoding: Option<&str>,
+) -> Result<(Value, usize), AppError> {
+    let decompressed =
+        decompress_request_body(body, content_encoding).map_err(AppError::BadRequest)?;
+    let decompressed_len = decompressed.len();
     serde_json::from_slice(&decompressed)
+        .map(|value| (value, decompressed_len))
         .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))
 }
 
@@ -877,10 +905,17 @@ pub async fn proxy_test(
     };
     let request_id = Uuid::new_v4();
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
-    let json =
-        parse_request_json(&body, &headers).map_err(|e| fail_with_request_id(e, request_id))?;
+    let (json, buffered_len) =
+        parse_request_json(&body, &headers)
+            .await
+            .map_err(|e| fail_with_request_id(e, request_id))?;
+    // 管理员测试不经 BufLimitedBody：零记账 guard（解压增量调整恒通过）
+    let mut guard = BufferGuard::unbounded();
+    guard
+        .resize_to(buffered_len as u64)
+        .expect("unbounded guard must absorb any decompressed size");
     proxy_authed(
-        st, headers, body, json, endpoint, client_ip, None, None, true, request_id,
+        st, headers, body, guard, json, endpoint, client_ip, None, None, true, request_id,
     )
     .await
     .map(|resp| bind_guards_to_body(resp, guards))
@@ -905,11 +940,67 @@ fn apply_extra(body: &mut Value, extra: Option<&Value>) {
     }
 }
 
+/// 已鉴权代理管线入口：F1 字节预算 guard 的生命周期绑定层。流式响应无整包
+/// 缓冲驻留（请求体缓冲随 handler 结束释放）；非流式响应是整包缓冲体——
+/// guard 绑进响应体流，流尽/客户端断开时释放（bind_guards_to_body 同款
+/// unfold 形状）。缓冲内存活多久，预算占多久。
+async fn proxy_authed(
+    st: &AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    guard: BufferGuard,
+    json: Value,
+    endpoint: Endpoint,
+    client_ip: std::net::IpAddr,
+    user_id: Option<i64>,
+    key_id: Option<i64>,
+    test_call: bool,
+    request_id: Uuid,
+) -> Result<Response, AppError> {
+    let streamed = json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let resp = proxy_authed_inner(
+        st,
+        headers,
+        body,
+        json,
+        endpoint,
+        client_ip,
+        user_id,
+        key_id,
+        streamed,
+        test_call,
+        request_id,
+    )
+    .await?;
+    if streamed {
+        Ok(resp)
+    } else {
+        Ok(bind_budget_to_body(resp, guard))
+    }
+}
+
+/// F1：字节预算 guard 绑定整包缓冲响应体。体流尽（正常发完）或 body 被丢弃
+/// （客户端断开）时 guard 随 unfold 状态一并 Drop，预算归还。
+fn bind_budget_to_body(resp: Response, guard: BufferGuard) -> Response {
+    let (parts, body) = resp.into_parts();
+    let bound = futures_util::stream::unfold(
+        (body.into_data_stream(), Some(guard)),
+        |(mut stream, guard)| async move {
+            let item = stream.next().await?;
+            Some((item, (stream, guard)))
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(bound))
+}
+
 /// 已鉴权代理管线：Plan 配额 → 路由 → 转发（含降级）→ 记账
 /// （并发上限已在入口 proxy 占坑、guard 绑定响应体；proxy_test 不占坑）。
 /// 端点开关检查与请求体解压/解析已在入口（proxy / proxy_test）完成，
 /// `json` 为解析结果、`body` 为原始字节（零改写快路径直传用）。
-async fn proxy_authed(
+async fn proxy_authed_inner(
     st: &AppState,
     headers: HeaderMap,
     body: Bytes,
@@ -918,6 +1009,7 @@ async fn proxy_authed(
     client_ip: std::net::IpAddr,
     user_id: Option<i64>,
     key_id: Option<i64>,
+    streamed: bool,
     test_call: bool,
     request_id: Uuid,
 ) -> Result<Response, AppError> {
@@ -951,10 +1043,6 @@ async fn proxy_authed(
         .filter(|m| !m.is_empty())
         .map(str::to_string)
         .ok_or_else(|| AppError::BadRequest("missing 'model' field".into()))?;
-    let streamed = json
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
 
     // 3. Coding Plan 配额：超出按策略拦截(429)/降级改写模型/仅告警放行。
     // 降级改写 json["model"] 并标记 plan_downgraded——零改写快路径直传原始

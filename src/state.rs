@@ -11,8 +11,8 @@ use crate::config::AppConfig;
 use crate::service::ratelimit::RateLimiter;
 use crate::service::usage::UsageCache;
 use crate::store::access::{UserAccessRule, load_user_access};
-use crate::store::rules::{ModelPrice, RateRule, load_prices, load_rules};
 use crate::store::keys::ApiKeyRow;
+use crate::store::rules::{ModelPrice, RateRule, load_prices, load_rules};
 use crate::store::upstream::{ModelRoute, Provider, load_providers, load_routes};
 
 /// F11：鉴权前缀缓存（前缀 → (缓存时刻, 候选行)）。TTL = cfg.auth_cache_secs
@@ -54,6 +54,118 @@ impl MessageTemplates {
     /// 模型无权限 403 文案
     pub fn model_denied(&self, model: &str) -> String {
         self.model_denied_tpl().replace("{model}", model)
+    }
+}
+
+/// F1：进程级缓冲字节预算 gauge（取代 W-2 的 4 计数静态信号量）。/v1 请求体
+/// 提取前按预估大小 try-acquire（Content-Length，无长度头的 chunked 传输按
+/// cfg.max_body_bytes 最坏情形），预算不足立即 429（try_acquire 语义，永不
+/// 排队）；许可以 [`BufferGuard`] 持有——缓冲内存活多久预算占多久（流式请求
+/// handler 结束即释放，非流式绑定响应体流尽/断开释放），解压膨胀经
+/// [`BufferGuard::resize_to`] 增量调整（超出剩余预算 → 413，不继续缓冲）。
+/// capacity = cfg.buffer_budget_bytes（默认 512MiB；0 = 不限，沿用资源加固
+/// 字段「0 = 关闭」约定）。
+#[derive(Clone, Debug)]
+pub struct BufferBudget {
+    inner: Arc<BufferBudgetInner>,
+}
+
+#[derive(Debug)]
+struct BufferBudgetInner {
+    capacity_bytes: u64,
+    used: parking_lot::Mutex<u64>,
+}
+
+/// 字节预算许可：持有期间预算被占用，Drop 归还。随缓冲内存生命周期传递
+/// （提取器 → handler → proxy → 非流式响应体绑定）。
+#[derive(Debug)]
+pub struct BufferGuard {
+    budget: BufferBudget,
+    reserved: u64,
+}
+
+impl BufferBudget {
+    pub fn new(capacity_bytes: u64) -> Self {
+        Self {
+            inner: Arc::new(BufferBudgetInner {
+                // 0 = 关闭预算（不限）：与 auth_cache_secs/usage_retention_days
+                // 同款「0 = 禁用」约定，避免误配 0 把全部 /v1 请求 429 掉
+                capacity_bytes: if capacity_bytes == 0 {
+                    u64::MAX
+                } else {
+                    capacity_bytes
+                },
+                used: parking_lot::Mutex::new(0),
+            }),
+        }
+    }
+
+    /// try-acquire（永不排队）：剩余预算不足返回 None（调用方 429 Retry-After）
+    pub(crate) fn try_acquire(&self, bytes: u64) -> Option<BufferGuard> {
+        let mut used = self.inner.used.lock();
+        if bytes > self.inner.capacity_bytes.saturating_sub(*used) {
+            return None;
+        }
+        *used += bytes;
+        Some(BufferGuard {
+            budget: self.clone(),
+            reserved: bytes,
+        })
+    }
+
+    /// 增量 try-acquire（解压膨胀）：剩余预算充足返回 true；不足 false（调用方
+    /// 413 request_too_large，不缓冲）
+    fn try_acquire_extra(&self, extra: u64) -> bool {
+        let mut used = self.inner.used.lock();
+        if extra > self.inner.capacity_bytes.saturating_sub(*used) {
+            return false;
+        }
+        *used += extra;
+        true
+    }
+
+    fn release(&self, bytes: u64) {
+        *self.inner.used.lock() -= bytes;
+    }
+
+    /// 当前占用量（测试断言用；生产路径无读者，预算仅作准入闸门）
+    #[cfg(test)]
+    pub fn in_use(&self) -> u64 {
+        *self.inner.used.lock()
+    }
+}
+
+impl BufferGuard {
+    /// 零记账 guard（proxy_test 等不经 BufLimitedBody 的入口）：容量不限、
+    /// 预留为 0，resize/drop 均不产生有效记账。
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            budget: BufferBudget::new(0),
+            reserved: 0,
+        }
+    }
+
+    /// 预留调整到 new_size：收缩 → 立即释放富余；增长 → try-acquire 增量，
+    /// 超出剩余预算返回 Err（guard 保持原预留，随后续 Drop 整份归还——调用方
+    /// 据此返回 413，不再继续缓冲）。
+    pub(crate) fn resize_to(&mut self, new_size: u64) -> Result<(), ()> {
+        if new_size < self.reserved {
+            self.budget.release(self.reserved - new_size);
+        } else if new_size > self.reserved {
+            if !self.budget.try_acquire_extra(new_size - self.reserved) {
+                return Err(());
+            }
+        }
+        self.reserved = new_size;
+        Ok(())
+    }
+}
+
+impl Drop for BufferGuard {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            self.budget.release(self.reserved);
+        }
     }
 }
 
@@ -118,6 +230,9 @@ pub struct AppState {
     /// 进程内指标计数器（/metrics 文本导出；连接加固 wave1 挂载）。
     /// 全应用共享单实例：proxy 候选失败 / 熔断开闸 / 客户端中断在此累计
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// F1：进程级缓冲字节预算（/v1 整包缓冲 + 解压膨胀记账；guard 随缓冲
+    /// 内存生命周期释放，容量 = cfg.buffer_budget_bytes，0 = 不限）
+    pub buffer_budget: BufferBudget,
     /// F11：鉴权前缀缓存（吊销/禁用最迟 TTL（cfg.auth_cache_secs，默认 5s）
     /// 内陈旧——接受的折衷；每次 reload tick 清空，0 = 关闭）
     pub auth_cache: AuthKeyCache,
@@ -163,6 +278,8 @@ impl AppState {
             success_threshold: cfg.breaker_success_threshold,
         };
 
+        // F1：预算容量在 cfg 移入 state 前取出（下方字面量 `cfg,` 已把 Arc 移走）
+        let buffer_budget_bytes = cfg.buffer_budget_bytes;
         let state = Self {
             pool,
             cfg,
@@ -198,6 +315,7 @@ impl AppState {
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            buffer_budget: BufferBudget::new(buffer_budget_bytes),
             auth_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         state.reload().await?;
@@ -227,6 +345,8 @@ impl AppState {
             .expect("lazy pool");
         let cfg = std::sync::Arc::new(crate::config::AppConfig::from_env().expect("env config"));
         let ldap = crate::service::ldap::LdapSettings::from(&*cfg);
+        // F1：预算容量在 cfg 移入 Self 前取出（同 init）
+        let buffer_budget_bytes = cfg.buffer_budget_bytes;
         Self {
             pool,
             cfg,
@@ -264,6 +384,7 @@ impl AppState {
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            buffer_budget: BufferBudget::new(buffer_budget_bytes),
             auth_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -493,7 +614,7 @@ fn non_empty(s: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_admin_id, commit_admin_snapshot, MessageTemplates};
+    use super::{apply_admin_id, commit_admin_snapshot, BufferBudget, BufferGuard, MessageTemplates};
     use parking_lot::RwLock;
     use sqlx::PgPool;
     use std::collections::HashSet;
@@ -626,5 +747,68 @@ mod tests {
             blank.model_denied("m"),
             crate::store::config::DEFAULT_MSG_MODEL_DENIED.replace("{model}", "m")
         );
+    }
+
+    // ---------- F1：缓冲字节预算 guard ----------
+
+    /// try-acquire 语义：预算充足占用、剩余不足立即 None（429，不排队）、
+    /// guard Drop 全额归还（release-on-drop 不变量）。
+    #[test]
+    fn budget_try_acquire_exhaustion_and_release_on_drop() {
+        let budget = BufferBudget::new(100);
+
+        let g1 = budget.try_acquire(60).expect("预算充足应获得许可");
+        assert_eq!(budget.in_use(), 60);
+        assert!(budget.try_acquire(41).is_none(), "剩余不足必须立即拒绝（429 不排队）");
+        assert_eq!(budget.in_use(), 60, "拒绝路径不得改动占用量");
+        let g2 = budget.try_acquire(40).expect("恰好占满剩余预算应成功");
+        assert_eq!(budget.in_use(), 100);
+        assert!(budget.try_acquire(1).is_none(), "预算占满后进一步请求被拒");
+
+        drop(g1);
+        assert_eq!(budget.in_use(), 40, "guard Drop 只归还其预留");
+        drop(g2);
+        assert_eq!(budget.in_use(), 0, "全部归还后预算归零");
+    }
+
+    /// 解压膨胀增量调整（proxy 入口 resize_to）：增长在剩余预算内吸收；
+    /// 超出剩余预算返回 Err（调用方 413 request_too_large）且占用保持原值
+    ///（guard 随后 Drop 整份归还）；收缩立即释放富余。
+    #[test]
+    fn guard_resize_grows_within_budget_and_413s_beyond() {
+        let budget = BufferBudget::new(100);
+        let mut g1 = budget.try_acquire(50).unwrap();
+        let mut g2 = budget.try_acquire(20).unwrap();
+        assert_eq!(budget.in_use(), 70);
+
+        // 增长（解压膨胀 50 → 80）：剩余 30 足够 → 吸收
+        g1.resize_to(80).expect("剩余预算内的增长必须成功");
+        assert_eq!(budget.in_use(), 100);
+        assert!(
+            budget.try_acquire(1).is_none(),
+            "膨胀吸收后预算占满"
+        );
+
+        // 增长超预算（80 → 110）：Err（→ 413），占用保持原值不部分记账
+        assert!(g1.resize_to(110).is_err(), "超出剩余预算必须返回 Err（413）");
+        assert_eq!(budget.in_use(), 100, "失败的 resize 不得部分调整");
+        // 失败路径整份归还：g1 Drop 释放其预留 80
+        drop(g1);
+        assert_eq!(budget.in_use(), 20);
+
+        // 收缩（chunked 最坏情形估算 → 实际体小）：立即释放富余
+        g2.resize_to(5).expect("收缩恒成功");
+        assert_eq!(budget.in_use(), 5, "收缩立即释放富余");
+        drop(g2);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// 零记账 guard（proxy_test 入口）：容量不限、预留 0——任意大小 resize
+    /// 均吸收（含 u64::MAX），预算独立于应用共享预算，无对外可观测记账。
+    #[test]
+    fn unbounded_guard_never_accounts() {
+        let mut g = BufferGuard::unbounded();
+        g.resize_to(u64::MAX)
+            .expect("零记账 guard 必须吸收任意大小（容量 = u64::MAX）");
     }
 }

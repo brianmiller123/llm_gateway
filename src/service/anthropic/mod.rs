@@ -110,6 +110,12 @@ pub fn error_response(err: &AppError) -> Response {
             (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", m.clone())
         }
         AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "invalid_request_error", m.clone()),
+        // F1：解压膨胀超缓冲预算（413；Anthropic 方言沿用 invalid_request_error 类型名）
+        AppError::PayloadTooLarge(m) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            m.clone(),
+        ),
         AppError::Conflict(m) => (StatusCode::CONFLICT, "invalid_request_error", m.clone()),
         AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error", m.clone()),
         AppError::ServiceUnavailable(m) => (

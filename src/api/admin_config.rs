@@ -2196,6 +2196,7 @@ fn app_error_status(e: &AppError) -> u16 {
         | AppError::ConcurrentLimited(..)
         | AppError::PlanQuotaExceeded(..) => 429,
         AppError::BadRequest(_) => 400,
+        AppError::PayloadTooLarge(_) => 413,
         AppError::Conflict(_) => 409,
         AppError::Internal(_) => 500,
         AppError::ServiceUnavailable(_) | AppError::UpstreamExhausted(_) => 503,
