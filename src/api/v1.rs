@@ -31,8 +31,9 @@ pub(crate) fn resolve_client_ip(
 /// 预算耗尽 → 429（try_acquire 语义，永不排队，大请求并发不再可 OOM）。许可
 /// 以 [`BufferGuard`] 随 body 传递给 proxy：流式请求 handler 结束即释放；
 /// 非流式由 proxy 绑定响应体，流尽/客户端断开释放（缓冲内存活多久预算占
-/// 多久）。实际占用差额（估算偏差/解压膨胀）由 proxy 入口
-/// resize_to(解压后长度) 增量调整。读取侧超限 413（Content-Length 体由路由
+/// 多久）。实际占用差额（估算偏差/解压膨胀）在解码期经 guard 逐块原子
+/// 入账（try_grow 拒收 → 413 中止解码），成功后 proxy 入口
+/// resize_to(解压后长度) 收缩收敛。读取侧超限 413（Content-Length 体由路由
 /// DefaultBodyLimit，chunked 由 collect_chunked 本地判定），失败路径 guard
 /// 随局部变量 Drop 即刻归还预算。
 struct BufLimitedBody(Bytes, BufferGuard);

@@ -747,7 +747,7 @@ pub async fn proxy(
     st: &AppState,
     headers: HeaderMap,
     body: Bytes,
-    mut guard: BufferGuard,
+    guard: BufferGuard,
     endpoint: Endpoint,
     client_ip: std::net::IpAddr,
 ) -> Result<Response, AppError> {
@@ -767,12 +767,17 @@ pub async fn proxy(
     // 优先于 body 400）：解析只做一次，解析出的 JSON 全管线复用，模型维度
     // （客户端原始 model）在挂载用户并发 guard 前即可取得
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
-    let (json, buffered_len) =
-        parse_request_json(&body, &headers, decode_ceiling(guard.headroom()))
+    // M-1 并发修复：解压上限取 min(静态预算容量, 常量上限)——瞬时余量快照
+    // 正是并发解码各自独占同一份 headroom 的聚合漏洞来源，已废除；动态余量
+    // 由解码期 ChargingReader 逐块 try_grow 互斥入账裁定，拒收即 413
+    let decode_cap = decode_ceiling(guard.capacity_bytes());
+    let (json, buffered_len, mut guard) =
+        parse_request_json(&body, &headers, guard, decode_cap)
             .await
             .map_err(|e| fail_with_request_id(e, request_id))?;
-    // F1：解压膨胀增量调整——gzip 等解压后超出剩余预算 → 413 request_too_large，
-    // 不再继续缓冲（失败路径 guard 保持原预估预留，随即 Drop 整份归还）
+    // F1：解压膨胀增量调整——解码期已逐块入账（含 raw 预留在上），此处收缩
+    // 收敛至解压后长度（释放 raw 差额；guard 失败路径已在解压内缩回 raw 后
+    // 整份 Drop 归还）。保留为 no-op/收缩 reconcile。
     guard
         .resize_to(buffered_len as u64)
         .map_err(|_| {
@@ -857,48 +862,57 @@ const LARGE_BODY_BLOCKING_BYTES: usize = 64 * 1024;
 /// 在入口挂用户并发 guard 前调用一次，结果传入管线复用——整份请求体
 /// 不做第二次解压/解析。返回解压后实际长度，供 F1 字节预算增量调整
 /// （identity 体与原始长度一致，调整为 no-op）。
+/// M-1 并发修复：`guard` 所有权移入（解码期 ChargingReader 逐块 try_grow
+/// 入账其预留），成功随三元组归还（预留 = raw + 解码入账，调用方 resize_to
+/// 收敛）；失败路径 guard 就地 Drop 整份归还预算（解码中途撞预算已在
+/// decompress_request_body 内先缩回 raw）。
 /// F10：大体的解压 + DOM 解析移入阻塞线程池执行。
-/// M-1：`decode_cap` 为解压输出上限（min(常量 512MiB, 预算余量)）——gzip
-/// 炸弹在解码中途撞上限即中止（413），不再先物化完整明文再事后校验。
+/// M-1：`decode_cap` 为解压输出绝对上限（min(静态预算容量, 常量 512MiB)），
+/// 动态余量裁定在入账侧。
 async fn parse_request_json(
     body: &Bytes,
     headers: &HeaderMap,
+    guard: BufferGuard,
     decode_cap: usize,
-) -> Result<(Value, usize), AppError> {
+) -> Result<(Value, usize, BufferGuard), AppError> {
     let enc = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if body.len() > LARGE_BODY_BLOCKING_BYTES {
         let body = body.clone();
-        let (value, len) = tokio::task::spawn_blocking(move || {
-            parse_request_json_sync(&body, enc.as_deref(), decode_cap)
+        let (value, len, guard) = tokio::task::spawn_blocking(move || {
+            parse_request_json_sync(&body, enc.as_deref(), guard, decode_cap)
         })
         .await
         .map_err(AppError::internal)??;
-        return Ok((value, len));
+        return Ok((value, len, guard));
     }
-    parse_request_json_sync(body, enc.as_deref(), decode_cap)
+    parse_request_json_sync(body, enc.as_deref(), guard, decode_cap)
 }
 
 /// 解压 + JSON 解析（同步体；大小超阈值时由调用方放进 spawn_blocking）。
-/// 返回 (解析结果, 解压后长度)。解压/解析失败时解压缓冲随局部变量释放。
+/// 返回 (解析结果, 解压后长度, guard)。解压/解析失败时解压缓冲与 guard
+/// 随局部变量释放（guard 失败路径预算整份归还）。
 /// 解压输出超预算 → 413 request_too_large（M-1）；解码失败/不支持编码 → 400。
 fn parse_request_json_sync(
     body: &Bytes,
     content_encoding: Option<&str>,
+    mut guard: BufferGuard,
     decode_cap: usize,
-) -> Result<(Value, usize), AppError> {
+) -> Result<(Value, usize, BufferGuard), AppError> {
     let decompressed =
-        decompress_request_body(body, content_encoding, decode_cap).map_err(|e| match e {
-            DecompressError::Budget(cap) => AppError::PayloadTooLarge(format!(
-                "decompressed request body exceeds the {cap}-byte decode budget"
-            )),
-            DecompressError::Decode(msg) => AppError::BadRequest(msg),
-        })?;
+        decompress_request_body(body, content_encoding, &mut guard, decode_cap).map_err(
+            |e| match e {
+                DecompressError::Budget(cap) => AppError::PayloadTooLarge(format!(
+                    "decompressed request body exceeds the {cap}-byte decode budget"
+                )),
+                DecompressError::Decode(msg) => AppError::BadRequest(msg),
+            },
+        )?;
     let decompressed_len = decompressed.len();
     serde_json::from_slice(&decompressed)
-        .map(|value| (value, decompressed_len))
+        .map(|value| (value, decompressed_len, guard))
         .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))
 }
 
@@ -934,12 +948,14 @@ pub async fn proxy_test(
     };
     let request_id = Uuid::new_v4();
     ensure_endpoint_enabled(st, endpoint).map_err(|e| fail_with_request_id(e, request_id))?;
-    let (json, buffered_len) =
-        parse_request_json(&body, &headers, MAX_DECOMPRESSED_BODY_BYTES)
+    // 管理员测试不经 BufLimitedBody：零记账 unbounded guard（容量不限，
+    // 解码入账恒通过；上限回落常量 512MiB）
+    let guard = BufferGuard::unbounded();
+    let decode_cap = decode_ceiling(guard.capacity_bytes());
+    let (json, buffered_len, mut guard) =
+        parse_request_json(&body, &headers, guard, decode_cap)
             .await
             .map_err(|e| fail_with_request_id(e, request_id))?;
-    // 管理员测试不经 BufLimitedBody：零记账 guard（解压增量调整恒通过）
-    let mut guard = BufferGuard::unbounded();
     guard
         .resize_to(buffered_len as u64)
         .expect("unbounded guard must absorb any decompressed size");
@@ -2876,7 +2892,7 @@ async fn proxy_authed_inner(
 /// L1：逗号分隔的堆叠编码按逆序解码（cc-switch content_encoding.rs:126-131 同款），
 /// 且解压输出受预算约束（防 zip bomb——解压后超限直接报错）。
 /// 解压阶段错误分型（M-1）：Budget = 解压输出超预算上限（413 request_too_large，
-/// 与 resize_to 超预算同语义）；Decode = 解码失败/不支持编码（400）
+/// 与解码入账 try_grow 拒收同语义）；Decode = 解码失败/不支持编码（400）
 #[derive(Debug)]
 enum DecompressError {
     Budget(usize),
@@ -2886,6 +2902,7 @@ enum DecompressError {
 fn decompress_request_body(
     body: &[u8],
     content_encoding: Option<&str>,
+    guard: &mut BufferGuard,
     cap: usize,
 ) -> Result<Vec<u8>, DecompressError> {
     let Some(enc) = content_encoding.map(|s| s.trim().to_ascii_lowercase()) else {
@@ -2902,13 +2919,28 @@ fn decompress_request_body(
     if encodings.is_empty() {
         return Ok(body.to_vec());
     }
-    let mut data = body.to_vec();
     // 堆叠编码：应用顺序 a,b,c 表示原始数据先经 a 编码；还原需逆序 c→b→a。
-    // 预算逐步生效：每步解码输出各自以 cap 为限（无步间累加豁免）
+    // 预算逐步生效：每步解码输出各自以 cap 为限，逐块原子入账 guard（guard
+    // 预留 = raw + 各步输出，跨步累计），无步间累加豁免
+    let mut data = body.to_vec();
+    let mut failure: Option<DecompressError> = None;
     for enc in encodings.iter().rev() {
         let mut out = Vec::with_capacity(data.len().min(cap) * 2);
-        decode_single_coding(&data, enc, &mut out, cap)?;
-        data = out;
+        match decode_single_coding(&data, enc, &mut out, guard, cap) {
+            Ok(()) => data = out,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = failure {
+        // 解码中途失败：释放解码期入账，缩回 raw（压缩原始体仍由调用方持有
+        // 并预留）——失败的炸弹即刻让出预算，不占坑到 guard Drop
+        guard
+            .resize_to(body.len() as u64)
+            .expect("shrink-to-raw cannot fail");
+        return Err(e);
     }
     Ok(data)
 }
@@ -2916,64 +2948,127 @@ fn decompress_request_body(
 /// L1：解压输出预算（防 zip bomb；客户端原始体 200MB 上限下留充足裕量）
 const MAX_DECOMPRESSED_BODY_BYTES: usize = 512 * 1024 * 1024;
 
-/// M-1：解压上限取 min(常量上限, 预算余量)——预算余量优先（解码中途撞预算
-/// 中止）；余量不限（预算关闭/unbounded guard）时回落常量上限
-fn decode_ceiling(headroom: u64) -> usize {
-    usize::try_from(headroom)
+/// M-1 并发修复：解压上限取 min(静态预算容量, 常量上限)——容量是静态配置，
+/// 只钳单次解码的绝对上限（预算关闭/unbounded → 常量 512MiB）；不再快照
+/// 瞬时余量（N 个并发解码各自独占同一份余量 → 聚合 N×512MiB 的 OOM 根因），
+/// 动态余量改由 ChargingReader 解码期逐块 try_grow 互斥裁定
+fn decode_ceiling(capacity: u64) -> usize {
+    usize::try_from(capacity)
         .unwrap_or(usize::MAX)
         .min(MAX_DECOMPRESSED_BODY_BYTES)
 }
 
-/// 单一编码解码到 out。M-1：输出预算 cap 作用于解码输出侧 take——膨胀到
-/// cap 附近即中止读取（分配停在 cap+ε），不再先物化完整明文再事后校验；
+/// 解压输出侧预算入账 reader（M-1 并发修复）：包住 take 后的解码器输出，
+/// 每读出一块即 [`BufferGuard::try_grow`] 原子入账请求 guard 的预留（单次
+/// 互斥 check-and-inc）；剩余预算不足 → 置位 refused 并以 io 错误中止解码
+/// （上层映射 Budget → 413）。N 个并发解码各自逐块入账，任一瞬时
+/// Σ预留 ≤ 容量，无窗口双记账同一份余量。
+struct ChargingReader<'a, R> {
+    inner: R,
+    guard: &'a mut BufferGuard,
+    refused: bool,
+}
+
+impl<R: std::io::Read> std::io::Read for ChargingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 && self.guard.try_grow(n as u64).is_err() {
+            self.refused = true;
+            // 错误仅作中止信号（read_to_end 即刻上抛），上层按 refused 映射
+            return Err(std::io::Error::other(
+                "decompressed output exceeds the gateway buffer budget",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+/// 读尽单个解码器输出并逐块入账：预算拒收 → Budget(cap)（413），解码失败 →
+/// Decode(label)（400）。拒收读侧已 take(out_cap) 兜底单次解码绝对上限。
+fn read_charged<R: std::io::Read>(
+    reader: R,
+    out_cap: u64,
+    out: &mut Vec<u8>,
+    guard: &mut BufferGuard,
+    cap: usize,
+    label: &str,
+) -> Result<(), DecompressError> {
+    use std::io::Read;
+    let mut charged = ChargingReader {
+        inner: reader.take(out_cap),
+        guard,
+        refused: false,
+    };
+    if let Err(e) = charged.read_to_end(out) {
+        if charged.refused {
+            return Err(DecompressError::Budget(cap));
+        }
+        return Err(DecompressError::Decode(format!("{label} decode failed: {e}")));
+    }
+    Ok(())
+}
+
+/// 单一编码解码到 out。M-1：输出预算 cap 作用于解码输出侧 take（单次解码
+/// 绝对上限，膨胀到 cap 附近即中止读取，分配停在 cap+ε）；共享预算余量由
+/// ChargingReader 逐块 try_grow 动态裁定——拒收即刻中止（413 request_too_large）；
 /// 越限报 Budget(cap)，解码失败/不支持编码报 Decode。`input` 为已按前置
 /// 编码解出的数据。
 fn decode_single_coding(
     input: &[u8],
     enc: &str,
     out: &mut Vec<u8>,
+    guard: &mut BufferGuard,
     cap: usize,
 ) -> Result<(), DecompressError> {
-    use std::io::Read;
     // cap+1：读到恰好越限一字节即停，供下方统一越限判定
     let out_cap = (cap as u64).saturating_add(1);
     match enc {
-        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(input)
-            .take(out_cap)
-            .read_to_end(out)
-            .map(|_| ())
-            .map_err(|e| DecompressError::Decode(format!("gzip decode failed: {e}"))),
+        "gzip" | "x-gzip" => read_charged(
+            flate2::read::GzDecoder::new(input),
+            out_cap,
+            out,
+            guard,
+            cap,
+            "gzip",
+        ),
         "deflate" => {
-            // zlib 容器优先，失败回退 raw deflate（部分客户端发裸流）
-            if flate2::read::ZlibDecoder::new(input)
-                .take(out_cap)
-                .read_to_end(out)
-                .is_err()
-            {
-                out.clear();
-                flate2::read::DeflateDecoder::new(input)
-                    .take(out_cap)
-                    .read_to_end(out)
-                    .map(|_| ())
-                    .map_err(|e| {
-                        DecompressError::Decode(format!("deflate decode failed: {e}"))
-                    })?;
+            // zlib 容器优先，解码失败回退 raw deflate（部分客户端发裸流）；
+            // 预算拒收不是解码失败——直接上抛，不再回退重解（同样撞预算）
+            match read_charged(
+                flate2::read::ZlibDecoder::new(input),
+                out_cap,
+                out,
+                guard,
+                cap,
+                "deflate",
+            ) {
+                Err(DecompressError::Decode(_)) => {
+                    out.clear();
+                    read_charged(
+                        flate2::read::DeflateDecoder::new(input),
+                        out_cap,
+                        out,
+                        guard,
+                        cap,
+                        "deflate",
+                    )
+                }
+                other => other,
             }
-            Ok(())
         }
-        "br" => brotli::Decompressor::new(input, 4096)
-            .take(out_cap)
-            .read_to_end(out)
-            .map(|_| ())
-            .map_err(|e| DecompressError::Decode(format!("brotli decode failed: {e}"))),
-        "zstd" | "zst" => zstd::stream::read::Decoder::new(input)
-            .map_err(|e| DecompressError::Decode(format!("zstd decode init failed: {e}")))
-            .and_then(|d| {
-                d.take(out_cap)
-                    .read_to_end(out)
-                    .map(|_| ())
-                    .map_err(|e| DecompressError::Decode(format!("zstd decode failed: {e}")))
-            }),
+        "br" => read_charged(
+            brotli::Decompressor::new(input, 4096),
+            out_cap,
+            out,
+            guard,
+            cap,
+            "br",
+        ),
+        "zstd" | "zst" => {
+            let decoder = zstd::stream::read::Decoder::new(input)
+                .map_err(|e| DecompressError::Decode(format!("zstd decode init failed: {e}")))?;
+            read_charged(decoder, out_cap, out, guard, cap, "zstd")
+        }
         other => Err(DecompressError::Decode(format!(
             "unsupported content-encoding: {other} (supported: gzip, deflate, br, zstd)"
         ))),
@@ -5960,14 +6055,16 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 
     /// 入口解析（挂用户并发 guard 前的唯一一次解压+解析）：identity 直通、
     /// gzip 解压、坏 JSON / 不支持编码 → 400；模型提取空/缺失 → None。
-    /// F1：新签名返回解压后长度（identity 与原始一致，预算调整为 no-op）。
+    /// F1：返回解压后长度（identity 与原始一致）；M-1 并发修复：guard 随
+    /// 三元组归还，解码期逐块入账其预留。
     #[tokio::test]
     async fn parse_request_json_at_entry_and_requested_model() {
         use std::io::Write;
         let raw = br#"{"model":"gpt-x","messages":[]}"#;
-        let (json, len) = parse_request_json(
+        let (json, len, _guard) = parse_request_json(
             &Bytes::from_static(raw),
             &HeaderMap::new(),
+            BufferGuard::unbounded(),
             MAX_DECOMPRESSED_BODY_BYTES,
         )
         .await
@@ -5980,9 +6077,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         let gz = enc.finish().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let (json, len) = parse_request_json(
+        let (json, len, _guard) = parse_request_json(
             &Bytes::from(gz.clone()),
             &headers,
+            BufferGuard::unbounded(),
             MAX_DECOMPRESSED_BODY_BYTES,
         )
         .await
@@ -5998,6 +6096,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             parse_request_json(
                 &Bytes::from_static(b"{not json"),
                 &HeaderMap::new(),
+                BufferGuard::unbounded(),
                 MAX_DECOMPRESSED_BODY_BYTES
             )
             .await,
@@ -6006,7 +6105,13 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         let mut bad = HeaderMap::new();
         bad.insert(header::CONTENT_ENCODING, "lzma".parse().unwrap());
         assert!(matches!(
-            parse_request_json(&Bytes::from(gz), &bad, MAX_DECOMPRESSED_BODY_BYTES).await,
+            parse_request_json(
+                &Bytes::from(gz),
+                &bad,
+                BufferGuard::unbounded(),
+                MAX_DECOMPRESSED_BODY_BYTES
+            )
+            .await,
             Err(AppError::BadRequest(_))
         ));
 
@@ -6018,9 +6123,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(requested_model(&serde_json::json!({ "model": 1 })), None);
     }
 
-    /// M-1：解压上限接预算余量——上限作用于解码输出侧（膨胀到上限附近即中止
-    /// 读取，不再先物化完整明文再事后校验）：超预算膨胀 → 413 request_too_large
-    /// （不再伪装 400）；上限内正常解压；identity 直通体不膨胀，不受上限约束。
+    /// M-1：解压上限接静态预算容量——绝对上限作用于解码输出侧 take（膨胀到
+    /// 上限附近即中止读取，不再先物化完整明文再事后校验）：超预算膨胀 → 413
+    /// request_too_large（不再伪装 400）；上限内正常解压；identity 直通体
+    /// 不膨胀，不受上限约束。动态余量裁定在解码期逐块入账侧。
     #[tokio::test]
     async fn parse_request_json_decode_cap_aborts_over_budget_inflate() {
         use std::io::Write;
@@ -6033,10 +6139,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
 
-        // 余量充足（常量上限）：完整解压解析
-        let (json, len) = parse_request_json(
+        // 上限充足（常量上限）：完整解压解析
+        let (json, len, _guard) = parse_request_json(
             &gz,
             &headers,
+            BufferGuard::unbounded(),
             MAX_DECOMPRESSED_BODY_BYTES,
         )
         .await
@@ -6044,9 +6151,16 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(len, raw.len(), "上限内解压出完整明文");
         assert_eq!(requested_model(&json).as_deref(), Some("m"));
 
-        // 余量不足（小上限注入）：解码中途撞上限 → 413，错误带上限信息
+        // 上限不足（小上限注入）：解码中途撞上限 → 413，错误带上限信息
         let cap = 16 * 1024;
-        let err = parse_request_json(&gz, &headers, cap).await.unwrap_err();
+        let err = parse_request_json(
+            &gz,
+            &headers,
+            BufferGuard::unbounded(),
+            cap,
+        )
+        .await
+        .unwrap_err();
         let AppError::PayloadTooLarge(msg) = &err else {
             panic!("超预算解压必须 413 request_too_large：{err:?}");
         };
@@ -6054,9 +6168,167 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 
         // identity 直通体不膨胀：上限只约束解压膨胀，不误伤直通体
         //（无 Content-Encoding 时整体跳过解码，返回原始体）
-        let passthrough = decompress_request_body(&raw, None, 4)
-            .expect("identity 直通不受解压上限约束");
+        let passthrough =
+            decompress_request_body(&raw, None, &mut BufferGuard::unbounded(), 4)
+                .expect("identity 直通不受解压上限约束");
         assert_eq!(passthrough.len(), raw.len());
+    }
+
+    /// M-1 并发修复回归（跨请求聚合，原套件缺失的覆盖）：N=8 并发任务对同一份
+    /// 共享预算解码 gzip 炸弹——解码输出逐块 try_grow 互斥入账，任一瞬时
+    /// Σ预留 ≤ 容量（peak 结构化断言），全部 413 且失败炸弹即刻让出预算。
+    /// 旧实现（已废除）：各解码器独立快照同一份余量 take，聚合 N×余量物化
+    /// 后才事后 resize——并发炸弹 OOM 根因，单请求测试不可见。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_bombs_aggregate_charges_against_shared_budget() {
+        use std::io::Write;
+
+        const CAP: u64 = 64 * 1024 * 1024;
+        let budget = crate::state::BufferBudget::new(CAP);
+        // 预占 56MiB（模拟其他在途请求）：余量 ~8MiB < 单弹 16MiB 膨胀——
+        // 每个解码器都无法完整解出，「全部 413」与调度时序无关（确定性）
+        let hold = budget.try_acquire(56 * 1024 * 1024).expect("预占不应被拒");
+        let raw = format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(16 * 1024 * 1024))
+            .into_bytes();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let gz = Bytes::from(enc.finish().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let budget = budget.clone();
+                let gz = gz.clone();
+                let headers = headers.clone();
+                tokio::spawn(async move {
+                    // 与 BufLimitedBody 同款：入口按 wire（Content-Length）预留
+                    let Some(guard) = budget.try_acquire(gz.len() as u64) else {
+                        panic!("wire 预留不应被拒");
+                    };
+                    let decode_cap = decode_ceiling(guard.capacity_bytes());
+                    parse_request_json(&gz, &headers, guard, decode_cap).await
+                })
+            })
+            .collect();
+        for h in handles {
+            let err = h
+                .await
+                .expect("任务不应 panic")
+                .expect_err("余量 ~8MiB < 16MiB 膨胀，必须全部 413");
+            assert!(
+                matches!(err, AppError::PayloadTooLarge(_)),
+                "并发炸弹必须 413 request_too_large：{err:?}"
+            );
+        }
+        // 任一瞬时 Σ预留 ≤ 容量（峰值在互斥临界区内采样，无双记账瞬窗）；
+        // 且解码期入账确实发生（峰值越过预占线）
+        assert!(
+            budget.peak_in_use() <= CAP,
+            "Σ预留峰值 {} 不得超过容量 {CAP}",
+            budget.peak_in_use()
+        );
+        assert!(
+            budget.peak_in_use() > 56 * 1024 * 1024,
+            "解码期入账未发生（峰值 {} 未越过预占线）",
+            budget.peak_in_use()
+        );
+        // 失败炸弹已让出全部入账与 raw 预留：仅剩主任务预占
+        assert_eq!(budget.in_use(), 56 * 1024 * 1024, "失败炸弹即刻释放");
+        drop(hold);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// 顺序炸弹仍逐次 413（每次失败后预算归零，可反复拒绝）；预算内解码
+    /// 通过且 guard 预留精确收敛至明文长度（解码期入账 + 入口 resize 收缩）。
+    #[tokio::test]
+    async fn sequential_bombs_still_413_and_within_budget_decode_reconciles() {
+        use std::io::Write;
+        let make_bomb = |pad: usize| -> (Bytes, HeaderMap) {
+            let raw =
+                format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(pad)).into_bytes();
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&raw).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+            (Bytes::from(enc.finish().unwrap()), headers)
+        };
+
+        // 顺序两弹：4MiB 预算 < 16MiB 膨胀，逐次 413
+        let budget = crate::state::BufferBudget::new(4 * 1024 * 1024);
+        let (gz, headers) = make_bomb(16 * 1024 * 1024);
+        for _ in 0..2 {
+            let guard = budget
+                .try_acquire(gz.len() as u64)
+                .expect("wire 预留不应被拒");
+            let decode_cap = decode_ceiling(guard.capacity_bytes());
+            let err = parse_request_json(&gz, &headers, guard, decode_cap)
+                .await
+                .expect_err("超预算膨胀必须 413");
+            assert!(matches!(err, AppError::PayloadTooLarge(_)));
+            assert_eq!(budget.in_use(), 0, "失败炸弹不占坑，下一弹同判");
+        }
+
+        // 预算内解码：guard 预留 = raw + 解码入账，入口 resize 收缩后精确
+        // 等于明文长度（raw 差额即刻归还）
+        let budget = crate::state::BufferBudget::new(64 * 1024 * 1024);
+        let (gz, headers) = make_bomb(4 * 1024 * 1024);
+        let guard = budget
+            .try_acquire(gz.len() as u64)
+            .expect("wire 预留不应被拒");
+        let decode_cap = decode_ceiling(guard.capacity_bytes());
+        let (json, plain_len, mut guard) =
+            parse_request_json(&gz, &headers, guard, decode_cap)
+                .await
+                .expect("预算内解码必须通过");
+        assert_eq!(requested_model(&json).as_deref(), Some("m"));
+        guard
+            .resize_to(plain_len as u64)
+            .expect("收缩收敛不应失败");
+        assert_eq!(
+            budget.in_use(),
+            plain_len as u64,
+            "成功路径预留精确收敛至明文长度"
+        );
+        drop(guard);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// 解码错误释放解码期入账：CRC 损坏的 gzip 膨胀出部分明文（入账已发生）
+    /// 后报 Decode（非预算拒收），guard 预留缩回 raw（压缩 wire 长度）——
+    /// 失败的炸弹即刻让出预算，不占坑到 guard Drop。
+    #[test]
+    fn decode_error_releases_decode_time_charges_to_raw() {
+        use std::io::Write;
+        let budget = crate::state::BufferBudget::new(64 * 1024 * 1024);
+        let raw = format!("{{\"model\":\"m\",\"pad\":\"{}\"}}", "0".repeat(4 * 1024 * 1024))
+            .into_bytes();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let mut gz = enc.finish().unwrap();
+        // 损坏 gzip 尾部 CRC32（末 8 字节 = CRC32 + ISIZE）：解码全程膨胀后
+        // 校验失败 → Decode 错误
+        let last = gz.len() - 8;
+        gz[last] ^= 0xff;
+
+        let mut guard = budget
+            .try_acquire(gz.len() as u64)
+            .expect("wire 预留不应被拒");
+        let cap = decode_ceiling(guard.capacity_bytes());
+        let err = decompress_request_body(&gz, Some("gzip"), &mut guard, cap)
+            .expect_err("CRC 损坏必须解码失败");
+        assert!(
+            matches!(err, DecompressError::Decode(_)),
+            "CRC 损坏归因解码错误而非预算拒收：{err:?}"
+        );
+        // 解码期入账已释放，guard 缩回 raw：预算占用恰为压缩 wire 长度
+        assert_eq!(
+            budget.in_use(),
+            gz.len() as u64,
+            "失败炸弹缩回 raw wire 预留"
+        );
+        drop(guard);
+        assert_eq!(budget.in_use(), 0);
     }
 
     /// F5：SSE 预读错误体累积受上限约束——超限返回 Err（文案带上限，调用方

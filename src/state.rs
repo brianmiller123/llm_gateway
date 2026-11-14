@@ -61,8 +61,9 @@ impl MessageTemplates {
 /// 提取前按预估大小 try-acquire（Content-Length，无长度头的 chunked 传输按
 /// cfg.max_body_bytes 最坏情形），预算不足立即 429（try_acquire 语义，永不
 /// 排队）；许可以 [`BufferGuard`] 持有——缓冲内存活多久预算占多久（流式请求
-/// handler 结束即释放，非流式绑定响应体流尽/断开释放），解压膨胀经
-/// [`BufferGuard::resize_to`] 增量调整（超出剩余预算 → 413，不继续缓冲）。
+/// handler 结束即释放，非流式绑定响应体流尽/断开释放），解压膨胀在解码期经
+/// [`BufferGuard::try_grow`] 逐块原子入账（拒收 → 413 中止解码），成功后
+/// resize_to 收敛至明文长度。
 /// capacity = cfg.buffer_budget_bytes（默认 512MiB；0 = 不限，沿用资源加固
 /// 字段「0 = 关闭」约定）。
 #[derive(Clone, Debug)]
@@ -74,6 +75,10 @@ pub struct BufferBudget {
 struct BufferBudgetInner {
     capacity_bytes: u64,
     used: parking_lot::Mutex<u64>,
+    /// 测试观测：占用历史峰值（仅在既有互斥临界区内更新）——并发测试据此
+    /// 断言「任一瞬时 Σ预留 ≤ 容量」性质（解码入账无双记账窗口）
+    #[cfg(test)]
+    peak_used: std::sync::atomic::AtomicU64,
 }
 
 /// 字节预算许可：持有期间预算被占用，Drop 归还。随缓冲内存生命周期传递
@@ -96,6 +101,8 @@ impl BufferBudget {
                     capacity_bytes
                 },
                 used: parking_lot::Mutex::new(0),
+                #[cfg(test)]
+                peak_used: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -107,6 +114,8 @@ impl BufferBudget {
             return None;
         }
         *used += bytes;
+        #[cfg(test)]
+        self.record_peak_test(*used);
         Some(BufferGuard {
             budget: self.clone(),
             reserved: bytes,
@@ -121,15 +130,21 @@ impl BufferBudget {
             return false;
         }
         *used += extra;
+        #[cfg(test)]
+        self.record_peak_test(*used);
         true
     }
 
-    /// 当前预算余量（capacity − used）：解压上限钳制用（min(常量上限, 余量)），
-    /// 使 gzip 炸弹在解码中途撞预算中止，不再先物化完整明文再事后校验
-    fn headroom(&self) -> u64 {
-        self.inner
-            .capacity_bytes
-            .saturating_sub(*self.inner.used.lock())
+    /// 测试观测：在既有互斥临界区内更新占用峰值（Relaxed 序即可——峰值读取
+    /// 与 used 更新共享同一把锁的 happens-before）
+    #[cfg(test)]
+    fn record_peak_test(&self, current: u64) {
+        let peak = self.inner.peak_used.load(std::sync::atomic::Ordering::Relaxed);
+        if current > peak {
+            self.inner
+                .peak_used
+                .store(current, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn release(&self, bytes: u64) {
@@ -140,6 +155,15 @@ impl BufferBudget {
     #[cfg(test)]
     pub fn in_use(&self) -> u64 {
         *self.inner.used.lock()
+    }
+
+    /// 占用历史峰值（测试断言用）：并发解码入账的「任一瞬时 Σ预留 ≤ 容量」
+    /// 性质据此结构化校验（峰值在互斥临界区内采样，不漏瞬窗）
+    #[cfg(test)]
+    pub fn peak_in_use(&self) -> u64 {
+        self.inner
+            .peak_used
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -153,10 +177,23 @@ impl BufferGuard {
         }
     }
 
-    /// 当前预算余量（capacity − used，本 guard 已预留部分计入占用）：解压
-    /// 上限取 min(常量上限, 余量)（M-1）
-    pub(crate) fn headroom(&self) -> u64 {
-        self.budget.headroom()
+    /// 预算容量（0 = 关闭 → u64::MAX）：解压绝对上限 min(容量, 常量) 取值用。
+    /// 注意取静态容量而非瞬时余量——余量快照正是并发解码各自独占余量的
+    /// 聚合漏洞来源，动态裁定交由解码期 try_grow 互斥入账
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        self.budget.inner.capacity_bytes
+    }
+
+    /// 解码期增量入账（解压输出逐块调用）：单次互斥临界区内 check-and-inc，
+    /// 剩余预算不足返回 Err（guard 保持原预留，调用方据此中止解码 → 413）。
+    /// N 个并发解码各自逐块原子入账，任一瞬时 Σ预留 ≤ 容量——不再出现
+    /// 各解码器独立快照余量、聚合超卖同一份 headroom 的窗口
+    pub(crate) fn try_grow(&mut self, extra: u64) -> Result<(), ()> {
+        if !self.budget.try_acquire_extra(extra) {
+            return Err(());
+        }
+        self.reserved += extra;
+        Ok(())
     }
 
     /// 预留调整到 new_size：收缩 → 立即释放富余；增长 → try-acquire 增量，
