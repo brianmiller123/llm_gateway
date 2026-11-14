@@ -300,7 +300,8 @@ pub async fn aggregate_daily(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::Usage;
+    use super::{record_usage, Usage, UsageMeta};
+    use uuid::Uuid;
 
     #[test]
     fn openai_nested_cache_details_map_to_cache_read() {
@@ -370,5 +371,78 @@ mod tests {
         u2.fold_anthropic_input();
         u2.fold_anthropic_input();
         assert_eq!(u2.input_tokens, Some(10));
+    }
+
+    // ---------- DB 集成测试（#[sqlx::test] 每测独立临时库，自动应用迁移） ----------
+
+    /// 最小 UsageMeta 构造（user_id = None：跳过月度/Plan 计数器，仅验证明细行）
+    fn meta(request_id: Uuid, failure_class: Option<&'static str>) -> UsageMeta {
+        UsageMeta {
+            request_id,
+            user_id: None,
+            api_key_id: None,
+            model: "test-model".into(),
+            provider_id: 1,
+            endpoint: "openai",
+            streamed: false,
+            client_ip: None,
+            session_id: None,
+            first_token_ms: None,
+            started: std::time::Instant::now(),
+            test_call: false,
+            pricing_models: Vec::new(),
+            plan: None,
+            failure_class,
+            upstream_status: None,
+            attempt: None,
+        }
+    }
+
+    /// 0036 回归（F3 缺陷）：同一 request_id 的候选归因行（failure_class 非空）
+    /// 与终局客户端可见行（NULL）必须共存——全表 UNIQUE 时代先落的归因行会把
+    /// 后落的终局行挤掉（duplicate key），客户端实际收到的错误从状态页消失。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn failure_row_and_client_visible_row_share_request_id(pool: sqlx::PgPool) {
+        let rid = Uuid::new_v4();
+        // 与 proxy 实际顺序一致：先落候选归因行，再落终局行
+        record_usage(&pool, &meta(rid, Some("upstream_status")), None, 502, 10, 1, 0.0)
+            .await
+            .unwrap();
+        record_usage(&pool, &meta(rid, None), None, 502, 10, 1, 0.0)
+            .await
+            .unwrap();
+
+        let (total, visible): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE failure_class IS NULL) \
+             FROM usage_logs WHERE request_id = $1",
+        )
+        .bind(rid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 2, "归因行与终局行都应落库");
+        assert_eq!(visible, 1, "客户端可见行恰一条");
+    }
+
+    /// 0036 回归：终态行（failure_class NULL）每请求仍唯一——同 request_id 的
+    /// 第二条 NULL 行必须被部分唯一索引拒绝（终局行只写一次的语义兜底）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn duplicate_client_visible_row_violates_partial_unique(pool: sqlx::PgPool) {
+        let rid = Uuid::new_v4();
+        record_usage(&pool, &meta(rid, None), None, 200, 10, 1, 0.0)
+            .await
+            .unwrap();
+        let err = record_usage(&pool, &meta(rid, None), None, 200, 10, 1, 0.0)
+            .await
+            .unwrap_err();
+        let sqlx::Error::Database(db) = err else {
+            panic!("expected DatabaseError, got {err}");
+        };
+        assert!(db.is_unique_violation(), "expected 23505, got {db}");
+        assert_eq!(
+            db.constraint(),
+            Some("usage_logs_request_id_client_visible_key"),
+            "违例应来自部分唯一索引而非其它约束"
+        );
     }
 }
