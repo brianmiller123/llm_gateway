@@ -12,7 +12,12 @@ use crate::service::ratelimit::RateLimiter;
 use crate::service::usage::UsageCache;
 use crate::store::access::{UserAccessRule, load_user_access};
 use crate::store::rules::{ModelPrice, RateRule, load_prices, load_rules};
+use crate::store::keys::ApiKeyRow;
 use crate::store::upstream::{ModelRoute, Provider, load_providers, load_routes};
+
+/// F11：鉴权前缀缓存（前缀 → (缓存时刻, 候选行)）。TTL = cfg.auth_cache_secs
+/// （0 = 关闭直查 DB），每次 reload tick 清空；sha256 行匹配仍在逐候选比对。
+pub type AuthKeyCache = Arc<Mutex<HashMap<String, (std::time::Instant, Vec<ApiKeyRow>)>>>;
 
 /// 拒绝文案模板：并发 429 / 模型无权限 403（管理员可配置，系统设置页）。
 /// DB 空串 = 未自定义，渲染时回落 store::config::DEFAULT_MSG_* 内置默认；
@@ -113,6 +118,9 @@ pub struct AppState {
     /// 进程内指标计数器（/metrics 文本导出；连接加固 wave1 挂载）。
     /// 全应用共享单实例：proxy 候选失败 / 熔断开闸 / 客户端中断在此累计
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// F11：鉴权前缀缓存（吊销/禁用最迟 TTL（cfg.auth_cache_secs，默认 5s）
+    /// 内陈旧——接受的折衷；每次 reload tick 清空，0 = 关闭）
+    pub auth_cache: AuthKeyCache,
 }
 
 impl AppState {
@@ -190,6 +198,7 @@ impl AppState {
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            auth_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         state.reload().await?;
         Ok(state)
@@ -255,6 +264,7 @@ impl AppState {
             plan_alerts_seen: Arc::new(Mutex::new(HashSet::new())),
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            auth_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -324,6 +334,10 @@ impl AppState {
     /// 启动期（init）返回首个错误 fail-fast；周期刷新沿用旧值继续运行。
     pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut first_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        // F11：全量 reload 即清空鉴权前缀缓存——吊销/禁用最迟下个 tick（加
+        // TTL 内 ≤auth_cache_secs）生效，是接受的折衷；清空无条件执行，
+        // 不因某节失败而跳过
+        self.auth_cache.lock().clear();
         macro_rules! section {
             ($name:literal, $expr:expr) => {
                 if let Err(e) = $expr.await {

@@ -1,5 +1,6 @@
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -23,6 +24,11 @@ fn match_candidate<'a>(rows: &'a [ApiKeyRow], key: &str) -> Option<&'a ApiKeyRow
     let digest = hex::encode(Sha256::digest(key.as_bytes()));
     rows.iter()
         .find(|row| constant_time_eq(digest.as_bytes(), row.key_hash.as_bytes()))
+}
+
+/// F11：缓存条目是否在 TTL 内（now 注入，sleep-free 单测）
+fn cache_fresh(at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(at) < ttl
 }
 
 /// 提取并校验 Bearer API Key，返回 (user_id, api_key_id)
@@ -57,11 +63,38 @@ pub async fn authenticate(
         return Err(AppError::Auth("invalid api key".into()));
     }
 
-    // 12 位前缀定位（避免全表哈希扫描）；前缀仅 12 hex 会碰撞 → 取全部候选逐行比对
+    // 12 位前缀定位（避免全表哈希扫描）；前缀仅 12 hex 会碰撞 → 取全部候选逐行比对。
+    // F11：候选组走进程内前缀缓存（TTL = cfg.auth_cache_secs，0 = 关闭直查
+    // DB；每次 reload tick 全量清空）——热路径免逐请求 DB SELECT。吊销/禁用
+    // 最迟 TTL + 一个 reload tick 内生效，对 5s 量级延迟换取主链路免查询是
+    // 接受的折衷；sha256 行匹配仍在逐候选常数时间比对，缓存只省定位查询。
     let prefix = &key[..12];
-    let rows = find_all_by_prefix(&st.pool, prefix)
-        .await
-        .map_err(AppError::internal)?;
+    let ttl = Duration::from_secs(st.cfg.auth_cache_secs);
+    let rows = if ttl.is_zero() {
+        find_all_by_prefix(&st.pool, prefix)
+            .await
+            .map_err(AppError::internal)?
+    } else {
+        let now = Instant::now();
+        let cached = st
+            .auth_cache
+            .lock()
+            .get(prefix)
+            .filter(|(at, _)| cache_fresh(*at, now, ttl))
+            .map(|(_, rows)| rows.clone());
+        match cached {
+            Some(rows) => rows,
+            None => {
+                let rows = find_all_by_prefix(&st.pool, prefix)
+                    .await
+                    .map_err(AppError::internal)?;
+                st.auth_cache
+                    .lock()
+                    .insert(prefix.to_string(), (now, rows.clone()));
+                rows
+            }
+        }
+    };
     if rows.is_empty() {
         tracing::warn!(prefix, "api key not found");
         return Err(AppError::Auth("invalid api key".into()));
@@ -112,5 +145,94 @@ mod tests {
     fn no_candidate_matches_returns_none() {
         let rows = [row(1, "deadbeef")];
         assert!(match_candidate(&rows, "sk-gateway-0123456789abcdef").is_none());
+    }
+
+    // ---------- F11：前缀缓存（TTL，0 = 关闭） ----------
+
+    use std::time::{Duration, Instant};
+
+    /// 构造鉴权测试态：断连池（触 DB 即快速失败——据此证明缓存命中/关闭
+    /// 时是否真的绕开了 DB）+ 注入的 auth_mode/TTL
+    fn auth_fixture(auth_cache_secs: u64) -> AppState {
+        let mut st = AppState::test_fixture();
+        let mut cfg = (*st.cfg).clone();
+        cfg.auth_mode = crate::config::AuthMode::ApiKey;
+        cfg.auth_cache_secs = auth_cache_secs;
+        st.cfg = std::sync::Arc::new(cfg);
+        st
+    }
+
+    fn bearer(key: &str) -> axum::http::HeaderMap {
+        axum::http::HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {key}").parse().unwrap(),
+        )])
+    }
+
+    fn cached_rows(key: &str) -> Vec<ApiKeyRow> {
+        vec![row(
+            42,
+            &hex::encode(sha2::Sha256::digest(key.as_bytes())),
+        )]
+    }
+
+    #[test]
+    fn cache_fresh_ttl_boundary() {
+        let at = Instant::now();
+        let ttl = Duration::from_secs(5);
+        assert!(cache_fresh(at, at + Duration::from_secs(1), ttl), "TTL 内命中");
+        assert!(
+            cache_fresh(at, at + ttl - Duration::from_millis(1), ttl),
+            "TTL 边界前一瞬仍命中"
+        );
+        assert!(!cache_fresh(at, at + ttl, ttl), "越过 TTL 未命中");
+    }
+
+    /// 缓存命中：断连池下仍成功返回——证明热路径未触 DB（候选组来自缓存）
+    #[tokio::test]
+    async fn authenticate_serves_from_cache_within_ttl() {
+        let key = "sk-gateway-cache-hit-key-0001";
+        let st = auth_fixture(60);
+        st.auth_cache
+            .lock()
+            .insert(key[..12].to_string(), (Instant::now(), cached_rows(key)));
+
+        let (user_id, key_id) = authenticate(&st, &bearer(key))
+            .await
+            .expect("缓存命中必须免 DB 查询直接通过");
+        assert_eq!(user_id, Some(7));
+        assert_eq!(key_id, Some(42));
+    }
+
+    /// TTL 过期：回源 DB——断连池下必然失败，证明过期条目不再被信任
+    #[tokio::test]
+    async fn expired_cache_entry_falls_back_to_db() {
+        let key = "sk-gateway-cache-exp-key-002";
+        let st = auth_fixture(60);
+        st.auth_cache.lock().insert(
+            key[..12].to_string(),
+            (Instant::now() - Duration::from_secs(61), cached_rows(key)),
+        );
+
+        assert!(
+            authenticate(&st, &bearer(key)).await.is_err(),
+            "过期缓存必须回源 DB（断连池下失败即证回源）"
+        );
+    }
+
+    /// 关闭模式（auth_cache_secs = 0）：即使缓存有匹配条目也直查 DB——
+    /// 断连池下失败即证缓存被绕开
+    #[tokio::test]
+    async fn disabled_cache_mode_goes_straight_to_db() {
+        let key = "sk-gateway-cache-off-key-03";
+        let st = auth_fixture(0);
+        st.auth_cache
+            .lock()
+            .insert(key[..12].to_string(), (Instant::now(), cached_rows(key)));
+
+        assert!(
+            authenticate(&st, &bearer(key)).await.is_err(),
+            "0 = 关闭缓存，必须直查 DB"
+        );
     }
 }
