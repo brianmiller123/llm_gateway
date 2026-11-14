@@ -213,19 +213,29 @@ impl AppConfig {
         let failover_on_header_timeout = env_bool("GATEWAY_FAILOVER_ON_HEADER_TIMEOUT", false)?;
         // 连接加固：受信代理网段（CSV；空 = 直连拓扑，仅用对端 socket 地址）
         let trust_proxy_cidrs = env("GATEWAY_TRUST_PROXY_CIDRS", "");
-        // 资源加固：数据库连接池上限（默认 32）
+        // 资源加固：数据库连接池上限（默认 32）。上限 500：单实例远超 PG
+        // max_connections（默认 100）的配置是自杀式误配——宁可启动期 loud
+        // 报错，也不要上线后静默耗尽 PG 连接/fd 造成全库故障
         let db_max_conns: u32 = env("GATEWAY_DB_MAX_CONNS", "32")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_DB_MAX_CONNS: {e}"))?;
         if db_max_conns == 0 {
             return Err("GATEWAY_DB_MAX_CONNS must be >= 1".into());
         }
-        // 资源加固：用量明细保留天数（默认 90；0 = 关闭清理）
+        if db_max_conns > 500 {
+            return Err("GATEWAY_DB_MAX_CONNS must be <= 500 (protect postgres max_connections; a loud config error beats a silent pool storm)".into());
+        }
+        // 资源加固：用量明细保留天数（默认 90；0 = 关闭清理）。上限 36500
+        //（百年）：purge 经 make_interval(days => $1::int) 绑定，超出 i32
+        // 范围的值每次清理周期确定性失败 SQL cast，purge 静默停摆
         let usage_retention_days: i64 = env("GATEWAY_USAGE_RETENTION_DAYS", "90")
             .parse()
             .map_err(|e| format!("invalid GATEWAY_USAGE_RETENTION_DAYS: {e}"))?;
         if usage_retention_days < 0 {
             return Err("GATEWAY_USAGE_RETENTION_DAYS must be >= 0".into());
+        }
+        if usage_retention_days > 36_500 {
+            return Err("GATEWAY_USAGE_RETENTION_DAYS must be <= 36500 (fits the SQL int cast in the purge query)".into());
         }
         // 资源加固：流式缓冲总预算（字节，默认 512MiB）
         let buffer_budget_bytes: u64 = env("GATEWAY_BUFFER_BUDGET_BYTES", "536870912")
