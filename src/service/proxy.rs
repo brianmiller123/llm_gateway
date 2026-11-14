@@ -2070,6 +2070,9 @@ async fn proxy_authed_inner(
                             started.elapsed().as_millis() as i64,
                         )
                         .await;
+                        // M-4（QC1-M-1）：读体失败归因本候选（与非 SSE 读体失败
+                        // 分支同形）——缺失会让尾段错误上下文落回 candidates[0]
+                        last_failed = Some(provider);
                         continue;
                     }
                 };
@@ -2234,6 +2237,9 @@ async fn proxy_authed_inner(
                             started.elapsed().as_millis() as i64,
                         )
                         .await;
+                        // M-4（QC1-M-1）：读体失败归因本候选（与非 SSE 读体失败
+                        // 分支同形）——缺失会让尾段错误上下文落回 candidates[0]
+                        last_failed = Some(provider);
                         continue;
                     }
                 };
@@ -5575,6 +5581,31 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         )
     }
 
+    /// 一次性假上游（洪流变体）：回写预置头 + 帧后持续写同一帧，直至客户端
+    /// 断开（M-4 测试用：驱动 collect 错误体 128MiB 上限 Err 分支；读满断开
+    /// 后 write 失败即退出，不要求发满声明的 Content-Length）
+    async fn spawn_flooding_upstream(head: String, frame: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(frame.as_bytes()).await;
+            for _ in 0..60_000 {
+                if sock.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
     fn test_provider(
         id: i64,
         api_type: &str,
@@ -5732,6 +5763,75 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(
             snap.window_requests, 1,
             "必须恰好结算一次（重复结算会计 2 次窗口请求）"
+        );
+    }
+
+    /// M-4（QC1-M-1）：converted SSE 错误体读失败（超 128MiB 读体上限）换家后，
+    /// 尾段错误上下文必须归属实际最后失败的候选——此前该 Err 分支不写
+    /// last_failed，上下文落回 candidates[0]。p1 先以「首字节前断流」臂归因
+    /// （last_failed=p1 + last_failure=502 信封）；p2 预读提交首帧后错误体洪流
+    /// 超读体上限 → 走被修的 collect Err 臂换家；终局透传 p1 的 502 信封按
+    /// Anthropic 方言整形，provider 上下文必须指向 p2（修复前为 p1）。
+    #[tokio::test]
+    async fn converted_sse_body_read_failure_attributes_last_candidate() {
+        let mut st = crate::state::AppState::test_fixture();
+        probe_fixture(&mut st);
+        // p1：SSE content-type + 空体 → 预读「首字节前断流」臂（既有归因）
+        let p1_upstream = spawn_one_shot_upstream(http_response(
+            "HTTP/1.1 406 Not Acceptable",
+            "text/event-stream",
+            "",
+        ))
+        .await;
+        // p2：首帧可提交（与既有 406 SSE 测试同形），错误体洪流超读体上限
+        let frame = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+            "x".repeat(3072),
+        );
+        let head = "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/event-stream\r\n\
+                    Content-Length: 1073741824\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let p2_upstream = spawn_flooding_upstream(head, frame).await;
+        let p1 = test_provider(1, "openai", &format!("http://{p1_upstream}"), "sk-1", &st.cfg.master_key);
+        let p2 = test_provider(2, "openai", &format!("http://{p2_upstream}"), "sk-2", &st.cfg.master_key);
+        *st.providers.write() = vec![p1, p2];
+        *st.routes.write() = vec![test_route("t-model", 1, vec![2])];
+        st.rebuild_provider_keys_from_memory();
+
+        let json = serde_json::json!({
+            "model": "t-model",
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/messages",
+                upstream: "/messages",
+                responses: false,
+                anthropic: true,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect("全候选耗尽经 last_failure 透传终局响应");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "p1 的 502 信封状态透传");
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        let body = String::from_utf8(body).expect("utf8 body");
+        assert!(
+            body.contains("provider=p2"),
+            "尾段错误上下文必须归属实际最后失败的 p2：{body}"
+        );
+        assert!(
+            !body.contains("provider=p1"),
+            "不得落回 candidates[0]（p1 非最后失败候选）：{body}"
         );
     }
 
