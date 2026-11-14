@@ -233,6 +233,9 @@ pub struct AppState {
     /// F1：进程级缓冲字节预算（/v1 整包缓冲 + 解压膨胀记账；guard 随缓冲
     /// 内存生命周期释放，容量 = cfg.buffer_budget_bytes，0 = 不限）
     pub buffer_budget: BufferBudget,
+    /// F8：解密后的渠道密钥快照 provider_id → 明文 key。reload 全量重建后
+    /// 指针整体交换（读路径 Arc clone 后无锁查表，热路径不再逐候选解密）
+    pub provider_keys: Arc<RwLock<Arc<HashMap<i64, String>>>>,
     /// F11：鉴权前缀缓存（吊销/禁用最迟 TTL（cfg.auth_cache_secs，默认 5s）
     /// 内陈旧——接受的折衷；每次 reload tick 清空，0 = 关闭）
     pub auth_cache: AuthKeyCache,
@@ -316,6 +319,7 @@ impl AppState {
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             buffer_budget: BufferBudget::new(buffer_budget_bytes),
+            provider_keys: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             auth_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         state.reload().await?;
@@ -385,8 +389,28 @@ impl AppState {
             provider_health: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             buffer_budget: BufferBudget::new(buffer_budget_bytes),
+            provider_keys: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             auth_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// F8 测试辅助：从内存 providers 重建解密密钥快照（reload 的 provider_keys
+    /// 段同款逻辑——解密失败渠道不入快照）。断连池夹具跑不了 DB reload，
+    /// 全候选循环测试（proxy_test）播种 providers 后调用。
+    #[cfg(test)]
+    pub(crate) fn rebuild_provider_keys_from_memory(&self) {
+        let mut keys: HashMap<i64, String> = HashMap::new();
+        for p in self.providers.read().iter() {
+            match crate::crypto::decrypt(&p.api_key_encrypted, &self.cfg.master_key) {
+                Ok(k) => {
+                    keys.insert(p.id, k);
+                }
+                Err(e) => {
+                    tracing::error!(provider_id = p.id, error = %e, "test key decrypt failed; excluded from snapshot");
+                }
+            }
+        }
+        *self.provider_keys.write() = Arc::new(keys);
     }
 
     /// 重载 LDAP 设置（生产路径：DB 配置启用（url 非空）时字段级 DB 优先、空字段回退 env）
@@ -470,6 +494,32 @@ impl AppState {
         section!("providers", async {
             let v = load_providers(&self.pool).await?;
             *self.providers.write() = v;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        section!("provider_keys", async {
+            // F8：渠道密钥解密快照——reload 期一次性解密，热路径仅查表。
+            // 解密失败的渠道不入快照（留痕），热路径按缺钥走既有候选失败
+            // 归因，其余渠道不受影响；换钥随下一轮 reload 重建生效
+            let providers = load_providers(&self.pool).await?;
+            let mut keys: HashMap<i64, String> = HashMap::with_capacity(providers.len());
+            for p in providers {
+                match crate::crypto::decrypt(&p.api_key_encrypted, &self.cfg.master_key) {
+                    Ok(k) => {
+                        keys.insert(p.id, k);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            provider_id = p.id,
+                            provider = %p.name,
+                            error = %e,
+                            "provider key decrypt failed; provider excluded from key snapshot"
+                        );
+                    }
+                }
+            }
+            // 指针整体交换：读路径拿旧 Arc 短暂存续（进行中请求用旧钥完成），
+            // 新请求立即可见新快照
+            *self.provider_keys.write() = Arc::new(keys);
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         section!("routes", async {
