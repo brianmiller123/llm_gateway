@@ -3518,7 +3518,7 @@ struct BillingOnDrop {
 impl Drop for BillingOnDrop {
     fn drop(&mut self) {
         // 连接加固：半开探测名额归还——流未结算即被丢弃时只释放名额不计数
-        // （见 QC 评审 S-2：极端时序下可能清除下一位探针，暂不处理）
+        // 已知残留（QC 评审 S-2）：极端时序下 drop 可能清除下一位探针标记（ABA），暂不处理
         self.st.breaker.release_probe(self.meta.provider_id);
         if !self.recorded.swap(true, Ordering::SeqCst) {
             // 连接加固：客户端中断计数（流式响应中途断开/丢弃）

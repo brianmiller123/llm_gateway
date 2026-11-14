@@ -21,8 +21,9 @@ use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
     let web_dir = state.cfg.web_dir.clone();
-    // /v1 中间件栈（外→内）：请求体上限提前检查 → 请求 tracing（DEBUG span）→
-    // v1::routes 内部的自定义响应头
+    // S-4：管理鉴权中间件（复用 console::require_admin，与 /api/admin/* 同一模式）
+    let admin = axum::middleware::from_fn_with_state(state.clone(), console::require_admin);
+    // /v1 中间件栈（外→内；axum 后加者为外层）：请求 tracing（DEBUG span，413 拒绝同样产生 span）→ 请求体上限提前检查 → v1::routes 内部的自定义响应头
     let v1 = v1::routes(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -40,7 +41,9 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
+        // S-4：/metrics 暴露按渠道的失败率/熔断开闸等拓扑敏感指标，须过管理
+        // 鉴权；/healthz /readyz 是存活/就绪探针，保持无鉴权
+        .route("/metrics", get(metrics).layer(admin))
         .route("/", get(root))
         .merge(v1)
         .merge(status::routes())
@@ -556,5 +559,101 @@ mod tests {
         assert!(out.contains("gateway_upstream_error_total{provider_id=\"3\"} 2"));
         assert!(out.contains("gateway_upstream_error_total{provider_id=\"9\"} 1"));
         assert!(out.contains("gateway_breaker_open_total 1"));
+    }
+
+    // ---------- /metrics 管理鉴权（S-4） ----------
+
+    /// oneshot 等价：直接用 tower_service（直接依赖）+ std poll_fn，不为此引入
+    /// tower::util 依赖。Router 的 poll_ready 就绪即返回。
+    async fn send(
+        mut app: Router,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> Response {
+        use tower_service::Service;
+        std::future::poll_fn(|cx| {
+            <Router as tower_service::Service<axum::http::Request<axum::body::Body>>>::poll_ready(
+                &mut app, cx,
+            )
+        })
+        .await
+        .expect("router ready");
+        app.call(req).await.expect("router call")
+    }
+
+    /// S-4：/metrics 暴露按渠道失败率/熔断开闸等拓扑敏感指标，必须过管理
+    /// 鉴权（复用 console::require_admin，与 /api/admin/* 同一模式）；无凭据
+    /// 401、有效但非管理员 403、管理员 200 text/plain。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn metrics_requires_admin_auth(
+        _pool_opts: sqlx::pool::PoolOptions<sqlx::Postgres>,
+        opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        // test_fixture 首调完成一次性 GATEWAY_MASTER_KEY 注入（from_env 强依赖）；
+        // 复用其 cfg 作模板，仅把 database_url 指向 sqlx 测试库
+        use sqlx::ConnectOptions as _;
+        let mut cfg = (*AppState::test_fixture().cfg).clone();
+        cfg.database_url = opts.to_url_lossy().to_string();
+        let state = AppState::init(std::sync::Arc::new(cfg)).await.expect("state init");
+        // Router 持有 state，测试还需 pool 发建号查询 → 克隆（Arc 集合，廉价）
+        let app = build_router(state.clone());
+
+        // 无凭据 → 401（不触库，先于任何 DB 查询短路）
+        let resp = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let issue = |st: &AppState, user: &crate::store::users::UserRow| {
+            crate::service::session::issue_access(&st.cfg.jwt_secret, user, 900).expect("token")
+        };
+        let get_metrics = |token: String| {
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // 有效凭据但非管理员 → 403
+        let user = crate::store::users::create_local_user(
+            &state.pool,
+            "metrics_plain_user",
+            "metrics_plain_user",
+            "not-a-real-hash",
+            false,
+        )
+        .await
+        .expect("create user");
+        let resp = send(app.clone(), get_metrics(issue(&state, &user))).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 管理员凭据 → 200 text/plain 指标文本
+        let admin = crate::store::users::create_local_user(
+            &state.pool,
+            "metrics_admin_user",
+            "metrics_admin_user",
+            "not-a-real-hash",
+            true,
+        )
+        .await
+        .expect("create admin");
+        let resp = send(app, get_metrics(issue(&state, &admin))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("gateway_conn_accepted_total"),
+            "管理员可见完整指标文本"
+        );
     }
 }
