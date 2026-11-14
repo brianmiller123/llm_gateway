@@ -1,5 +1,6 @@
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::error::AppError;
@@ -30,6 +31,30 @@ fn match_candidate<'a>(rows: &'a [ApiKeyRow], key: &str) -> Option<&'a ApiKeyRow
 fn cache_fresh(at: Instant, now: Instant, ttl: Duration) -> bool {
     now.saturating_duration_since(at) < ttl
 }
+
+/// L-d（QC2-L-6）：缓存容量界（max_entries 注入供测试）——插入前超容先逐出
+/// TTL 过期条目（tick 间自然过期即可腾位），仍超容则整体清空（未鉴权前缀
+/// 洪泛不能在两个 reload tick 之间无限抬升内存；下个 tick 本就全量清空）。
+/// 插入后规模界 = max_entries。
+fn insert_bounded(
+    cache: &mut HashMap<String, (Instant, Vec<ApiKeyRow>)>,
+    prefix: String,
+    value: (Instant, Vec<ApiKeyRow>),
+    now: Instant,
+    ttl: Duration,
+    max_entries: usize,
+) {
+    if cache.len() >= max_entries {
+        cache.retain(|_, (at, _)| cache_fresh(*at, now, ttl));
+        if cache.len() >= max_entries {
+            cache.clear();
+        }
+    }
+    cache.insert(prefix, value);
+}
+
+/// L-d：鉴权前缀缓存规模界（miss 结果无条件入缓存，规模受每次插入钳制）
+const AUTH_CACHE_MAX_ENTRIES: usize = 50_000;
 
 /// 提取并校验 Bearer API Key，返回 (user_id, api_key_id)
 ///
@@ -88,9 +113,16 @@ pub async fn authenticate(
                 let rows = find_all_by_prefix(&st.pool, prefix)
                     .await
                     .map_err(AppError::internal)?;
-                st.auth_cache
-                    .lock()
-                    .insert(prefix.to_string(), (now, rows.clone()));
+                // L-d：容量界插入——超容先逐过期条目，仍超容整体清空
+                let mut cache = st.auth_cache.lock();
+                insert_bounded(
+                    &mut cache,
+                    prefix.to_string(),
+                    (now, rows.clone()),
+                    now,
+                    ttl,
+                    AUTH_CACHE_MAX_ENTRIES,
+                );
                 rows
             }
         }
@@ -234,5 +266,32 @@ mod tests {
             authenticate(&st, &bearer(key)).await.is_err(),
             "0 = 关闭缓存，必须直查 DB"
         );
+    }
+
+    /// L-d：容量界——插入前超容先逐出 TTL 过期条目（正常过期腾位，存活条目
+    /// 不受影响）；全为存活条目仍超容 → 整体清空（未鉴权前缀洪泛不抬升内存）
+    #[test]
+    fn auth_cache_insert_bounded_evicts_expired_then_clears() {
+        let ttl = Duration::from_secs(5);
+        let now = Instant::now();
+        let expired_at = Instant::now() - Duration::from_secs(ttl.as_secs() + 10);
+
+        // 满容过期条目：逐过期腾位 → 新条目入位
+        let mut cache: HashMap<String, (Instant, Vec<ApiKeyRow>)> = HashMap::new();
+        for i in 0..3 {
+            cache.insert(format!("old{i}"), (expired_at, Vec::new()));
+        }
+        insert_bounded(&mut cache, "new".into(), (now, Vec::new()), now, ttl, 3);
+        assert_eq!(cache.len(), 1, "过期条目全部逐出后仅剩新插入条目");
+        assert!(cache.contains_key("new"));
+
+        // 满容存活条目：无法腾位 → 整体清空再插入
+        let mut cache: HashMap<String, (Instant, Vec<ApiKeyRow>)> = HashMap::new();
+        for i in 0..3 {
+            cache.insert(format!("fresh{i}"), (now, Vec::new()));
+        }
+        insert_bounded(&mut cache, "new".into(), (now, Vec::new()), now, ttl, 3);
+        assert_eq!(cache.len(), 1, "仍超容则清空，仅剩新条目");
+        assert!(cache.contains_key("new"));
     }
 }
