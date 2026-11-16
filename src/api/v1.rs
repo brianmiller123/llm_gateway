@@ -144,6 +144,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(models))
@@ -196,6 +197,7 @@ async fn responses(
             upstream: "/responses",
             responses: true,
             anthropic: false,
+            systemone: false,
         },
         ip,
     )
@@ -222,6 +224,7 @@ async fn messages(
             upstream: "/messages",
             responses: false,
             anthropic: true,
+            systemone: false,
         },
         ip,
     )
@@ -229,6 +232,37 @@ async fn messages(
     {
         Ok(resp) => Ok(resp),
         Err(e) => Ok(crate::service::anthropic::error_response(&e)),
+    }
+}
+
+/// POST /v1/systemone：TypeSafe System One 决策模型（单次请求返回全部问题的
+/// 概率分布）。仅 `api_type=systemone` 上游原生透传，其余配对方言不匹配 400；
+/// 无流式。网关内部错误整形为 `{"detail": ...}`（客户端方言）。
+async fn systemone(
+    State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: BufLimitedBody,
+) -> Result<Response, AppError> {
+    let ip = resolve_client_ip(addr, &headers, &st.cfg.trust_proxy_cidrs);
+    match proxy::proxy(
+        &st,
+        headers,
+        body.0,
+        body.1,
+        Endpoint {
+            api: "/v1/systemone",
+            upstream: "/systemone",
+            responses: false,
+            anthropic: false,
+            systemone: true,
+        },
+        ip,
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => Ok(crate::service::systemone::error_response(&e)),
     }
 }
 
@@ -249,6 +283,7 @@ async fn chat_completions(
             upstream: "/chat/completions",
             responses: false,
             anthropic: false,
+            systemone: false,
         },
         ip,
     )
@@ -272,6 +307,7 @@ async fn completions(
             upstream: "/completions",
             responses: false,
             anthropic: false,
+            systemone: false,
         },
         ip,
     )
@@ -295,6 +331,7 @@ async fn embeddings(
             upstream: "/embeddings",
             responses: false,
             anthropic: false,
+            systemone: false,
         },
         ip,
     )
@@ -302,8 +339,13 @@ async fn embeddings(
 }
 
 /// GET /v1/models：列出全部模型名（模型库 models 表已启用行 + 出站模型在库内
-/// 启用的路由别名 pattern，去重）；有 API Key 时按用户授权过滤；通配符 pattern
-/// （不可作为模型名提交）不列出。
+/// 启用的路由别名 pattern，去重）；通配符 pattern（不可作为模型名提交）不列出。
+///
+/// 鉴权：`auth_mode = api_key`（默认）必须携带有效 API Key——`Authorization:
+/// Bearer <key>` 或 `x-api-key: <key>`，缺失/无效一律 401 `invalid_api_key`；
+/// `auth_mode = none`（本地开发）直接放行。普通用户按 provider 走用户授权过滤，
+/// 管理员与无 uid（`auth_mode=none`）看全量。
+///
 /// 模型库中设置了 context_length 的模型同值下发三个别名字段
 /// （context_length / context_window / max_model_len——分别覆盖 one-api /
 /// Anthropic / vLLM 生态客户端的读取约定），未设置则不下发，客户端回落自身默认。
@@ -338,10 +380,14 @@ fn merge_capability<'a>(acc: Option<&'a str>, next: Option<&'a str>) -> Option<&
 }
 
 async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
-    let uid = crate::service::auth::authenticate(&st, &headers)
-        .await
-        .ok()
-        .and_then(|(uid, _)| uid);
+    // R2-SEC-01：`api_key` 模式的鉴权错误不再被 `.ok()` 吞掉——匿名/无效 Key
+    // 请求曾可列出全量模型（与 README 的 Bearer 鉴权契约冲突）；现在缺失/无效
+    // → 401 `invalid_api_key`。`auth_mode=none` 由 `authenticate` 直接放行
+    // （`uid=None` → 全量），本地开发兼容不变。
+    let uid = match crate::service::auth::authenticate(&st, &headers).await {
+        Ok((uid, _)) => uid,
+        Err(e) => return e.into_response(),
+    };
     let is_admin = uid
         .map(|u| st.admin_ids.read().contains(&u))
         .unwrap_or(true);
@@ -452,11 +498,101 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{BufLimitedBody, Bytes, merge_capability, merge_min_opt};
+    use super::{BufLimitedBody, Bytes, merge_capability, merge_min_opt, models};
     use crate::state::{AppState, BufferBudget};
+    use crate::store::keys::ApiKeyRow;
     use axum::body::{Body, to_bytes};
-    use axum::extract::{DefaultBodyLimit, FromRequest, Request};
-    use axum::http::{StatusCode, header};
+    use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
+    use axum::http::{HeaderMap, StatusCode, header};
+    use sha2::Digest;
+
+    /// R2-SEC-01 测试用合法 Key（≥16 字节：短于此 `authenticate` 直接 401）
+    const VALID_KEY: &str = "sk-test-valid-key-000001";
+
+    /// `auth_mode=api_key` 的测试状态：DB 断连，合法 Key 行直接种进前缀缓存
+    /// （TTL 内命中 → 不查库），另有短 Key 走"格式非法"分支
+    fn api_key_state(mode: crate::config::AuthMode) -> AppState {
+        let mut st = AppState::test_fixture();
+        // handler 的目录查询（models 表）在断连池上必须快速失败，否则 sqlx
+        // 默认 30s acquire 超时会让每个 200 用例白等半分钟
+        st.pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy("postgres://127.0.0.1:1/none")
+            .expect("lazy pool");
+        let mut cfg = (*st.cfg).clone();
+        cfg.auth_mode = mode;
+        cfg.auth_cache_secs = 60;
+        st.cfg = std::sync::Arc::new(cfg);
+        let prefix = VALID_KEY[..12].to_string();
+        st.auth_cache.lock().insert(
+            prefix,
+            (
+                std::time::Instant::now(),
+                vec![ApiKeyRow {
+                    id: 1,
+                    user_id: 7,
+                    key_hash: hex::encode(sha2::Sha256::digest(VALID_KEY.as_bytes())),
+                    expires_at: None,
+                    user_status: 1,
+                }],
+            ),
+        );
+        st
+    }
+
+    fn bearer(key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {key}").parse().unwrap());
+        headers
+    }
+
+    async fn error_code(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// R2-SEC-01：`api_key` 模式下 `/v1/models` 必须鉴权——匿名请求曾可列出全量
+    /// 模型（`.ok()` 吞掉 `authenticate` 错误），与 README 的 Bearer 契约冲突
+    #[tokio::test]
+    async fn models_rejects_missing_key_in_api_key_mode() {
+        let st = api_key_state(crate::config::AuthMode::ApiKey);
+        let (status, body) = error_code(models(State(st), HeaderMap::new()).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "缺失 Key 必须 401");
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+
+    /// R2-SEC-01：`api_key` 模式下无效 Key 同样 401（短于 16 字节在校验前即拒绝）
+    #[tokio::test]
+    async fn models_rejects_invalid_key_in_api_key_mode() {
+        let st = api_key_state(crate::config::AuthMode::ApiKey);
+        let (status, body) = error_code(models(State(st), bearer("sk-invalid")).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "无效 Key 必须 401");
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+
+    /// R2-SEC-01：缓存中的合法 Key 通过鉴权 → 200（DB 断连 → 目录为空，
+    /// 但 200 证明请求已越过鉴权门）
+    #[tokio::test]
+    async fn models_accepts_cached_valid_key() {
+        let st = api_key_state(crate::config::AuthMode::ApiKey);
+        let (status, body) = error_code(models(State(st), bearer(VALID_KEY)).await).await;
+        assert_eq!(status, StatusCode::OK, "合法 Key 必须放行: {body}");
+        assert_eq!(body["object"], "list");
+        assert!(
+            body["data"].as_array().is_some_and(|d| d.is_empty()),
+            "DB 断连 → 空目录"
+        );
+    }
+
+    /// R2-SEC-01：`auth_mode=none`（本地开发）继续匿名放行，不因新鉴权回归
+    #[tokio::test]
+    async fn models_allows_anonymous_when_auth_disabled() {
+        let st = api_key_state(crate::config::AuthMode::None);
+        let (status, body) = error_code(models(State(st), HeaderMap::new()).await).await;
+        assert_eq!(status, StatusCode::OK, "auth_mode=none 必须匿名放行: {body}");
+        assert_eq!(body["object"], "list");
+    }
 
     /// F1 字节预算不变量（预算实例为测试局部，无跨测共享状态）。1) 正常收集
     /// → 预算按 Content-Length 预估占用，guard 随 body 持有；2) 读取侧超限

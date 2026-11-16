@@ -8,7 +8,8 @@
 //! reasoning / web_search_call item 均已支持）。
 //!
 //! 边界：
-//! - 仅内存态（512 条 LRU）：重启/过期后引用 → 显式 400（带修复指引），不静默丢上下文
+//! - 仅内存态（512 条 LRU + 64 MiB 总字节预算）：重启/过期后引用 → 显式 400
+//!   （带修复指引），不静默丢上下文
 //! - 多实例部署需会话亲和（或后续接 Redis）；单实例/容器重启语义同 cc-switch
 //! - 原生 openai-responses 透传路径不记录：上游自身有状态，`previous_response_id`
 //!   原样转发由上游解析（跨方言 failover 时的引用丢失以显式 400 暴露）
@@ -26,6 +27,10 @@ const MAX_ENTRIES: usize = 512;
 /// 超限丢弃该条（下一轮引用将显式 400，而非 OOM）。
 const MAX_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 
+/// 总字节预算（默认 64 MiB）：512 条 × 单条 2 MiB 最坏叠加约 1 GiB；进程级
+/// 总预算把峰值钉住，超预算从 LRU 队首逐出（最老会话先死，下一轮引用显式 400）。
+const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// 响应 id 必须 looks like `resp_…`（网关生成形态）才入库，防客户端伪造任意 key
 fn plausible_response_id(id: &str) -> bool {
     id.starts_with("resp_") && id.len() >= "resp_".len() + 8 && id.len() <= 128
@@ -34,18 +39,49 @@ fn plausible_response_id(id: &str) -> bool {
 #[derive(Default)]
 struct HistoryInner {
     order: VecDeque<String>,
-    map: HashMap<String, Value>,
+    /// response_id → (序列化字节数, output items)
+    map: HashMap<String, (usize, Value)>,
+    /// 当前全部条目的序列化字节总数（插入/覆盖/逐出同步维护）
+    bytes: usize,
 }
 
-/// 进程内 Responses 会话历史（LRU）
+impl HistoryInner {
+    /// 从 LRU 队首逐出并回收其字节计数；队列空 → false
+    fn evict_front(&mut self) -> bool {
+        let Some(evicted) = self.order.pop_front() else {
+            return false;
+        };
+        if let Some((bytes, _)) = self.map.remove(&evicted) {
+            self.bytes -= bytes;
+        }
+        true
+    }
+}
+
+/// 进程内 Responses 会话历史（LRU + 总字节预算）
 pub struct ResponseHistoryStore {
     inner: Mutex<HistoryInner>,
+    max_entries: usize,
+    max_entry_bytes: usize,
+    max_total_bytes: usize,
 }
 
 impl ResponseHistoryStore {
     pub fn new() -> Self {
+        Self::new_with_limits(MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_TOTAL_BYTES)
+    }
+
+    /// 注入限额构造（生产经 `new()` 用默认值；单测用小限额验证逐出与计数）
+    fn new_with_limits(
+        max_entries: usize,
+        max_entry_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Self {
         Self {
             inner: Mutex::new(HistoryInner::default()),
+            max_entries,
+            max_entry_bytes,
+            max_total_bytes,
         }
     }
 
@@ -61,27 +97,37 @@ impl ResponseHistoryStore {
         let Ok(serialized) = serde_json::to_vec(&items) else {
             return;
         };
-        if serialized.len() > MAX_ENTRY_BYTES {
+        let bytes = serialized.len();
+        if bytes > self.max_entry_bytes {
             tracing::warn!(
                 response_id = response_id,
-                bytes = serialized.len(),
+                bytes,
+                cap = self.max_entry_bytes,
                 "responses history entry exceeds cap; not recorded (next reference will 400)"
             );
             return;
         }
         let mut inner = self.inner.lock();
-        // LRU：命中则移到尾部；新条目插入尾部；超容量逐出队首
-        if let Some(existing) = inner.map.get_mut(response_id) {
-            *existing = items;
-        } else {
-            inner.map.insert(response_id.to_string(), items);
-            inner.order.push_back(response_id.to_string());
-            while inner.order.len() > MAX_ENTRIES {
-                if let Some(evicted) = inner.order.pop_front() {
-                    inner.map.remove(&evicted);
+        // 覆盖：按新旧字节差调整总量（同一 id 不重复计费）
+        let previous_bytes = inner.map.get(response_id).map(|(bytes, _)| *bytes);
+        match previous_bytes {
+            Some(old_bytes) => {
+                inner.map.insert(response_id.to_string(), (bytes, items));
+                inner.bytes = inner.bytes - old_bytes + bytes;
+            }
+            None => {
+                inner.map.insert(response_id.to_string(), (bytes, items));
+                inner.bytes += bytes;
+                inner.order.push_back(response_id.to_string());
+                // 条目数上限：逐出队首
+                while inner.order.len() > self.max_entries {
+                    inner.evict_front();
                 }
             }
         }
+        // 总字节预算：从队首逐出直到总量回到上限内（单条上限已保证可收敛）
+        while inner.bytes > self.max_total_bytes && inner.evict_front() {}
+        // LRU：命中/新插入统一移到队尾
         if let Some(pos) = inner.order.iter().position(|k| k == response_id) {
             let id = inner.order.remove(pos).expect("position just found");
             inner.order.push_back(id);
@@ -96,7 +142,7 @@ impl ResponseHistoryStore {
             let id = inner.order.remove(pos).expect("position just found");
             inner.order.push_back(id);
         }
-        inner.map.get(response_id).cloned()
+        inner.map.get(response_id).map(|(_, items)| items.clone())
     }
 
     /// 测试/诊断用（生产路径走 restore/record）
@@ -108,6 +154,12 @@ impl ResponseHistoryStore {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.lock().map.is_empty()
+    }
+
+    /// 当前条目序列化字节总数（单测校验计数精确性）
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        self.inner.lock().bytes
     }
 }
 
@@ -241,6 +293,81 @@ mod tests {
             s.restore(&format!("resp_{:012}", MAX_ENTRIES + 4))
                 .is_some()
         );
+    }
+
+    // ---------- 总字节预算（R2-PERF-02） ----------
+
+    /// 计入口径就是 record 的序列化字节数
+    fn item_bytes(items: &Value) -> usize {
+        serde_json::to_vec(items).unwrap().len()
+    }
+
+    /// 造一条体积可控的 output items（text 长度决定序列化字节数）
+    fn pad_items(text_len: usize) -> Value {
+        json!([{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "x".repeat(text_len) }]
+        }])
+    }
+
+    /// 超总预算：从 LRU 队首逐出到预算内，被逐条目 restore 返回 None
+    #[test]
+    fn total_byte_budget_evicts_oldest_entries() {
+        let entry = pad_items(100);
+        let per_entry = item_bytes(&entry);
+        let s = ResponseHistoryStore::new_with_limits(16, 4096, per_entry * 3);
+        for i in 0..4 {
+            s.record(&format!("resp_{i:012}"), entry.clone());
+        }
+        assert_eq!(s.total_bytes(), per_entry * 3, "超预算只逐出队首，剩三份");
+        assert!(
+            s.restore("resp_000000000000").is_none(),
+            "被预算逐出的最老条目不可恢复"
+        );
+        for i in 1..4 {
+            assert!(
+                s.restore(&format!("resp_{i:012}")).is_some(),
+                "较新条目保留"
+            );
+        }
+    }
+
+    /// 覆盖同一 id：按新旧字节差调整总量，旧份不重复计费，且不新增条目
+    #[test]
+    fn overwrite_adjusts_total_bytes_without_double_counting() {
+        let small = pad_items(10);
+        let large = pad_items(200);
+        let (small_b, large_b) = (item_bytes(&small), item_bytes(&large));
+        let s = ResponseHistoryStore::new_with_limits(8, 4096, 1 << 20);
+        s.record("resp_aaaa00000001", small);
+        s.record("resp_bbbb00000002", large.clone());
+        assert_eq!(s.total_bytes(), small_b + large_b);
+        s.record("resp_aaaa00000001", large.clone());
+        assert_eq!(
+            s.total_bytes(),
+            large_b * 2,
+            "覆盖后只计新体积，旧份从总量扣除"
+        );
+        assert_eq!(s.len(), 2, "覆盖不新增条目");
+        assert_eq!(s.restore("resp_aaaa00000001").unwrap(), large);
+    }
+
+    /// 持续插入：条目数上限与总预算同时成立，计数器不越界
+    #[test]
+    fn total_bytes_never_exceeds_budget_under_pressure() {
+        let cap = 900usize;
+        let s = ResponseHistoryStore::new_with_limits(32, 4096, cap);
+        for i in 0..50 {
+            s.record(&format!("resp_{i:012}"), pad_items(20 + (i * 7) % 40));
+            assert!(
+                s.total_bytes() <= cap,
+                "第 {i} 次插入后计数 {} 越过预算 {cap}",
+                s.total_bytes()
+            );
+            assert!(s.len() <= 32, "条目数上限同时成立");
+        }
+        assert!(!s.is_empty(), "预算内必须留存条目");
     }
 
     #[test]

@@ -111,7 +111,7 @@ Vue 3 + TS + Vite 6 + Element Plus + ECharts + Pinia + vue-router。`npm run bui
 
 ## P10 /v1/models 合并模型库 + API Key 可再次复制（已交付）
 
-- `/v1/models`：模型库（models 表 JOIN providers）+ 已启用路由的具体 pattern（`ends_with('*')` 通配 pattern 不列出，不可作为模型名提交）合并去重；授权过滤：无 key/admin 全见，普通用户按 provider 走 user_can_use；DB 查询失败回落空列表（unwrap_or_default）
+- `/v1/models`：模型库（models 表 JOIN providers）+ 已启用路由的具体 pattern（`ends_with('*')` 通配 pattern 不列出，不可作为模型名提交）合并去重；鉴权：`api_key` 模式必须带有效 Key（`Authorization: Bearer` 或 `x-api-key`，缺失/无效 → 401 `invalid_api_key`），`auth_mode=none`（本地开发）匿名放行；授权过滤：admin 与 `auth_mode=none` 全见，普通用户按 provider 走 user_can_use；DB 查询失败回落空列表（unwrap_or_default）
 - API Key 可再次复制：迁移 0004 加 `api_keys.key_encrypted TEXT`；新 `src/service/keys_crypto.rs`（AES-256-GCM，密钥 = GATEWAY_MASTER_KEY，nonce12 || ct，base64）；create_key 加密落库（key_hash 鉴权不变）；`GET /api/keys/{id}/reveal`（仅本人+仅启用，解密失败=主密钥变更报错；旧 Key 无副本 → 400）；audit 记 api_key.reveal
 - 前端 Keys.vue：操作列加「复制 Key」按钮（loading 防连点），reveal 后 clipboard 写入
 - 验证：/v1/models 无 key = [mock-1, deepseek-v4-flash, deepseek-v4-pro, mock-2]（mock-* 不再出现）；reveal 往返明文一致；不存在 id / 他人 key → 400；浏览器点击发出 reveal 请求且 200；headless clipboard 被权限模型拒（"Document is not focused"）→ 错误分支正常

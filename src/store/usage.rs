@@ -32,7 +32,7 @@ pub struct UsageMeta {
     /// 失败归因类别（连接加固/F3；仅内部候选失败行经 record_failure_row 有值，
     /// 成功行与终局行恒 None——状态页聚合以 `failure_class IS NULL` 过滤出
     /// 客户端可见行）：connect_error / header_timeout / body_timeout /
-    /// body_read_error / upstream_status / all_candidates_failed
+    /// body_read_error / upstream_status
     pub failure_class: Option<&'static str>,
     /// 上游真实 HTTP 状态（候选失败行 = 该候选响应状态；终局透传行 = 客户端
     /// 实际收到的上游错误状态；其余行 NULL）

@@ -69,77 +69,92 @@ impl AppError {
             },
         }
     }
+
+    /// 状态码 / 错误码 / 消息 / Retry-After 的统一映射：OpenAI 错误体
+    /// （[`IntoResponse`]）与 systemone `{"detail"}` 方言整形都读这一份，
+    /// 两处状态语义不会漂移。`WithRequestId` 递归解包到内层变体。
+    pub(crate) fn classify(&self) -> (StatusCode, &'static str, String, Option<u64>) {
+        match self {
+            // 双层包装（理论上不出现）解包后按内层变体映射
+            AppError::WithRequestId { inner, .. } => inner.classify(),
+            AppError::Auth(m) => (StatusCode::UNAUTHORIZED, "invalid_api_key", m.clone(), None),
+            AppError::Unauthorized(m) => {
+                (StatusCode::UNAUTHORIZED, "unauthorized", m.clone(), None)
+            }
+            AppError::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.clone(), None),
+            AppError::RateLimited(secs) => {
+                // 上限 24h：rpm<=0 的规则会产生无限等待，不能让 u64 溢出/巨值直达客户端
+                let retry = secs.ceil().max(1.0).min(86400.0) as u64;
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_exceeded",
+                    format!("Rate limit exceeded, retry after {retry}s"),
+                    Some(retry),
+                )
+            }
+            AppError::ConcurrentLimited(msg, secs) => {
+                // 同 RateLimited：钳制 [1, 86400]，防溢出/巨值直达客户端
+                let retry = secs.ceil().max(1.0).min(86400.0) as u64;
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_exceeded",
+                    msg.clone(),
+                    Some(retry),
+                )
+            }
+            AppError::PlanQuotaExceeded(m, retry) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "insufficient_quota",
+                m.clone(),
+                *retry,
+            ),
+            AppError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone(), None),
+            AppError::BadRequest(m) => {
+                (StatusCode::BAD_REQUEST, "invalid_request_error", m.clone(), None)
+            }
+            AppError::PayloadTooLarge(m) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                m.clone(),
+                None,
+            ),
+            AppError::Internal(m) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                m.clone(),
+                None,
+            ),
+            AppError::ServiceUnavailable(m) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_disabled",
+                m.clone(),
+                None,
+            ),
+            AppError::UpstreamTimeout(m) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                m.clone(),
+                None,
+            ),
+            AppError::BadGateway(m) => (StatusCode::BAD_GATEWAY, "bad_gateway", m.clone(), None),
+            AppError::UpstreamExhausted(m) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_exhausted",
+                m.clone(),
+                None,
+            ),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // P1-6：解包关联 id，响应统一附 X-Request-Id 头（早期失败可关联日志）
-        let (request_id, self_err) = match self {
-            AppError::WithRequestId { inner, request_id } => (Some(request_id), *inner),
-            other => (None, other),
+        let request_id = match &self {
+            AppError::WithRequestId { request_id, .. } => Some(*request_id),
+            _ => None,
         };
-        let (status, code, message, retry_after): (StatusCode, &str, String, Option<u64>) =
-            match self_err {
-                // 双层包装（理论上不出现）解包后按内层变体映射
-                AppError::WithRequestId { inner, .. } => {
-                    return IntoResponse::into_response(*inner);
-                }
-                AppError::Auth(m) => (StatusCode::UNAUTHORIZED, "invalid_api_key", m, None),
-                AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m, None),
-                AppError::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m, None),
-                AppError::RateLimited(secs) => {
-                    // 上限 24h：rpm<=0 的规则会产生无限等待，不能让 u64 溢出/巨值直达客户端
-                    let retry = secs.ceil().max(1.0).min(86400.0) as u64;
-                    (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_exceeded",
-                        format!("Rate limit exceeded, retry after {retry}s"),
-                        Some(retry),
-                    )
-                }
-                AppError::ConcurrentLimited(msg, secs) => {
-                    // 同 RateLimited：钳制 [1, 86400]，防溢出/巨值直达客户端
-                    let retry = secs.ceil().max(1.0).min(86400.0) as u64;
-                    (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_exceeded",
-                        msg.clone(),
-                        Some(retry),
-                    )
-                }
-                AppError::PlanQuotaExceeded(m, retry) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "insufficient_quota",
-                    m,
-                    retry,
-                ),
-                AppError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m, None),
-                AppError::BadRequest(m) => {
-                    (StatusCode::BAD_REQUEST, "invalid_request_error", m, None)
-                }
-                AppError::PayloadTooLarge(m) => (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_too_large",
-                    m,
-                    None,
-                ),
-                AppError::Internal(m) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", m, None)
-                }
-                AppError::ServiceUnavailable(m) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "api_disabled", m, None)
-                }
-                AppError::UpstreamTimeout(m) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", m, None)
-                }
-                AppError::BadGateway(m) => (StatusCode::BAD_GATEWAY, "bad_gateway", m, None),
-                AppError::UpstreamExhausted(m) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "upstream_exhausted",
-                    m,
-                    None,
-                ),
-            };
+        let (status, code, message, retry_after) = self.classify();
 
         let body = json!({
             "error": { "message": message, "type": code, "code": code }

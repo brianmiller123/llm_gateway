@@ -103,6 +103,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"status": "ok", "service": "mock-upstream", "version": "1.0.0"})
 
     def do_POST(self):
+        if self.path == "/v1/systemone":
+            self._systemone()
+            return
         if self.path == "/v1/responses":
             self._responses()
             return
@@ -548,6 +551,97 @@ class Handler(BaseHTTPRequestHandler):
                 }],
                 "usage": usage,
             })
+
+    def _systemone(self):
+        """原生 /v1/systemone（TypeSafe System One 决策模型冒烟用）：单次 JSON
+        返回，无流式。模式来源 /tmp/mock_systemone_mode（缺省 ok）：
+        ok → 200 + answers/usage；slow_header → 睡 /tmp/mock_systemone_delay 秒
+        （默认 3s）再回 200（网关 header 等待超时 504 冒烟）；slow → 同延迟后
+        回 200（并发上限冒烟）；400/429/500 → 该状态 + {"detail": "mock <mode>"}。
+        请求体 {model,state,questions,assets} 与两个 TypeSafe-Danger-Zone-* 头
+        落 /tmp/mock_last_request.json（透传保真校验用）。"""
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+
+        def hdr(name):
+            # HTTP 头名大小写不敏感（客户端可任意大小写发送）
+            for k, v in self.headers.items():
+                if k.lower() == name.lower():
+                    return v
+            return None
+
+        try:
+            with open("/tmp/mock_last_request.json", "w") as f:
+                json.dump({
+                    "path": self.path,
+                    "model": body.get("model"),
+                    "state": body.get("state"),
+                    "questions": body.get("questions"),
+                    "assets": body.get("assets"),
+                    "headers": {
+                        "TypeSafe-Danger-Zone-Images": hdr("TypeSafe-Danger-Zone-Images"),
+                        "TypeSafe-Danger-Zone-Long-Context": hdr(
+                            "TypeSafe-Danger-Zone-Long-Context"
+                        ),
+                    },
+                }, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+        try:
+            with open("/tmp/mock_systemone_mode") as f:
+                mode = f.read().strip()
+        except OSError:
+            mode = "ok"
+        if mode in ("400", "429", "500"):
+            self._json(int(mode), {"detail": f"mock {mode}"})
+            return
+        if mode == "sse_body":
+            # 上游违反 stream:false 回了 SSE 体：网关应整形为 502 {detail}
+            self._sse_start()
+            self._sse_write({"usage": {"input_tokens": 1, "output_tokens": 1}})
+            return
+        if mode == "slow_header":
+            # 回 200 前先沉默：网关 header 等待时限到期 → 504 终局（detail 方言）
+            time.sleep(_delay_file("/tmp/mock_systemone_delay", 3.0))
+        if mode == "slow":
+            # 并发上限冒烟：保持请求在途，让第二个请求撞 429
+            time.sleep(_delay_file("/tmp/mock_systemone_delay", 3.0))
+        answers = {}
+        questions = body.get("questions")
+        for name, q in (questions.items() if isinstance(questions, dict) else []):
+            q = q if isinstance(q, dict) else {}
+            qtype = q.get("type")
+            if qtype == "choice":
+                options = list((q.get("criteria") or {}).keys()) or ["a", "b"]
+                answers[name] = {
+                    "type": "choice",
+                    "choice": options[0],
+                    "confidence": 0.75,
+                    "probabilities": {o: (1.0 if o == options[0] else 0.0) for o in options},
+                }
+            elif qtype == "score":
+                levels = q.get("criteria") or ["low", "high"]
+                answers[name] = {
+                    "type": "score",
+                    "score": 0.0,
+                    "confidence": 0.9,
+                    "legend": {str(i): lvl for i, lvl in enumerate(levels)},
+                    "probabilities": {str(i): (1.0 if i == 0 else 0.0) for i in range(len(levels))},
+                }
+            elif qtype == "box":
+                answers[name] = {
+                    "type": "box",
+                    "box": {"top": 0.2, "bottom": 0.66, "left": 0.19, "right": 0.68},
+                    "confidence": None,
+                }
+            else:
+                answers[name] = {"type": "noul", "noul": 0.96}
+        self._json(200, {
+            "model": body.get("model", "mock"),
+            "answers": answers,
+            "usage": {"input_tokens": 476, "output_tokens": 70},
+            "request_id": "mock-systemone",
+        })
 
     def log_message(self, *args):
         pass

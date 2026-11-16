@@ -519,6 +519,7 @@ export interface ApiEndpointsResp {
   public_base_override: boolean
   responses: ApiEndpointInfo
   messages: ApiEndpointInfo
+  systemone: ApiEndpointInfo
 }
 
 export interface ApiEndpointsReq {
@@ -526,6 +527,8 @@ export interface ApiEndpointsReq {
   responses_visible: boolean
   messages_enabled: boolean
   messages_visible: boolean
+  systemone_enabled: boolean
+  systemone_visible: boolean
 }
 
 /** 管理员 API 测试结果 */
@@ -565,6 +568,7 @@ export interface PublicEndpointInfo {
 export interface PublicEndpointsResp {
   responses: PublicEndpointInfo | null
   messages: PublicEndpointInfo | null
+  systemone: PublicEndpointInfo | null
 }
 
 // ---------- Coding Plan 与用户分组 ----------

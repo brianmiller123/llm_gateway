@@ -124,6 +124,7 @@ const endpointList = computed<{ path: string; title: string; address: string }[]
   const list: { path: string; title: string; address: string }[] = []
   if (eps.responses) list.push({ path: eps.responses.path, title: 'Response API', address: eps.responses.address })
   if (eps.messages) list.push({ path: eps.messages.path, title: 'Anthropic Messages', address: eps.messages.address })
+  if (eps.systemone) list.push({ path: eps.systemone.path, title: 'System One', address: eps.systemone.address })
   return list
 })
 

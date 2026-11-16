@@ -1,6 +1,7 @@
 //! 配置管理 API：供应商 / 路由规则 / 限流 / 配额 / 单价 CRUD。
 //! 全部写操作：入库 → `reload()` 即时生效 → audit 留痕。仅管理员可访问。
 
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use serde_json::json;
 
 use crate::error::AppError;
 use crate::service::ldap::LdapSettings;
+use crate::service::proxy::join_upstream_url;
 use crate::state::{AppState, MessageTemplates};
 use crate::store::{audit, config, users};
 
@@ -147,14 +149,115 @@ struct TestConnectionReq {
     provider_id: Option<i64>,
 }
 
+/// 解析上游 /models 响应体 → 模型 id 列表（纯函数；形态识别在此收口，便于单测）。
+///
+/// 支持的形态（按此顺序选候选数组）：
+/// - 顶层裸数组：`[{"id":"a"},{"name":"b"}]`（唯一候选）
+/// - 顶层对象：`data`、`models` 中**所有存在且为数组**的字段都算候选，按此顺序尝试
+///   ——`{"data":[...]}`（OpenAI 兼容标准形态）、`{"models":[...]}`（TypeSafe System One
+///   / StartLux-Prism），以及两者同时出现（如 `{"data":[],"models":[...]}`）
+///
+/// 条目取名称：字符串 `id` trim 后非空则用 `id`，否则退回字符串 `name`（同样 trim
+/// 后非空才用）——空 `id` 不得遮蔽合法 `name`。空/纯空白名称丢弃；
+/// **部分可识别 = 部分接受**：一个候选数组里只要有条目能识别就返回这些名称，缺字段的
+/// 条目只是被跳过。首个产生名称的候选即为结果；全部候选都是空数组才是合法的「无模型」。
+/// 但**非空候选里一个可识别名称都没有**属形态不符——下游 `replace_provider_models`
+/// 会把空列表当成“清空模型库”，所以这类形态必须报错，不能静默吞成空列表。
+/// 结果按首次出现顺序去重（HashSet 判重，O(n)；重复名称会插出重复 `model_routes`
+/// 行并虚高 count）。
+fn parse_models_body(text: &str) -> Result<Vec<String>, String> {
+    let head: String = text.chars().take(120).collect();
+    let bad_shape = || format!("unexpected /models response shape: {head}");
+    let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+        format!("unexpected /models response shape (invalid JSON: {e}): {head}")
+    })?;
+    // 候选顺序即语义优先级：裸数组只有自己；对象按 data、models 依次尝试。
+    let candidates: Vec<&Vec<serde_json::Value>> = match &parsed {
+        serde_json::Value::Array(arr) => vec![arr],
+        serde_json::Value::Object(o) => ["data", "models"]
+            .iter()
+            .filter_map(|key| o.get(*key).and_then(|v| v.as_array()))
+            .collect(),
+        _ => return Err(bad_shape()),
+    };
+    if candidates.is_empty() {
+        return Err(bad_shape());
+    }
+    for arr in candidates {
+        if arr.is_empty() {
+            continue;
+        }
+        let mut models: Vec<String> = Vec::new();
+        // 判重集合（借用候选数组内的字符串，不额外分配）：保持首次出现顺序
+        let mut seen: HashSet<&str> = HashSet::new();
+        for m in arr {
+            // 空 id 不得遮蔽合法 name（`or_else` 只在缺失/非字符串时回退）
+            let id = m
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let name = id.or_else(|| {
+                m.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+            if let Some(name) = name {
+                if seen.insert(name) {
+                    models.push(name.to_string());
+                }
+            }
+        }
+        if models.is_empty() {
+            return Err(bad_shape());
+        }
+        return Ok(models);
+    }
+    Ok(Vec::new())
+}
+
+/// 上游模型名长度守卫：上游名会复用为 `model_routes.model_pattern
+/// VARCHAR(128)`，超长名会让路由 INSERT 报 PG 22001 并回滚整个同步事务
+/// （Prism 的默认名来自 GGUF 文件名，长度不可控）。入库前拦下并给出明确错误，
+/// 而不是让 DB 报 500。
+fn reject_overlong(models: &[String]) -> Result<(), String> {
+    match models.iter().find(|m| m.chars().count() > MODEL_NAME_MAX_CHARS) {
+        Some(name) => {
+            // 错误不回流整条超长串（上游名长度不可控，日志/响应都不该被它撑爆）
+            let preview: String = name.chars().take(120).collect();
+            Err(format!(
+                "upstream model id exceeds {MODEL_NAME_MAX_CHARS} chars (model_routes limit): \
+                 {preview}… (len={})",
+                name.chars().count()
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// `model_routes.model_pattern` / `models.model` 的列宽（PG VARCHAR(128) 计**字符**，
+/// 不是字节：128 个 CJK 字符合法）
+const MODEL_NAME_MAX_CHARS: usize = 128;
+
+/// `/models` 探测响应体上限：正常模型列表远小于此；无上限时误配/恶意上游能把
+/// admin 进程内存打爆（代理侧有 `MAX_UPSTREAM_BODY_BYTES`，探测侧此前没有）
+const MAX_MODELS_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// 拉取上游 /models（CN 网络下偶发 TCP 失败，重试 3 次退避）；
 /// 成功返回模型 id 列表；失败返回已展开错误链的字符串。
+///
+/// URL 拼接走 [`join_upstream_url`]（与代理同一套 base_url 容错）。
+/// 响应体上限 [`MAX_MODELS_BODY_BYTES`]（8 MiB，先看 Content-Length，再按块累积
+/// 兜底）：超限直接报错、不重试（与 status 非 2xx 同一语义）。
+/// 「空列表不清库」是 handler 层策略：本函数对空列表仍返回 `Ok(empty)`，
+/// 由 `test_connection` / `refresh_models` 结合库中现有行数决定是否拒绝写入。
 async fn fetch_upstream_models(
     client: &reqwest::Client,
     base: &str,
     key: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let url = format!("{base}/models");
+    let url = join_upstream_url(base, "/models");
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 0..3 {
         let mut rb = client.get(&url).timeout(Duration::from_secs(15));
@@ -162,40 +265,54 @@ async fn fetch_upstream_models(
             rb = rb.header("Authorization", format!("Bearer {k}"));
         }
         match rb.send().await {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
+                let declared = resp.content_length();
+                if declared.is_some_and(|len| len > MAX_MODELS_BODY_BYTES as u64) {
+                    return Err(format!(
+                        "models response exceeds {MAX_MODELS_BODY_BYTES} bytes"
+                    ));
+                }
+                // 不使用 resp.text()：它会把整个体读进内存且不留上限
+                let mut buf: Vec<u8> = Vec::with_capacity(
+                    declared.unwrap_or(0).min(MAX_MODELS_BODY_BYTES as u64) as usize,
+                );
+                loop {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if buf.len() + chunk.len() > MAX_MODELS_BODY_BYTES {
+                                return Err(format!(
+                                    "models response exceeds {MAX_MODELS_BODY_BYTES} bytes"
+                                ));
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        // 读体失败保留真实原因（旧写法 unwrap_or_default 会洗成
+                        // "invalid JSON: EOF" 的形态错误）
+                        Err(e) => return Err(format!("failed to read /models body: {e}")),
+                    }
+                }
+                // 非 UTF-8 仍宽忍（上游偶发脏字节），与 text() 的 lossy 语义一致
+                let text = String::from_utf8_lossy(&buf);
                 if !status.is_success() {
                     return Err(format!(
                         "upstream {status}: {}",
                         text.chars().take(300).collect::<String>()
                     ));
                 }
-                // 响应形态防御：200 但非 JSON / 非 {"data":[...]} / 非裸数组一律报错——
+                // 响应形态防御（见 parse_models_body）：无法识别的形态一律报错——
                 // 空列表会被下游 replace_provider_models 当成“清空模型库”，绝不能静默吞
-                let head: String = text.chars().take(120).collect();
-                let bad_shape = || format!("unexpected /models response shape: {head}");
-                let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-                    format!("unexpected /models response shape (invalid JSON: {e}): {head}")
-                })?;
-                let arr: &Vec<serde_json::Value> = match &parsed {
-                    serde_json::Value::Array(arr) => arr,
-                    // 裸数组（部分网关形态）与 {"data":[...]} 均合法；空数组是合法的空结果
-                    serde_json::Value::Object(o) => match o.get("data").and_then(|d| d.as_array()) {
-                        Some(arr) => arr,
-                        None => return Err(bad_shape()),
-                    },
-                    _ => return Err(bad_shape()),
-                };
-                let models: Vec<String> = arr
-                    .iter()
-                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
-                    .collect();
+                let models = parse_models_body(&text)?;
+                reject_overlong(&models)?;
                 return Ok(models);
             }
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(400 * (attempt as u64 + 1))).await;
+                // 最后一次尝试失败后没有下一次重试，不再白等
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(400 * (attempt as u64 + 1))).await;
+                }
             }
         }
     }
@@ -221,7 +338,7 @@ async fn test_connection(
     admin: Admin,
     Json(req): Json<TestConnectionReq>,
 ) -> Result<Response, AppError> {
-    let base = req.base_url.trim().trim_end_matches('/');
+    let base = req.base_url.trim();
     if !(base.starts_with("http://") || base.starts_with("https://")) {
         return Err(AppError::BadRequest(
             "base_url must start with http(s)://".into(),
@@ -251,6 +368,20 @@ async fn test_connection(
         .map_err(AppError::BadRequest)?;
     // 测试的是已保存的供应商 → 把拉到的模型同步进模型库
     if let Some(pid) = req.provider_id {
+        // 空结果保护（handler 策略，store 语义不变）：上游可能返回合法的空列表
+        // （`{"data":[]}`），直接替换会 DELETE 该渠道全部模型行（含启停状态）。
+        // 库中已有行 → 拒绝清库并如实报错；本来就没有行 → 空替换是安全的。
+        if models.is_empty() {
+            let existing = config::provider_model_count(&st.pool, pid)
+                .await
+                .map_err(AppError::internal)?;
+            if existing > 0 {
+                return Err(AppError::BadRequest(format!(
+                    "upstream returned no models; refusing to delete {existing} existing entries \
+                     — delete the provider or its models manually if intended"
+                )));
+            }
+        }
         config::replace_provider_models(&st.pool, pid, &models)
             .await
             .map_err(AppError::internal)?;
@@ -510,22 +641,69 @@ async fn refresh_models(State(st): State<AppState>, admin: Admin) -> Result<Resp
             let st = st.clone();
             let p = p.clone();
             tokio::spawn(async move {
-                let base = p.base_url.trim_end_matches('/').to_string();
                 let key = crate::crypto::decrypt(&p.api_key_encrypted, &st.cfg.master_key).ok();
-                let models = fetch_upstream_models(&st.client, &base, key.as_deref()).await;
+                let models = fetch_upstream_models(&st.client, &p.base_url, key.as_deref()).await;
                 (p.id, p.name, models)
             })
         })
         .collect();
-    for task in tasks {
+    // 与 enabled 同序（同一 iter 构造），JoinError 分支据此回填渠道信息
+    for (idx, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok((pid, name, Ok(models))) => {
-                let count = config::replace_provider_models(&st.pool, pid, &models)
-                    .await
-                    .map_err(AppError::internal)?;
-                // 自动兜底路由立即生效（无需等 30s 周期重载）；失败必须暴露
-                st.reload().await.map_err(AppError::internal)?;
-                audit::log(
+                // 空结果保护（handler 策略，store 语义不变）：上游可能返回合法的空
+                // 列表（`{"data":[]}`），直接替换会 DELETE 该渠道全部模型行（含启停
+                // 状态）。库中已有行 → 记为该渠道失败并保留现有模型；本来没有行 →
+                // 空替换是安全的。
+                if models.is_empty() {
+                    let existing = match config::provider_model_count(&st.pool, pid).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            failed.push(json!({
+                                "provider_id": pid,
+                                "provider_name": name,
+                                "error": format!("failed to count existing models: {e}"),
+                            }));
+                            continue;
+                        }
+                    };
+                    if existing > 0 {
+                        failed.push(json!({
+                            "provider_id": pid,
+                            "provider_name": name,
+                            "error": format!(
+                                "upstream returned no models; refusing to delete {existing} existing \
+                                 entries — delete the provider or its models manually if intended"
+                            ),
+                        }));
+                        continue;
+                    }
+                }
+                // 单渠道写库失败（如超长名触发 PG 22001）不得中断整轮刷新：
+                // 记入 failed，其余渠道照常同步
+                let count = match config::replace_provider_models(&st.pool, pid, &models).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        failed.push(json!({
+                            "provider_id": pid,
+                            "provider_name": name,
+                            "error": format!("model sync failed: {e}"),
+                        }));
+                        continue;
+                    }
+                };
+                // 自动兜底路由立即生效（无需等 30s 周期重载）。DB 已写入，后续失败
+                // 只影响该渠道的内存/审计一致性：记入 failed 并继续下一渠道，
+                // 不得中断整轮刷新，也不得重复计入 updated
+                if let Err(e) = st.reload().await {
+                    failed.push(json!({
+                        "provider_id": pid,
+                        "provider_name": name,
+                        "error": format!("model sync persisted but reload failed: {e}"),
+                    }));
+                    continue;
+                }
+                if let Err(e) = audit::log(
                     &st.pool,
                     Some(admin.0.id),
                     "provider.models.sync",
@@ -534,13 +712,37 @@ async fn refresh_models(State(st): State<AppState>, admin: Admin) -> Result<Resp
                     Some(json!({"models": count})),
                 )
                 .await
-                .map_err(AppError::internal)?;
+                {
+                    failed.push(json!({
+                        "provider_id": pid,
+                        "provider_name": name,
+                        "error": format!("model sync persisted but audit failed: {e}"),
+                    }));
+                    continue;
+                }
                 updated.push(json!({ "provider_id": pid, "provider_name": name, "count": count }));
             }
             Ok((pid, name, Err(err))) => {
                 failed.push(json!({ "provider_id": pid, "provider_name": name, "error": err }));
             }
-            Err(_) => {}
+            Err(e) => {
+                // JoinError（panic 或任务被取消）：既不进 updated 也不得静默丢弃。
+                // enabled 与 tasks 同序，可回填原渠道信息；独立兜底 -1/unknown 仅为
+                // 顺序假设失效时不留空洞
+                let provider = enabled.get(idx);
+                tracing::warn!(
+                    error = %e,
+                    provider_id = provider.map(|p| p.id).unwrap_or(-1),
+                    "model sync task failed"
+                );
+                failed.push(json!({
+                    "provider_id": provider.map(|p| p.id).unwrap_or(-1),
+                    "provider_name": provider
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    "error": "model sync task panicked",
+                }));
+            }
         }
     }
     Ok(Json(json!({ "updated": updated, "failed": failed })).into_response())
@@ -566,23 +768,51 @@ struct ModelTestResult {
     error: Option<String>,
 }
 
-/// 对单个模型发最小 chat 请求验证可用性；超时取 min(供应商 timeout_ms, 20s)
+/// 模型测试探针的 URL 与请求体（纯函数；按上游方言选择入口，便于单测）。
+///
+/// - `api_type=systemone`（大小写不敏感，判定口径与
+///   [`crate::service::systemone::provider_native_systemone`] 一致）→ `POST {base}/systemone`，
+///   最小合法请求体（决策模型服务没有 `/chat/completions`）；
+/// - 其余方言 → 维持 `POST {base}/chat/completions` 的最小 chat 请求。
+///
+/// 仅对 chat 与 systemone 两种方言选择探针入口；anthropic / openai-responses
+/// 原生上游仍探 `/chat/completions`（本次不扩展）。
+/// URL 拼接走 [`join_upstream_url`]（与代理同一套 base_url 容错）。
+fn model_test_request(api_type: &str, base_url: &str, model: &str) -> (String, Vec<u8>) {
+    let (path, body) = if api_type.eq_ignore_ascii_case("systemone") {
+        (
+            "/systemone",
+            json!({
+                "model": model,
+                "state": "ping",
+                "questions": {"ping": {"type": "noul"}},
+            }),
+        )
+    } else {
+        (
+            "/chat/completions",
+            json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }),
+        )
+    };
+    (
+        join_upstream_url(base_url, path),
+        // PERF-06 同款：单次序列化直达字节
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+/// 对单个模型发最小探针请求验证可用性；超时取 min(供应商 timeout_ms, 20s)
 async fn test_model_once(
     client: &reqwest::Client,
     provider: &config::AdminProvider,
     key: &str,
     model: &str,
 ) -> Result<i64, String> {
-    let url = format!(
-        "{}/chat/completions",
-        provider.base_url.trim_end_matches('/')
-    );
-    let body = serde_json::to_vec(&serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-    }))
-    .unwrap_or_default();
+    let (url, body) = model_test_request(&provider.api_type, &provider.base_url, model);
     let started = std::time::Instant::now();
     let timeout = Duration::from_millis((provider.timeout_ms.max(1_000) as u64).min(20_000));
     let resp = client
@@ -754,6 +984,16 @@ fn validate_timeout_ms(timeout_ms: i32) -> Result<(), AppError> {
     Ok(())
 }
 
+/// api_type 落 `providers.api_type VARCHAR(16)`：超长值会在写入时报 PG 22001 并
+/// 变成 500。只校验非空与长度，不引入枚举白名单（新方言提前接入不受阻）。
+fn validate_api_type(api_type: &str) -> Result<(), AppError> {
+    let t = api_type.trim();
+    if t.is_empty() || t.chars().count() > 16 {
+        return Err(AppError::BadRequest("api_type must be 1-16 chars".into()));
+    }
+    Ok(())
+}
+
 /// extra_body 配置校验：必须是 JSON 对象、不含网关管理的顶层字段、≤ 8KB
 fn validate_extra_body(v: &serde_json::Value) -> Result<(), AppError> {
     let Some(obj) = v.as_object() else {
@@ -857,6 +1097,7 @@ async fn create_provider(
         ));
     }
     validate_timeout_ms(req.timeout_ms)?;
+    validate_api_type(&req.api_type)?;
     validate_extra_body(&req.extra_body)?;
     validate_extra_headers(&req.auth_scheme, &req.extra_headers)?;
     let api_key = req
@@ -933,6 +1174,9 @@ async fn update_provider(
     }
     if let Some(timeout_ms) = req.timeout_ms {
         validate_timeout_ms(timeout_ms)?;
+    }
+    if let Some(api_type) = req.api_type.as_deref() {
+        validate_api_type(api_type)?;
     }
     if let Some(v) = req.extra_body.as_ref() {
         validate_extra_body(v)?;
@@ -1053,7 +1297,8 @@ fn normalize_upstream_model(raw: Option<&str>) -> Result<Option<String>, AppErro
     if s.is_empty() {
         return Ok(None);
     }
-    if s.len() > 128 {
+    // VARCHAR(128) 在 PG 计字符而非字节：CJK 模型名按 chars 判定
+    if s.chars().count() > MODEL_NAME_MAX_CHARS {
         return Err(AppError::BadRequest(
             "upstream_model must be 1-128 chars".into(),
         ));
@@ -1132,7 +1377,8 @@ async fn create_route(
     Json(req): Json<RouteReq>,
 ) -> Result<Response, AppError> {
     let pattern = req.model_pattern.trim();
-    if pattern.is_empty() || pattern.len() > 128 {
+    // VARCHAR(128) 计字符：与入库口径一致（否则 100 个 CJK 字符能同步入库却被 400）
+    if pattern.is_empty() || pattern.chars().count() > MODEL_NAME_MAX_CHARS {
         return Err(AppError::BadRequest(
             "model_pattern must be 1-128 chars".into(),
         ));
@@ -1234,7 +1480,7 @@ async fn update_route(
 ) -> Result<Response, AppError> {
     // 与 create 一致：pattern 长度/空值校验（此前缺口可写入空 pattern）
     if let Some(p) = req.model_pattern.as_deref().map(str::trim) {
-        if p.is_empty() || p.len() > 128 {
+        if p.is_empty() || p.chars().count() > MODEL_NAME_MAX_CHARS {
             return Err(AppError::BadRequest(
                 "model_pattern must be 1-128 chars".into(),
             ));
@@ -2095,6 +2341,7 @@ struct ApiEndpointsResp {
     public_base_override: bool,
     responses: ApiEndpointOut,
     messages: ApiEndpointOut,
+    systemone: ApiEndpointOut,
 }
 
 /// 组装端点视图（base 无尾斜杠）
@@ -2116,6 +2363,12 @@ fn endpoints_view(st: &AppState, headers: &HeaderMap) -> ApiEndpointsResp {
             enabled: eps.messages_enabled,
             visible: eps.messages_visible,
         },
+        systemone: ApiEndpointOut {
+            path: "/v1/systemone",
+            address: format!("{base}/v1/systemone"),
+            enabled: eps.systemone_enabled,
+            visible: eps.systemone_visible,
+        },
     }
 }
 
@@ -2133,6 +2386,10 @@ struct ApiEndpointsReq {
     responses_visible: bool,
     messages_enabled: bool,
     messages_visible: bool,
+    /// 未提交（旧客户端/旧页面）→ 保留当前运行时值，绝不把新端点静默写回
+    /// false；显式提交的 bool 才生效（Option 缺省即 null，不需要 serde(default)）
+    systemone_enabled: Option<bool>,
+    systemone_visible: Option<bool>,
 }
 
 /// 保存开关：入库 → 运行时状态即时生效 → audit 留痕（周期 reload 兜底）
@@ -2142,11 +2399,22 @@ async fn put_api_endpoint_settings(
     headers: HeaderMap,
     Json(req): Json<ApiEndpointsReq>,
 ) -> Result<Response, AppError> {
+    // 未提交 systemone 字段（旧页面/旧客户端）→ 沿用当前运行时值，避免把
+    // 新端点静默写回 false；显式提交的值才覆盖
+    let (systemone_enabled, systemone_visible) = {
+        let cur = st.api_endpoints.read();
+        (
+            req.systemone_enabled.unwrap_or(cur.systemone_enabled),
+            req.systemone_visible.unwrap_or(cur.systemone_visible),
+        )
+    };
     let settings = config::ApiEndpointSettings {
         responses_enabled: req.responses_enabled,
         responses_visible: req.responses_visible,
         messages_enabled: req.messages_enabled,
         messages_visible: req.messages_visible,
+        systemone_enabled,
+        systemone_visible,
     };
     config::save_api_endpoint_settings(&st.pool, &settings)
         .await
@@ -2163,6 +2431,8 @@ async fn put_api_endpoint_settings(
             "responses_visible": req.responses_visible,
             "messages_enabled": req.messages_enabled,
             "messages_visible": req.messages_visible,
+            "systemone_enabled": systemone_enabled,
+            "systemone_visible": systemone_visible,
         })),
     )
     .await
@@ -2188,21 +2458,9 @@ const TEST_PREVIEW_CHARS: usize = 8000;
 const TEST_TIMEOUT: Duration = Duration::from_secs(150);
 
 fn app_error_status(e: &AppError) -> u16 {
-    match e {
-        AppError::WithRequestId { inner, .. } => app_error_status(inner),
-        AppError::Auth(_) | AppError::Unauthorized(_) => 401,
-        AppError::Forbidden(_) => 403,
-        AppError::RateLimited(_)
-        | AppError::ConcurrentLimited(..)
-        | AppError::PlanQuotaExceeded(..) => 429,
-        AppError::BadRequest(_) => 400,
-        AppError::PayloadTooLarge(_) => 413,
-        AppError::Conflict(_) => 409,
-        AppError::Internal(_) => 500,
-        AppError::ServiceUnavailable(_) | AppError::UpstreamExhausted(_) => 503,
-        AppError::BadGateway(_) => 502,
-        AppError::UpstreamTimeout(_) => 504,
-    }
+    // DEBT-01：状态码 SSOT 是 `AppError::classify`（错误体/Retry-After/响应头
+    // 同源）；此处不再维护第三份 arm 表——新增变体时自动跟随，不会静默漂移
+    e.classify().0.as_u16()
 }
 async fn test_api_endpoint(
     State(st): State<AppState>,
@@ -2215,12 +2473,14 @@ async fn test_api_endpoint(
             upstream: "/responses",
             responses: true,
             anthropic: false,
+            systemone: false,
         },
         "messages" => crate::service::proxy::Endpoint {
             api: "/v1/messages",
             upstream: "/messages",
             responses: false,
             anthropic: true,
+            systemone: false,
         },
         other => {
             return Err(AppError::BadRequest(format!(
@@ -2368,4 +2628,223 @@ async fn list_api_test_results(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(json!({ "results": rows })).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- /models 响应形态识别（parse_models_body） ----------
+
+    #[test]
+    fn parse_models_body_openai_data() {
+        let got = parse_models_body(r#"{"object":"list","data":[{"id":"a"}]}"#);
+        assert_eq!(got, Ok(vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn parse_models_body_prism_models() {
+        // StartLux-Prism / TypeSafe System One：模型名在 name，无 id
+        let got = parse_models_body(
+            r#"{"models":[{"name":"X (StartLux-Prism)","description":"d","release_date":"2026-01-01"}]}"#,
+        );
+        assert_eq!(got, Ok(vec!["X (StartLux-Prism)".to_string()]));
+    }
+
+    #[test]
+    fn parse_models_body_bare_array() {
+        // 裸数组：条目按 id 优先、缺失回落 name
+        let got = parse_models_body(r#"[{"id":"a"},{"name":"b"}]"#);
+        assert_eq!(got, Ok(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn parse_models_body_empty_lists_are_ok() {
+        // 空数组是合法的「无模型」，不得转成错误
+        assert_eq!(parse_models_body(r#"{"data":[]}"#), Ok(vec![]));
+        assert_eq!(parse_models_body(r#"{"models":[]}"#), Ok(vec![]));
+        assert_eq!(parse_models_body("[]"), Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_models_body_rejects_unknown_shape() {
+        // 非法 JSON / 无可用数组 / 数组内无可识别名称 → 必须报错（不可静默吞成空列表）
+        for body in [
+            "not json",
+            "{}",
+            r#"{"object":"list"}"#,
+            r#"{"data":[{"x":1}]}"#,
+        ] {
+            let err = parse_models_body(body).expect_err("应报形态错误");
+            assert!(
+                err.contains("unexpected /models response shape"),
+                "错误文案不符: {err}"
+            );
+        }
+        // 非法 JSON 额外标注原因
+        let err = parse_models_body("not json").expect_err("应报形态错误");
+        assert!(err.contains("invalid JSON"), "非法 JSON 未带原因: {err}");
+    }
+
+    #[test]
+    fn parse_models_body_prefers_first_non_empty_candidate() {
+        // data 为空但 models 有内容 → 必须返回 models（不能因 data 存在就返回空列表，下游会清库）
+        let got = parse_models_body(r#"{"object":"list","data":[],"models":[{"name":"X"}]}"#);
+        assert_eq!(got, Ok(vec!["X".to_string()]));
+    }
+
+    #[test]
+    fn parse_models_body_dedupes_repeated_names() {
+        // id 与 name 指向同一模型名 → 只保留首次出现，避免重复 model_routes 行与虚高 count
+        let got = parse_models_body(r#"{"models":[{"name":"X"},{"id":"X"}]}"#);
+        assert_eq!(got, Ok(vec!["X".to_string()]));
+    }
+
+    #[test]
+    fn parse_models_body_skips_blank_names_but_rejects_all_blank() {
+        // 空 / 纯空白名称不进入结果；整段都不可识别 → 形态错误
+        let err = parse_models_body(r#"{"models":[{"name":""},{"name":"  "}]}"#)
+            .expect_err("全空白名称应报形态错误");
+        assert!(
+            err.contains("unexpected /models response shape"),
+            "错误文案不符: {err}"
+        );
+        // 部分可识别 = 部分接受：空名称条目被跳过，其余照收
+        let got = parse_models_body(r#"{"models":[{"name":""},{"name":"X"}]}"#);
+        assert_eq!(got, Ok(vec!["X".to_string()]));
+    }
+
+    #[test]
+    fn parse_models_body_first_non_empty_candidate_without_names_fails() {
+        // data 非空却没有任何可识别名称 → 立即报错，不回落到 models
+        let err = parse_models_body(r#"{"data":[{"x":1}],"models":[{"name":"X"}]}"#)
+            .expect_err("首个非空候选无可识别名称应报形态错误");
+        assert!(
+            err.contains("unexpected /models response shape"),
+            "错误文案不符: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_models_body_empty_id_falls_back_to_name() {
+        // 空 id 不得遮蔽合法 name（旧写法 or_else 只在缺失/非字符串时回退）
+        assert_eq!(
+            parse_models_body(r#"{"models":[{"id":"","name":"X"}]}"#),
+            Ok(vec!["X".to_string()])
+        );
+        // 非字符串 id 同理
+        assert_eq!(
+            parse_models_body(r#"{"models":[{"id":123,"name":"X"}]}"#),
+            Ok(vec!["X".to_string()])
+        );
+        // 名称 trim 后使用
+        assert_eq!(
+            parse_models_body(r#"{"models":[{"name":" X "}]}"#),
+            Ok(vec!["X".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_models_body_skips_non_object_entries() {
+        // 非对象元素（null / 字符串 / 数组）没有 id/name，跳过；其余照收
+        assert_eq!(
+            parse_models_body(r#"{"data":[null,"s",[],{"id":"a"}]}"#),
+            Ok(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_models_body_non_array_data_falls_back_to_models() {
+        // data 不是数组 → 不算候选，仍按 models 取
+        assert_eq!(
+            parse_models_body(r#"{"data":{},"models":[{"name":"X"}]}"#),
+            Ok(vec!["X".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_models_body_rejects_null_and_bool_toplevel() {
+        for body in ["null", "true"] {
+            assert!(parse_models_body(body).is_err(), "顶层 {body} 应报形态错误");
+        }
+    }
+
+    #[test]
+    fn reject_overlong_blocks_names_over_128_chars() {
+        // model_routes.model_pattern 是 VARCHAR(128)：128 字符放行，129 字符必须拦下
+        let ok = "x".repeat(128);
+        assert_eq!(reject_overlong(&[ok]), Ok(()));
+        let long = "y".repeat(129);
+        let err = reject_overlong(&["fine".to_string(), long.clone()])
+            .expect_err("129 字符应超 model_routes.model_pattern 上限");
+        assert!(err.contains("exceeds 128"), "错误文案不符: {err}");
+        // 错误只带前 120 字符预览 + 真实长度，不回流整条超长串
+        assert!(
+            err.contains(&format!("{}… (len=129)", "y".repeat(120))),
+            "错误文案不符: {err}"
+        );
+        assert!(!err.contains(&long), "错误不应回流整条 129 字符名称");
+        // 与解析链路衔接：上游给出超长 name 时，fetch 后的守卫必须拦住
+        let body = serde_json::json!({"models": [{"name": long}]}).to_string();
+        let models = parse_models_body(&body).expect("形态合法");
+        assert!(reject_overlong(&models).is_err());
+    }
+
+    #[test]
+    fn reject_overlong_counts_chars_not_bytes() {
+        // PG VARCHAR(128) 计字符：128 个 CJK 字符（384 字节）合法，129 个必须拦下
+        assert_eq!(reject_overlong(&["模".repeat(128)]), Ok(()));
+        let err = reject_overlong(&["型".repeat(129)]).expect_err("129 个 CJK 字符应超上限");
+        assert!(err.contains("(len=129)"), "错误文案不符: {err}");
+        // 路由 upstream_model 与表列同口径
+        assert!(normalize_upstream_model(Some(&"模".repeat(128))).is_ok());
+        assert!(normalize_upstream_model(Some(&"模".repeat(129))).is_err());
+    }
+
+    #[test]
+    fn validate_api_type_enforces_chars_boundary() {
+        // providers.api_type VARCHAR(16)：空值/纯空白/超长拒绝
+        assert!(validate_api_type("").is_err());
+        assert!(validate_api_type("   ").is_err());
+        assert!(validate_api_type(&"a".repeat(17)).is_err());
+        // 恰 16 字符的现役方言必须放行（此前 17 才拒，但边界用例此前无锁）
+        assert!(validate_api_type("openai-responses").is_ok());
+        assert!(validate_api_type("systemone").is_ok());
+    }
+
+    // ---------- 模型测试探针选择（model_test_request） ----------
+
+    #[test]
+    fn model_test_request_systemone_probe() {
+        let (url, body) = model_test_request("systemone", "http://h/v1/", "m");
+        assert_eq!(url, "http://h/v1/systemone");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("body 应为 JSON");
+        assert_eq!(v["model"], "m");
+        assert_eq!(v["state"], "ping");
+        assert_eq!(v["questions"]["ping"]["type"], "noul");
+        // 大小写不敏感（与 provider_native_systemone 同口径）
+        let (url2, _) = model_test_request("SystemOne", "http://h/v1", "m");
+        assert_eq!(url2, "http://h/v1/systemone");
+    }
+
+    #[test]
+    fn model_test_request_openai_probe() {
+        let (url, body) = model_test_request("openai", "http://h/v1/", "m");
+        assert_eq!(url, "http://h/v1/chat/completions");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("body 应为 JSON");
+        assert_eq!(v["model"], "m");
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert!(v.get("questions").is_none(), "openai 探针不应带 systemone 字段");
+    }
+
+    #[test]
+    fn model_test_request_joins_base_url_variants() {
+        // 管理端误填完整端点 / 带空白 / 带 query 时探针 URL 不双拼（与代理同一口径）
+        let (url, _) = model_test_request("openai", "http://h/v1/chat/completions", "m");
+        assert_eq!(url, "http://h/v1/chat/completions");
+        let (url, _) = model_test_request("systemone", "  http://h/v1/systemone  ", "m");
+        assert_eq!(url, "http://h/v1/systemone");
+        let (url, _) = model_test_request("openai", "http://h/v1?x=1#f", "m");
+        assert_eq!(url, "http://h/v1/chat/completions");
+    }
 }

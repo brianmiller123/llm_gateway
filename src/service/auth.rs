@@ -32,23 +32,19 @@ fn cache_fresh(at: Instant, now: Instant, ttl: Duration) -> bool {
     now.saturating_duration_since(at) < ttl
 }
 
-/// L-d（QC2-L-6）：缓存容量界（max_entries 注入供测试）——插入前超容先逐出
-/// TTL 过期条目（tick 间自然过期即可腾位），仍超容则整体清空（未鉴权前缀
-/// 洪泛不能在两个 reload tick 之间无限抬升内存；下个 tick 本就全量清空）。
-/// 插入后规模界 = max_entries。
+/// L-d（R2-PERF-03）：缓存容量界（max_entries 注入供测试）——满载即整体清空
+/// 后插入。缓存是 best-effort（下个 reload tick 本就全量清空，清空后由 DB
+/// 回填），此前满载时先 `retain` 全表过期条目：在攻击可达的 miss 路径上持全局
+/// 锁做 O(容量) 扫描（50k 起），且腾出的位未必被本次插入命中。插入后规模界
+/// = max_entries。
 fn insert_bounded(
     cache: &mut HashMap<String, (Instant, Vec<ApiKeyRow>)>,
     prefix: String,
     value: (Instant, Vec<ApiKeyRow>),
-    now: Instant,
-    ttl: Duration,
     max_entries: usize,
 ) {
     if cache.len() >= max_entries {
-        cache.retain(|_, (at, _)| cache_fresh(*at, now, ttl));
-        if cache.len() >= max_entries {
-            cache.clear();
-        }
+        cache.clear();
     }
     cache.insert(prefix, value);
 }
@@ -113,14 +109,12 @@ pub async fn authenticate(
                 let rows = find_all_by_prefix(&st.pool, prefix)
                     .await
                     .map_err(AppError::internal)?;
-                // L-d：容量界插入——超容先逐过期条目，仍超容整体清空
+                // L-d：容量界插入——满载整体清空后插入（不清扫全表）
                 let mut cache = st.auth_cache.lock();
                 insert_bounded(
                     &mut cache,
                     prefix.to_string(),
                     (now, rows.clone()),
-                    now,
-                    ttl,
                     AUTH_CACHE_MAX_ENTRIES,
                 );
                 rows
@@ -268,30 +262,25 @@ mod tests {
         );
     }
 
-    /// L-d：容量界——插入前超容先逐出 TTL 过期条目（正常过期腾位，存活条目
-    /// 不受影响）；全为存活条目仍超容 → 整体清空（未鉴权前缀洪泛不抬升内存）
+    /// R2-PERF-03：容量界——满载直接整体清空后插入（不再持全局锁全表
+    /// `retain` 扫描过期条目）；未满载不驱逐任何条目
     #[test]
-    fn auth_cache_insert_bounded_evicts_expired_then_clears() {
-        let ttl = Duration::from_secs(5);
+    fn auth_cache_insert_bounded_clears_when_full() {
         let now = Instant::now();
-        let expired_at = Instant::now() - Duration::from_secs(ttl.as_secs() + 10);
-
-        // 满容过期条目：逐过期腾位 → 新条目入位
+        // 未满载：新条目入位，既有条目保留
         let mut cache: HashMap<String, (Instant, Vec<ApiKeyRow>)> = HashMap::new();
-        for i in 0..3 {
-            cache.insert(format!("old{i}"), (expired_at, Vec::new()));
-        }
-        insert_bounded(&mut cache, "new".into(), (now, Vec::new()), now, ttl, 3);
-        assert_eq!(cache.len(), 1, "过期条目全部逐出后仅剩新插入条目");
-        assert!(cache.contains_key("new"));
+        cache.insert("keep".into(), (now, Vec::new()));
+        insert_bounded(&mut cache, "new".into(), (now, Vec::new()), 3);
+        assert_eq!(cache.len(), 2, "未满容不得驱逐存活条目");
+        assert!(cache.contains_key("keep"));
 
-        // 满容存活条目：无法腾位 → 整体清空再插入
+        // 满载：整体清空再插入（存活条目也一并丢弃，下个 tick 由 DB 回填）
         let mut cache: HashMap<String, (Instant, Vec<ApiKeyRow>)> = HashMap::new();
         for i in 0..3 {
             cache.insert(format!("fresh{i}"), (now, Vec::new()));
         }
-        insert_bounded(&mut cache, "new".into(), (now, Vec::new()), now, ttl, 3);
-        assert_eq!(cache.len(), 1, "仍超容则清空，仅剩新条目");
-        assert!(cache.contains_key("new"));
+        insert_bounded(&mut cache, "next".into(), (now, Vec::new()), 3);
+        assert_eq!(cache.len(), 1, "满载清空后仅剩新条目");
+        assert!(cache.contains_key("next"));
     }
 }

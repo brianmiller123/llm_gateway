@@ -56,6 +56,11 @@ async fn public_endpoints(
         } else {
             serde_json::Value::Null
         },
+        "systemone": if eps.systemone_visible {
+            json!({ "path": "/v1/systemone", "address": format!("{base}/v1/systemone") })
+        } else {
+            serde_json::Value::Null
+        },
     });
     Ok(Json(out).into_response())
 }

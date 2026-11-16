@@ -122,6 +122,8 @@ async function testConnection() {
 interface ProviderForm {
   id: number | null
   name: string
+  /** 上游方言：openai（默认）/ openai-responses / anthropic / systemone */
+  api_type: string
   base_url: string
   api_key: string
   timeout_ms: number
@@ -132,9 +134,18 @@ const dialogVisible = ref(false)
 const editing = ref(false)
 const saving = ref(false)
 const formRef = ref<FormInstance>()
+
+/** 上游方言选项（与后端 api_type 判定一致） */
+const API_TYPE_OPTIONS = [
+  { value: 'openai', label: 'openai — OpenAI 兼容（默认）' },
+  { value: 'openai-responses', label: 'openai-responses — OpenAI Responses 原生' },
+  { value: 'anthropic', label: 'anthropic — Anthropic 原生' },
+  { value: 'systemone', label: 'systemone — System One 决策模型（/v1/systemone）' },
+]
 const formData = reactive<ProviderForm>({
   id: null,
   name: '',
+  api_type: 'openai',
   base_url: '',
   api_key: '',
   timeout_ms: 120000,
@@ -158,6 +169,7 @@ const dialogTitle = computed(() => (editing.value ? '编辑供应商' : '新建�
 function resetForm() {
   formData.id = null
   formData.name = ''
+  formData.api_type = 'openai'
   formData.base_url = ''
   formData.api_key = ''
   formData.timeout_ms = 120000
@@ -174,6 +186,7 @@ function openEdit(p: ProviderRow) {
   editing.value = true
   formData.id = p.id
   formData.name = p.name
+  formData.api_type = p.api_type
   formData.base_url = p.base_url
   formData.api_key = ''
   formData.timeout_ms = p.timeout_ms
@@ -200,6 +213,7 @@ async function doSave() {
   try {
     const payload: Record<string, unknown> = {
       name: formData.name.trim(),
+      api_type: formData.api_type,
       base_url: formData.base_url.trim(),
       timeout_ms: formData.timeout_ms,
       enabled: formData.enabled,
@@ -316,6 +330,21 @@ onMounted(loadProviders)
             clearable
           />
         </el-form-item>
+        <el-form-item label="类型">
+          <div style="width: 100%">
+            <el-select v-model="formData.api_type" style="width: 100%">
+              <el-option
+                v-for="o in API_TYPE_OPTIONS"
+                :key="o.value"
+                :label="o.label"
+                :value="o.value"
+              />
+            </el-select>
+            <div v-if="formData.api_type === 'systemone'" class="field-hint" style="margin-top: 4px">
+              决策模型上游（如 StartLux-Prism）：Base URL 以 /v1 结尾，模型测试走 /systemone
+            </div>
+          </div>
+        </el-form-item>
         <el-form-item label="Base URL" prop="base_url">
           <el-input
             v-model="formData.base_url"
@@ -390,6 +419,11 @@ onMounted(loadProviders)
 
 .mr-icon {
   margin-right: 4px;
+}
+
+.field-hint {
+  font-size: 12px;
+  color: #909399;
 }
 
 .mono {

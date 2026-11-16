@@ -1328,14 +1328,10 @@ impl ChatSseParser {
 
     /// 追加字节；`out` 收集完整帧；返回是否遇到 `[DONE]`
     pub fn push(&mut self, chunk: &[u8], out: &mut Vec<SseEvent>) -> bool {
-        self.buf.extend_from_slice(chunk);
-        let mut done = false;
-        loop {
-            let Some(idx) = find_event_end(&self.buf) else {
-                break;
-            };
-            let event: Vec<u8> = self.buf.drain(..idx).collect();
-            let text = String::from_utf8_lossy(&event);
+        // 与 proxy::feed_sse 共用 `service::sse` 的帧切分（原地扫描 / 游标扫描
+        // + 单次 drain，混合行尾各自成帧）与 1 MiB 半帧防御；命中 `[DONE]` 即停止
+        crate::service::sse::scan_frames(&mut self.buf, chunk, |event| {
+            let text = String::from_utf8_lossy(event);
             let mut data_lines: Vec<&str> = Vec::new();
             let mut event_name: Option<String> = None;
             for line in text.lines() {
@@ -1349,34 +1345,19 @@ impl ChatSseParser {
                 }
             }
             if data_lines.is_empty() {
-                continue;
+                return false;
             }
             let data = data_lines.join("\n");
             if data == "[DONE]" {
-                done = true;
-            } else {
-                out.push(SseEvent {
-                    event: event_name,
-                    data,
-                });
+                return true;
             }
-            if done {
-                break;
-            }
-        }
-        // 防御：异常巨大的不完整事件丢弃缓冲（与 proxy::feed_sse 一致）
-        if self.buf.len() > 1_000_000 {
-            self.buf.clear();
-        }
-        done
+            out.push(SseEvent {
+                event: event_name,
+                data,
+            });
+            false
+        })
     }
-}
-
-fn find_event_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|i| i + 2)
-        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,6 +1954,38 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data, "{}");
         assert_eq!(out[0].event.as_deref(), Some("ping"));
+    }
+
+    /// R2-BUG-02：混合行尾（`\r\n\r\n` 后接 `\n\n`）必须切成两帧。旧实现先找
+    /// `\n\n`，把两帧并成一帧，data 行 join 后 JSON 非法 → 整帧丢失
+    #[test]
+    fn sse_parser_mixed_line_endings_keep_frames_separate() {
+        let mut parser = ChatSseParser::new();
+        let mut out = Vec::new();
+        let done = parser.push(b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\n\n", &mut out);
+        assert!(!done);
+        assert_eq!(
+            out.iter().map(|e| e.data.as_str()).collect::<Vec<_>>(),
+            vec![r#"{"a":1}"#, r#"{"b":2}"#]
+        );
+    }
+
+    /// R2-PERF-01：单 chunk ≥3 帧全部解析、event 名保留、`[DONE]` 终止——
+    /// 游标扫描 + 单次 drain 不吃掉后续帧
+    #[test]
+    fn sse_parser_single_chunk_parses_all_events() {
+        let mut parser = ChatSseParser::new();
+        let mut out = Vec::new();
+        let done = parser.push(
+            b"data: {\"a\":1}\n\nevent: ping\ndata: {\"b\":2}\n\ndata: {\"c\":3}\n\ndata:[DONE]\n\n",
+            &mut out,
+        );
+        assert!(done);
+        assert_eq!(
+            out.iter().map(|e| e.data.as_str()).collect::<Vec<_>>(),
+            vec![r#"{"a":1}"#, r#"{"b":2}"#, r#"{"c":3}"#]
+        );
+        assert_eq!(out[1].event.as_deref(), Some("ping"));
     }
 
     #[test]

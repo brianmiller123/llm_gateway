@@ -360,6 +360,8 @@ impl AppState {
                 responses_visible: true,
                 messages_enabled: true,
                 messages_visible: true,
+                systemone_enabled: true,
+                systemone_visible: true,
             })),
             custom_headers: Arc::new(RwLock::new(crate::store::config::HeaderSettings::default())),
             usage: Arc::new(UsageCache::new()),
@@ -430,6 +432,8 @@ impl AppState {
                 responses_visible: true,
                 messages_enabled: true,
                 messages_visible: true,
+                systemone_enabled: true,
+                systemone_visible: true,
             })),
             custom_headers: Arc::new(RwLock::new(crate::store::config::HeaderSettings::default())),
             usage: Arc::new(UsageCache::new()),
@@ -578,6 +582,24 @@ impl AppState {
         };
         section!("routes", async {
             let v = load_routes(&self.pool).await?;
+            // R2-BUG-03：路由/供应商分节加载错位——providers 节失败时快照沿用
+            // 旧集合，新路由指向缺失 provider 只会在请求路径退化为「无候选」
+            // 503 且无因果线索。此处每条缺失引用留一条 error（routes 节成功时
+            // 判定一次，不进入逐请求告警）；路由仍按加载结果应用，不改运行
+            // 语义。providers 读锁只覆盖快照比对，不跨 routes 写锁。
+            let missing = {
+                let providers = self.providers.read();
+                let known: HashSet<i64> = providers.iter().map(|p| p.id).collect();
+                missing_provider_refs(&v, &known)
+            };
+            for (model_pattern, provider_id) in missing {
+                tracing::error!(
+                    route = model_pattern,
+                    provider_id,
+                    "route references provider missing from current providers snapshot; \
+                     route applied but candidate resolution skips it"
+                );
+            }
             *self.routes.write() = v;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
@@ -706,6 +728,27 @@ fn commit_admin_snapshot(
     true
 }
 
+/// R2-BUG-03：reload 交叉校验——返回新路由中引用了当前 providers 快照之外
+/// provider id 的 (model_pattern, provider_id) 列表（主 + 降级候选，按路由顺序）。
+/// providers 节加载失败时快照沿用旧集合，新路由会静默退化成「无候选」503；
+/// 调用方据此在 reload 时每条缺失引用留一条 error，而不是在请求路径逐次告警。
+fn missing_provider_refs<'a>(
+    routes: &'a [ModelRoute],
+    provider_ids: &HashSet<i64>,
+) -> Vec<(&'a str, i64)> {
+    let mut missing = Vec::new();
+    for route in routes {
+        for provider_id in std::iter::once(route.provider_id)
+            .chain(route.fallback_ids.iter().copied())
+        {
+            if !provider_ids.contains(&provider_id) {
+                missing.push((route.model_pattern.as_str(), provider_id));
+            }
+        }
+    }
+    missing
+}
+
 /// 空串 → None（DB 空字段回退 env 用）
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim();
@@ -718,7 +761,10 @@ fn non_empty(s: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_admin_id, commit_admin_snapshot, BufferBudget, BufferGuard, MessageTemplates};
+    use super::{
+        apply_admin_id, commit_admin_snapshot, missing_provider_refs, BufferBudget, BufferGuard,
+        MessageTemplates,
+    };
     use parking_lot::RwLock;
     use sqlx::PgPool;
     use std::collections::HashSet;
@@ -914,5 +960,31 @@ mod tests {
         let mut g = BufferGuard::unbounded();
         g.resize_to(u64::MAX)
             .expect("零记账 guard 必须吸收任意大小（容量 = u64::MAX）");
+    }
+
+    /// R2-BUG-03：路由引用当前 providers 快照之外的 id → 逐条给出
+    /// (model_pattern, provider_id)；主候选与降级候选都检查，存在的引用不报告
+    #[test]
+    fn missing_provider_refs_flags_absent_primary_and_fallback() {
+        use crate::store::upstream::ModelRoute;
+        let route = |pattern: &str, primary: i64, fallbacks: Vec<i64>| ModelRoute {
+            model_pattern: pattern.into(),
+            provider_id: primary,
+            fallback_ids: fallbacks,
+            upstream_model: None,
+            extra_body: serde_json::json!({}),
+            strict_system_head: false,
+            system_head_merge: false,
+            reasoning_effort_mode: None,
+            thinking_form: None,
+            responses_passthrough_fields: None,
+        };
+        let routes = vec![route("gpt-*", 1, vec![2, 3]), route("claude-*", 9, vec![])];
+        let known: HashSet<i64> = HashSet::from([1, 2]);
+        assert_eq!(
+            missing_provider_refs(&routes, &known),
+            vec![("gpt-*", 3), ("claude-*", 9)],
+            "只报告快照外的 provider id（主 + 降级），每条引用一条"
+        );
     }
 }

@@ -4,8 +4,8 @@
       <div>
         <h2 class="page-title">API 端点管理</h2>
         <p class="page-desc">
-          查看 Response API 与 Anthropic Messages API 的调用地址、独立启用/停用各 API（停用后立即返回 503 明确提示，
-          不影响另一 API），并控制用户页面是否展示对应调用地址。测试区发送真实代理管线请求，展示状态码 / 耗时 / 响应内容 / 错误。
+          查看 Response API、Anthropic Messages API 与 System One 决策模型 API 的调用地址、独立启用/停用各 API（停用后立即返回 503 明确提示，
+          不影响其它 API），并控制用户页面是否展示对应调用地址。测试区发送真实代理管线请求，展示状态码 / 耗时 / 响应内容 / 错误。
         </p>
       </div>
       <div class="switch-box">
@@ -39,7 +39,7 @@
         <div class="switch-row">
           <span class="switch-label">启用 {{ item.short }} API</span>
           <el-switch v-model="item.info.enabled" :loading="saving" />
-          <span class="hint">停用后请求立即返回 503 明确提示，另一 API 不受影响</span>
+          <span class="hint">停用后请求立即返回 503 明确提示，其它 API 不受影响</span>
         </div>
 
         <div class="switch-row">
@@ -157,7 +157,7 @@ const testing = ref(false)
 const loadingHistory = ref(false)
 
 interface CardItem {
-  key: 'responses' | 'messages'
+  key: 'responses' | 'messages' | 'systemone'
   title: string
   short: string
   info: { path: string; address: string; enabled: boolean; visible: boolean }
@@ -168,11 +168,13 @@ const resp = reactive({
   public_base_override: false,
   responses: { path: '/v1/responses', address: '', enabled: true, visible: true },
   messages: { path: '/v1/messages', address: '', enabled: true, visible: true },
+  systemone: { path: '/v1/systemone', address: '', enabled: true, visible: true },
 })
 
 const cardList = computed<CardItem[]>(() => [
   { key: 'responses', title: 'Response API', short: 'Response', info: resp.responses },
   { key: 'messages', title: 'Anthropic Messages API', short: 'Messages', info: resp.messages },
+  { key: 'systemone', title: 'System One 决策模型 API', short: 'System One', info: resp.systemone },
 ])
 
 const endpointNote = computed(() =>
@@ -189,6 +191,7 @@ async function load() {
     resp.public_base_override = r.public_base_override
     resp.responses = { ...r.responses }
     resp.messages = { ...r.messages }
+    resp.systemone = { ...r.systemone }
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '加载端点配置失败')
   } finally {
@@ -204,9 +207,12 @@ async function save() {
       responses_visible: resp.responses.visible,
       messages_enabled: resp.messages.enabled,
       messages_visible: resp.messages.visible,
+      systemone_enabled: resp.systemone.enabled,
+      systemone_visible: resp.systemone.visible,
     })
     resp.responses = { ...r.responses }
     resp.messages = { ...r.messages }
+    resp.systemone = { ...r.systemone }
     ElMessage.success('端点配置已保存并生效')
   } finally {
     saving.value = false

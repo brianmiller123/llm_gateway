@@ -631,6 +631,16 @@ pub async fn replace_provider_models(
     Ok(models.len())
 }
 
+/// 某供应商当前的模型行数。空结果保护用：上游返回空列表时据此判断直接替换
+/// 是否会删掉已有模型行（含启停状态）。
+pub async fn provider_model_count(pool: &PgPool, provider_id: i64) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM models WHERE provider_id = $1")
+        .bind(provider_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
 pub async fn delete_model(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
     let res = sqlx::query("DELETE FROM models WHERE id = $1")
         .bind(id)
@@ -808,13 +818,16 @@ pub async fn save_header_settings(
 
 // ---------- 系统设置（API 端点管理） ----------
 
-/// API 端点运行时开关：启用/停用与用户页地址可见性（Response API × Messages API 独立）
+/// API 端点运行时开关：启用/停用与用户页地址可见性（Response API × Messages
+/// API × System One 各自独立）
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ApiEndpointSettings {
     pub responses_enabled: bool,
     pub responses_visible: bool,
     pub messages_enabled: bool,
     pub messages_visible: bool,
+    pub systemone_enabled: bool,
+    pub systemone_visible: bool,
 }
 
 #[derive(FromRow)]
@@ -823,13 +836,15 @@ struct ApiEndpointRow {
     responses_visible: bool,
     messages_enabled: bool,
     messages_visible: bool,
+    systemone_enabled: bool,
+    systemone_visible: bool,
 }
 
 /// 读取 API 端点开关（单行表，迁移保证列存在；缺省全部启用/可见）
 pub async fn load_api_endpoint_settings(pool: &PgPool) -> Result<ApiEndpointSettings, sqlx::Error> {
     let row: Option<ApiEndpointRow> = sqlx::query_as(
-        "SELECT responses_enabled, responses_visible, messages_enabled, messages_visible \
-         FROM system_settings WHERE id = 1",
+        "SELECT responses_enabled, responses_visible, messages_enabled, messages_visible, \
+         systemone_enabled, systemone_visible FROM system_settings WHERE id = 1",
     )
     .fetch_optional(pool)
     .await?;
@@ -839,12 +854,16 @@ pub async fn load_api_endpoint_settings(pool: &PgPool) -> Result<ApiEndpointSett
             responses_visible: r.responses_visible,
             messages_enabled: r.messages_enabled,
             messages_visible: r.messages_visible,
+            systemone_enabled: r.systemone_enabled,
+            systemone_visible: r.systemone_visible,
         })
         .unwrap_or(ApiEndpointSettings {
             responses_enabled: true,
             responses_visible: true,
             messages_enabled: true,
             messages_visible: true,
+            systemone_enabled: true,
+            systemone_visible: true,
         }))
 }
 
@@ -855,12 +874,15 @@ pub async fn save_api_endpoint_settings(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE system_settings SET responses_enabled = $1, responses_visible = $2, \
-         messages_enabled = $3, messages_visible = $4, updated_at = now() WHERE id = 1",
+         messages_enabled = $3, messages_visible = $4, systemone_enabled = $5, \
+         systemone_visible = $6, updated_at = now() WHERE id = 1",
     )
     .bind(s.responses_enabled)
     .bind(s.responses_visible)
     .bind(s.messages_enabled)
     .bind(s.messages_visible)
+    .bind(s.systemone_enabled)
+    .bind(s.systemone_visible)
     .execute(pool)
     .await?;
     Ok(())

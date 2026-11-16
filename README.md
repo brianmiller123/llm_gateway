@@ -12,6 +12,7 @@
 - `POST /v1/responses`（OpenAI Responses API）：上游原生支持时透传（`api_type=openai-responses`），否则自动做 Responses ↔ Chat 转换（非流式 + 流式状态机），新旧 OpenAI SDK 均可直连
 - `POST /v1/messages`（Anthropic Messages API，参照 cc-switch 转换层实现）：上游 `api_type=anthropic` 时透传，其余上游自动做 Anthropic ↔ Chat 降级转换——system（含 Claude Code billing header 剥离）/ tool_use ↔ tool_calls（参数 canonical JSON 保前缀缓存）/ tool_result → tool 消息 / thinking ↔ reasoning_content（DeepSeek 等厂商 tool-call 消息空思考自动补占位符）/ usage 三桶恒等式（input + cache_read + cache_creation == prompt_tokens 双向换算）/ finish_reason ↔ stop_reason / 流式 SSE 状态机（message_start → content_block_* → message_delta/message_stop，多 finish_reason 去重、工具块延迟启动、断流兜底）/ 错误整形为 Anthropic 单错误对象形状
 - Responses ↔ Chat 转换层按 cc-switch 模式加固：usage 多源缓存字段归一化（prompt_tokens_details.cached_tokens / cache_read_input_tokens / DeepSeek prompt_cache_hit_tokens）、无名工具调用护栏（全部丢弃时报 failed 而非伪 completed）、流内错误帧 → response.failed、断流区分 incomplete/failed
+- `POST /v1/systemone`（TypeSafe System One 决策模型）：仅 `api_type=systemone` 上游原生透传——请求体 `model` / `state` / `questions` / `assets` 逐字转发，客户端可选 `TypeSafe-Danger-Zone-Images` / `TypeSafe-Danger-Zone-Long-Context` 头原样透传；**不做任何降级转换**（其它方言配对一律 400）；**无流式**（`stream: true` → 400）；网关自身错误按客户端方言整形为 `{"detail": "..."}`，上游错误体原样透传；usage `{input_tokens, output_tokens}` 走既有记账归一
 - API Key 鉴权：Key 仅存 SHA-256 哈希 + 12 位前缀定位，明文只在创建时展示一次；可配置为不鉴权（仅本地开发）
 - 并发限流：三层规则（API Key → 用户 → 全局，可选模型限定按客户端模型名精确匹配），限制同时在途的请求数（0 = 不限），满员返回 429 + `Retry-After` + OpenAI 标准错误体；guard 绑定响应体生命周期，流式请求流尽/断开才释放（见「限流（并发上限）」）
 - Coding Plan 周期配额：分组绑定套餐（多分组取优先级最高生效），token 上限 + 统计周期（每日 / 每月 / 总量 / 小时级——每 N 小时（1..168）滚动重置，锚点可选 UTC 整点网格或按开通时间偏移），超额策略（拦截 429 / 降级指定模型 / 仅告警）；可选模型作用域（精确 + 前缀通配、白/黑名单黑名单优先，未配置 = 全模型生效，切换模型即时重评估，见「Coding Plan 周期用量限制与小时级重置」）；80/95/100% 阈值告警（站内 / 邮件 / webhook）。重置由周期键在读取路径推导，无清零定时任务
@@ -131,6 +132,24 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 
 `test_anthropic.py` / `test_response.py` 的调用凭据从 `GATEWAY_API_KEY` 环境变量读取，不再硬编码入仓；曾提交进仓库的 key 应视为泄露并轮换。
 
+### 接入 StartLux-Prism（决策模型）
+
+StartLux-Prism 是 StartLux-Decision 决策模型的推理服务，自身提供 `POST /v1/systemone`（决策调用，另带 `POST /v1/decisions` 别名）、`GET /v1/models`、`GET /health`；网关只对外提供 `/v1/systemone` 这一个调用面（无 `/chat/completions`、无流式），按 `api_type=systemone` 原生透传接入：
+
+1. **供应商**：Base URL 填 `http://<host>:<port>/v1`（Prism `--port` 默认 `8092`），`api_type` 选 `systemone`。Prism 自身不鉴权，但网关要求供应商配 Key——填任意占位值即可（Prism 忽略 `Authorization` 头）。
+2. **模型库**：点「刷新模型库」（或供应商「测试连接」）。Prism 的 `GET /v1/models` 返回 `{"models":[{"name": …}]}` 形态（与本网关 `{"data":[{"id": …}]}` 的 OpenAI 口径不同），已原生识别。模型 id 由 Prism 启动参数 `--name` 决定：缺省为 GGUF 文件名去掉 `-Q8_0` 后缀再追加 ` (StartLux-Prism)`，建议显式 `--name` 指定稳定 id，避免换量化版本后路由失效。
+3. **调用**：刷新会为每个模型自动建精确路由，客户端 `POST /v1/systemone` 携带该模型名即可：
+
+```bash
+curl -sk https://127.0.0.1:8443/v1/systemone \
+  -H "Authorization: Bearer sk-xxx" -H "Content-Type: application/json" \
+  -d '{"model":"StartLux-Decision-v1.1-27B-AutoThink (StartLux-Prism)",
+       "state":"当前局面文本",
+       "questions":{"is_ok":{"type":"noul"}}}'
+```
+
+`model` / `state` / `questions` / `assets` 逐字转发给上游；Prism 侧图像证据字段名为 `images`（base64/data URI 列表；未启 vision tower 时 422），`assets` 仅逐字转发，Prism 不解读。`stream: true` 返回 400（协议层无 SSE）。模型「测试」按方言选择探针——`systemone` 渠道打 `POST {base_url}/systemone`，其余打 `/chat/completions`。仅 `api_type=systemone` 上游原生透传，网关**不做**任何方言转换（其它上游与 `/v1/systemone` 配对一律 400）。
+
 ## 配置说明（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -164,13 +183,14 @@ curl -sk https://127.0.0.1:8443/v1/chat/completions \
 | `GET /` | 无 | 服务信息 JSON（配置了前端目录时为控制台页面） |
 | `POST /v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/responses`、`GET /v1/models` | Bearer API Key | OpenAI 兼容调用面 |
 | `POST /v1/messages` | Bearer API Key | Anthropic Messages 调用面（Claude Code / Claude SDK；错误体为 Anthropic 形状） |
+| `POST /v1/systemone` | Bearer API Key | TypeSafe System One 决策模型调用面（仅原生 `api_type=systemone` 透传；无流式；错误体为 `{"detail": ...}`） |
 | `GET /api/status` | 无 | 公开状态：组件状态 + 30 天可用率 + 事故 |
 | `POST /api/auth/login`、`/refresh`、`/logout` | — | 控制台会话（LDAP / 本地账号） |
 | `GET /api/me`、`/api/me/plan`、`/api/keys`、`/api/usage`、`/api/usage/trend` | JWT | 个人资料、我的套餐、Key 管理、用量查询 |
 | `GET/POST /api/admin/users`、`/providers`、`/routes`、`/rate-limits`、`/prices`、`/models`、`/settings/ldap`、`/settings/extra-body`、`/audit`、`/usage/realtime` 等 | JWT + 管理员 | 管理后台 CRUD 与运维接口 |
 | `GET/POST /api/admin/plans`、`/api/admin/groups`、`/api/admin/plan-alerts`、`/api/admin/smtp` 等 | JWT + 管理员 | Coding Plan 套餐 CRUD 与用量回溯、成员管理（直连用户 / 加入分组：列表、候选检索、批量增删）、用户分组（成员管理 / LDAP 同步 / CSV 导出）、阈值告警流、SMTP 设置 |
 
-错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；并发限流 429 带 `Retry-After`（短退避可重试）；Coding Plan 配额拦截 429（`insufficient_quota`）同样带 `Retry-After`（距当前统计周期边界的秒数，上限 24h；`total` 周期无边界则不带）——周期内重试必然失败，客户端应等到边界而非空转重试；`/v1/messages` 方言保留 Plan 拦截的明细消息（套餐名/周期/用量），便于区分「并发限流（短退避可重试）」与「配额耗尽（等到周期边界）」。上游错误透明透传。
+错误约定：API 错误统一返回 `{"error": {"message", "code", "type"}}` 形状；并发限流 429 带 `Retry-After`（短退避可重试）；Coding Plan 配额拦截 429（`insufficient_quota`）同样带 `Retry-After`（距当前统计周期边界的秒数，上限 24h；`total` 周期无边界则不带）——周期内重试必然失败，客户端应等到边界而非空转重试；`/v1/messages` 方言保留 Plan 拦截的明细消息（套餐名/周期/用量），便于区分「并发限流（短退避可重试）」与「配额耗尽（等到周期边界）」；`/v1/systemone` 自身错误体为 `{"detail": "<message>"}`（状态码与本约定一致，429 同样带 `Retry-After`）。上游错误透明透传，`/v1/systemone` 上游错误体不做二次整形。
 
 ## 状态页监测语义
 

@@ -17,6 +17,8 @@ pub mod rectify;
 pub mod responses;
 pub mod routing;
 pub mod session;
+pub mod sse;
 pub mod system_head;
+pub mod systemone;
 pub mod tool_media;
 pub mod usage;

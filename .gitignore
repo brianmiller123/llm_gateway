@@ -9,3 +9,4 @@ __pycache__/
 backups/
 *.pyc
 .agent
+/docs

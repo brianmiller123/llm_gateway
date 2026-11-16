@@ -27,14 +27,17 @@ impl UsageCache {
 
     pub fn incr_plan(&self, user_id: i64, plan_id: i64, period_key: &str, tokens: i64) {
         let mut map = self.plan_usage.lock();
-        let e = map
-            .entry((user_id, plan_id))
-            .or_insert((period_key.to_string(), 0));
-        if e.0 == period_key {
-            e.1 = e.1.saturating_add(tokens);
-        } else {
+        // R2-NIT-02：`period_key.to_string()` 只在新建条目/翻周期时分配——
+        // 同周期记账是热路径（每次成功请求一笔），不再逐笔复制周期键
+        match map.get_mut(&(user_id, plan_id)) {
+            Some((key, used)) if key == period_key => {
+                *used = used.saturating_add(tokens);
+            }
             // 周期翻转：以本笔增量重置
-            *e = (period_key.to_string(), tokens.max(0));
+            Some(entry) => *entry = (period_key.to_string(), tokens.max(0)),
+            None => {
+                map.insert((user_id, plan_id), (period_key.to_string(), tokens));
+            }
         }
     }
 
@@ -98,6 +101,34 @@ pub async fn record(
     record_with_gen_ms(st, meta, usage, status, latency_ms, gen_ms).await;
 }
 
+/// 记账 detach（PERF-02）：响应路径不再等待「BEGIN + 2~3 INSERT + COMMIT」
+/// 整条记账事务（本地 PG 即 1–3ms，池抖动时最多叠加 `acquire_timeout`），
+/// 与既有流式收尾（`tokio::spawn`）统一为非阻塞记账。
+///
+/// 取舍（PM 决策）：进程崩溃可能丢失极少量在途行；`incr_plan` 的内存计数
+/// 随 spawn 更新，最大滞后一次 DB 写——短窗口内可能放行少量超额请求。
+/// `test_call` 闸门留在 spawn 之前（管理端测试调用不产生任何任务）。
+/// `gen_ms` 由 spawn 内的 `record` 在记账时点计算：非流式恒等于 `latency_ms`；
+/// 流式终局行含 µs 级 spawn 调度延迟（`gen_ms` 只用于速度聚合的下界样本，
+/// 不参与计费/配额）。
+pub fn record_detached(
+    st: &AppState,
+    meta: &UsageMeta,
+    usage: Option<Usage>,
+    status: u16,
+    latency_ms: i64,
+) {
+    // 管理员测试调用不记账：不写 usage_logs，不污染状态页/错误率
+    if meta.test_call {
+        return;
+    }
+    let st = st.clone();
+    let meta = meta.clone();
+    tokio::spawn(async move {
+        record(&st, &meta, usage.as_ref(), status, latency_ms).await;
+    });
+}
+
 /// 候选失败行（连接加固）：每个失败候选一条零 token / 零成本明细，仅记录
 /// 失败归因（类别 + 上游状态 + 候选序号）。`status_out` 写行内 status 列，
 /// 与该候选故障最终呈现给客户端的状态一致。成功行不经过此函数（归因列保持
@@ -139,6 +170,77 @@ pub async fn record_failure_row(
             tracing::error!(request_id = %m.request_id, error = %e, "failure attribution record failed")
         }
     }
+}
+
+/// 候选失败行 detach（PERF-07）：归因行是纯观测数据——`failure_class` 非空，
+/// 状态页/实时聚合以 `failure_class IS NULL` 排除，且不推进月度/Plan 计数——
+/// 因此落库不得阻塞 failover 的 `continue`。此前同步 `await` 让每个失败候选
+/// 在换家前先等一次 INSERT（池满时单次 5s，N 个候选串成整条降级链的时延）。
+///
+/// `test_call` 闸门留在 spawn 前（管理端测试调用不落任何行、不产生任务）；
+/// 落库顺序由 spawn 调度决定，行内 `attempt` 列保持候选序号，报表按它排序。
+pub fn record_failure_row_detached(
+    st: AppState,
+    meta: UsageMeta,
+    class: &'static str,
+    upstream_status: Option<u16>,
+    attempt: Option<usize>,
+    status_out: u16,
+    latency_ms: i64,
+) {
+    // 管理员测试调用不落任何行（与 record_detached 的 test_call 闸门同一语义）
+    if meta.test_call {
+        return;
+    }
+    tokio::spawn(async move {
+        record_failure_row(
+            &st,
+            &meta,
+            class,
+            upstream_status,
+            attempt,
+            status_out,
+            latency_ms,
+        )
+        .await;
+    });
+}
+
+/// 终局失败行 detach（全候选耗尽）：与候选归因行不同，这行是**客户端可见**
+/// 的终局错误（504/502/503），必须计入错误率——`failure_class` 保持 NULL
+/// （状态页/实时视图按 `status >= 400 AND failure_class IS NULL` 聚合），
+/// `upstream_status`/`attempt` 同样清空（无单个上游响应可归因，F4 归因对
+/// 只属于候选行）。零 token / 零成本、单条 INSERT，不做月度/Plan upsert，
+/// 故可直接 detach（同 PERF-07 语义：不阻塞终局响应）。
+pub fn record_terminal_failure_detached(
+    st: AppState,
+    meta: UsageMeta,
+    status_out: u16,
+    latency_ms: i64,
+) {
+    // 管理员测试调用不落任何行（与 record_detached 的 test_call 闸门同一语义）
+    if meta.test_call {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut m = meta;
+        m.failure_class = None;
+        m.upstream_status = None;
+        m.attempt = None;
+        let gen_ms = gen_ms_at(&m, latency_ms);
+        match record_failure_log(&st.pool, &m, status_out, latency_ms, gen_ms).await {
+            Ok(()) => tracing::info!(
+                request_id = %m.request_id,
+                status = status_out,
+                latency_ms,
+                "terminal failure row recorded"
+            ),
+            // 终局行失败不影响客户端响应，仅告警（request_id 保证可对账）
+            Err(e) => {
+                tracing::error!(request_id = %m.request_id, error = %e, "terminal failure record failed")
+            }
+        }
+    });
 }
 
 /// 带显式生成阶段耗时的记账（客户端断开兜底在断开时点先算好 gen_ms）。
@@ -231,7 +333,28 @@ pub async fn record_with_gen_ms(
 
 #[cfg(test)]
 mod tests {
-    use super::gen_ms_from;
+    use super::{gen_ms_from, UsageCache};
+
+    /// R2-NIT-02：同周期累加不重置，也不串到其他周期/用户
+    #[test]
+    fn incr_plan_accumulates_within_same_period() {
+        let cache = UsageCache::new();
+        cache.incr_plan(1, 2, "2026-11", 100);
+        cache.incr_plan(1, 2, "2026-11", 25);
+        assert_eq!(cache.get_plan(1, 2, "2026-11"), 125);
+        assert_eq!(cache.get_plan(1, 2, "2026-12"), 0, "他周期不读旧计数");
+        assert_eq!(cache.get_plan(9, 2, "2026-11"), 0, "他用户不串计");
+    }
+
+    /// 周期翻转：以本笔增量重置（旧周期计数不再可读）
+    #[test]
+    fn incr_plan_period_flip_resets_to_increment() {
+        let cache = UsageCache::new();
+        cache.incr_plan(1, 2, "2026-10", 500);
+        cache.incr_plan(1, 2, "2026-11", 30);
+        assert_eq!(cache.get_plan(1, 2, "2026-11"), 30, "翻周期以本笔增量重置");
+        assert_eq!(cache.get_plan(1, 2, "2026-10"), 0);
+    }
 
     #[test]
     fn gen_ms_stream_uses_post_first_token_duration() {

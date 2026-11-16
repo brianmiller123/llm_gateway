@@ -256,22 +256,36 @@ fn dedup_min_limit(rules: Vec<(String, i32)>) -> Vec<(String, i32)> {
 
 /// 应用并发上限（scope × 模型精确匹配）。
 /// 返回的 guard 由调用方绑定到响应体生命周期；Err 即整体拒绝、零占坑。
+/// `global_cap`（`GATEWAY_GLOBAL_MAX_CONCURRENCY`）> 0 时追加一条 global
+/// 作用域、不限模型的兜底规则：与 DB 全局规则同一 "global" 桶键，经
+/// `dedup_min_limit` 取最严（min）后由同一次 all-or-nothing acquire 覆盖。
+/// 参数下推而非合成规则快照：每请求 clone `AppState` + 深拷贝 rules +
+/// 新建 `RwLock` 只为加一条固定规则，默认 256 上限下是恒定的每请求开销。
 pub fn apply_concurrency_limits(
     st: &AppState,
     user_id: Option<i64>,
     key_id: Option<i64>,
     model: &str,
+    global_cap: usize,
 ) -> Result<ConcurrencyGuard, AppError> {
     // DB 不强制 (scope, scope_id, model) 唯一：重复规则会让同一桶键出现多次，
     // try_acquire 阶段双倍占坑，实际并发上限被副本数稀释。
     // 按键去重、取最严（最小）上限。
-    let matched: Vec<(String, i32)> = dedup_min_limit({
+    let matched: Vec<(String, i32)> = {
         let rules = st.rules.read();
-        matched_rules(&rules, user_id, key_id, model)
+        let mut matched: Vec<(String, i32)> = matched_rules(&rules, user_id, key_id, model)
             .into_iter()
             .filter(|(_, limit)| *limit > 0)
-            .collect()
-    });
+            .collect();
+        // global_cap == 0（关闭）不入表；与 DB 全局规则同键时由去重取 min
+        if global_cap > 0 {
+            matched.push((
+                "global".to_string(),
+                global_cap.min(i32::MAX as usize) as i32,
+            ));
+        }
+        dedup_min_limit(matched)
+    };
 
     match st.concurrency.try_acquire(&matched) {
         Ok(guard) => Ok(guard),
