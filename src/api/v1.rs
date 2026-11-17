@@ -382,18 +382,21 @@ fn merge_capability<'a>(acc: Option<&'a str>, next: Option<&'a str>) -> Option<&
 /// 模型库目录行：`(model_id, provider_id, context_length, capability, max_output_tokens)`
 type CatalogRow = (String, i64, Option<i64>, Option<String>, Option<i64>);
 
-/// 路由别名的方言标记判定：候选链（主供应商 + 降级链）**全部**是原生
-/// systemone 才标记——proxy 的方言配对只过滤不可行候选、保留可行候选
-/// （`pairing_unsupported`），链上有任一 chat 供应商时该别名实际可走
-/// `/v1/chat/completions`。快照缺 provider（已停用/过期）按非 systemone 处理。
+/// 路由别名的方言标记判定：候选链**全部**是原生 systemone 才标记——proxy 的
+/// 方言配对只过滤不可行候选、保留可行候选（`pairing_unsupported`），链上有
+/// 任一 chat 供应商时该别名实际可走 `/v1/chat/completions`。
+///
+/// `chain` 必须是**有效链**：调用方已按「快照存在（已启用）+ 该用户可路由 +
+/// 模型目录未禁用」过滤，与 `resolve_candidates` / `proxy` 的候选构造对齐。
+/// 空链（没有可用候选）保守不标记；表里缺 id 同样按非 systemone 处理。
 fn chain_systemone_only(
-    primary: i64,
-    fallbacks: &[i64],
+    chain: &[i64],
     provider_systemone: &std::collections::HashMap<i64, bool>,
 ) -> bool {
-    std::iter::once(&primary)
-        .chain(fallbacks)
-        .all(|pid| provider_systemone.get(pid).copied().unwrap_or(false))
+    !chain.is_empty()
+        && chain
+            .iter()
+            .all(|pid| provider_systemone.get(pid).copied().unwrap_or(false))
 }
 
 async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
@@ -532,15 +535,23 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             continue;
         };
         if can_use(r.provider_id, &r.model_pattern) {
-            // 标记按候选链判定（主 + 降级链）：链上有 chat 供应商时该别名实际
-            // 可走 /v1/chat/completions，不能标成 decision-only（只列具体
-            // pattern，通配符已在上面跳过）
+            // 标记按**有效**链判定（与 proxy 候选构造同序同过滤）：快照存在
+            //（已启用）→ 该用户可路由 → 模型目录未禁用。配置里指向已停用/
+            // 无权供应商的 fallback 不是可用候选，不得抑制标记
+            let effective: Vec<i64> = std::iter::once(r.provider_id)
+                .chain(r.fallback_ids.iter().copied())
+                .filter(|pid| provider_systemone.contains_key(pid))
+                .filter(|pid| can_use(*pid, &r.model_pattern))
+                .filter(|pid| {
+                    !crate::service::routing::model_disabled(&st, *pid, upstream_model)
+                })
+                .collect();
             push(
                 r.model_pattern.clone(),
                 *ctx,
                 *max_out,
                 cap.as_deref(),
-                chain_systemone_only(r.provider_id, &r.fallback_ids, &provider_systemone),
+                chain_systemone_only(&effective, &provider_systemone),
             );
         }
     }
@@ -866,43 +877,46 @@ mod tests {
         assert_eq!(fold(&[Some("vision"), None]), None);
     }
 
-    /// W1：别名标记按候选链判定——链上全部原生 systemone 才标记；降级链含
-    /// chat 供应商（proxy 保留可行候选，实际可走 chat）或快照缺 provider 均
-    /// 不标记
+    /// F1：别名标记按**有效**链判定——链上全部原生 systemone 才标记；链含
+    /// chat 供应商（实际可走 chat）不标记；空链（无可用候选）保守不标记；
+    /// 已按启用/授权/模型启停过滤掉不可用 fallback 后只剩 systemone → 标记
     #[test]
     fn chain_systemone_only_requires_whole_chain_native() {
         // provider 1 = systemone，2 = chat，3 = 快照缺失
         let dialect = std::collections::HashMap::from([(1i64, true), (2i64, false)]);
 
+        // 有效链为 [systemone]：即「主 systemone + 已停用/无权 fallback」过滤
+        // 后的形状（旧口径吃配置链 [1, 3] 会漏标，见响应级用例）
+        assert!(chain_systemone_only(&[1], &dialect), "仅 systemone → 标记");
         assert!(
-            chain_systemone_only(1, &[], &dialect),
-            "纯 systemone 主链 → 标记"
-        );
-        assert!(
-            chain_systemone_only(1, &[1], &dialect),
+            chain_systemone_only(&[1, 1], &dialect),
             "降级链同为 systemone → 标记"
         );
         assert!(
-            !chain_systemone_only(1, &[2], &dialect),
-            "chat fallback → 不标记"
+            !chain_systemone_only(&[1, 2], &dialect),
+            "链含 chat 供应商 → 不标记"
         );
+        assert!(!chain_systemone_only(&[], &dialect), "空链 → 保守不标记");
+        assert!(!chain_systemone_only(&[2], &dialect), "主供应商是 chat → 不标记");
         assert!(
-            !chain_systemone_only(2, &[1], &dialect),
-            "主供应商是 chat → 不标记"
-        );
-        assert!(
-            !chain_systemone_only(3, &[], &dialect),
-            "快照缺 provider（已停用/过期）→ 按非 systemone"
+            !chain_systemone_only(&[1, 3], &dialect),
+            "表里缺的 id → 按非 systemone"
         );
     }
 
-    /// S3：`/v1/models` 响应级断言——catalog 与别名按方言标记；既有键与列序
-    /// 不变；别名按候选链判定（主 systemone + chat fallback → 不标记）
+    /// S3/F1/F2/F3：`/v1/models` 响应级断言——catalog 与别名按方言标记；
+    /// 已停用 fallback 不计入有效链；同名模型「可见但混合」不标记；既有键
+    /// 不变；catalog 段顺序无 SQL 合同（只断言集合），别名段按路由序
     #[sqlx::test(migrations = "./migrations")]
     async fn models_tags_decision_entries_by_dialect_and_chain(pool: sqlx::PgPool) {
         use crate::store::config::{create_provider, create_route, replace_provider_models};
 
-        async fn provider(pool: &sqlx::PgPool, name: &str, api_type: &str) {
+        async fn provider(
+            pool: &sqlx::PgPool,
+            name: &str,
+            api_type: &str,
+            enabled: bool,
+        ) -> i64 {
             create_provider(
                 pool,
                 name,
@@ -910,14 +924,15 @@ mod tests {
                 "https://example.invalid/v1",
                 "",
                 30_000,
-                true,
+                enabled,
                 &serde_json::json!({}),
                 "bearer",
                 &serde_json::json!({}),
                 false,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .id
         }
         async fn alias(
             pool: &sqlx::PgPool,
@@ -945,13 +960,13 @@ mod tests {
             .unwrap();
         }
 
-        provider(&pool, "p-chat", "openai").await;
-        provider(&pool, "p-sys", "SystemOne").await;
-        let providers = crate::store::upstream::load_providers(&pool).await.unwrap();
-        let p_chat = providers.iter().find(|p| p.name == "p-chat").unwrap().id;
-        let p_sys = providers.iter().find(|p| p.name == "p-sys").unwrap().id;
-        // 模型库同步（同时为本供应商各建一条直指精确路由）
-        replace_provider_models(&pool, p_chat, &["c-model".to_string()])
+        let p_chat = provider(&pool, "p-chat", "openai", true).await;
+        let p_sys = provider(&pool, "p-sys", "SystemOne", true).await;
+        // 已停用供应商：配置里的 fallback 仍指着它（维护期不自动清理）
+        let p_off = provider(&pool, "p-off", "openai", false).await;
+        // 模型库同步（同时为本供应商各建一条直指精确路由）；chat 侧同样提供
+        // d-model → d-model 是「可见但混合」，不得标记（F3）
+        replace_provider_models(&pool, p_chat, &["c-model".to_string(), "d-model".to_string()])
             .await
             .unwrap();
         replace_provider_models(&pool, p_sys, &["d-model".to_string()])
@@ -959,6 +974,8 @@ mod tests {
             .unwrap();
         // 别名：精确 pattern + upstream_model（出站模型须是主供应商库内模型）
         alias(&pool, "d-alias", p_sys, &[], "d-model").await;
+        // F1 回归点：fallback 指向已停用供应商 → 有效链只剩 systemone → 标记
+        alias(&pool, "d-alias-off", p_sys, &[p_off], "d-model").await;
         alias(&pool, "c-alias", p_chat, &[], "c-model").await;
         // W1：主供应商 systemone + chat fallback → 实际可走 chat，不标记
         alias(&pool, "mixed-alias", p_sys, &[p_chat], "d-model").await;
@@ -980,25 +997,43 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().expect("id"))
             .collect();
+        // catalog 查询无 ORDER BY：只断言集合；别名段有 ORDER BY priority,id
+        // 的合同，断言相对顺序
+        for id in ["c-model", "d-model"] {
+            assert!(ids.contains(&id), "catalog 模型必须在结果中: {ids:?}");
+        }
+        let alias_ids = ["d-alias", "d-alias-off", "c-alias", "mixed-alias"];
+        let seen_aliases: Vec<&str> = ids
+            .iter()
+            .copied()
+            .filter(|id| alias_ids.contains(id))
+            .collect();
         assert_eq!(
-            ids,
-            vec!["c-model", "d-model", "d-alias", "c-alias", "mixed-alias"],
-            "列序：catalog（入库序）在前、别名按路由序在后"
+            seen_aliases,
+            alias_ids,
+            "别名段按路由顺序（priority, id）: {ids:?}"
         );
+        assert_eq!(data.len(), 6, "catalog 2 条 + 别名 4 条: {ids:?}");
+
         let entry = |id: &str| {
             data.iter()
                 .find(|m| m["id"] == id)
                 .unwrap_or_else(|| panic!("缺少模型 {id}"))
         };
-        assert_eq!(
-            entry("d-model")["api_type"],
-            "systemone",
-            "systemone 供应商的模型带标记"
+        // F3：d-model 在 chat 侧也存在 → 可见但混合，不标记
+        assert!(
+            entry("d-model").get("api_type").is_none(),
+            "chat 侧也提供 d-model → 混合，不标记"
         );
         assert_eq!(
             entry("d-alias")["api_type"],
             "systemone",
-            "纯 systemone 别名带标记"
+            "别名候选链只含 systemone 供应商 → 标记"
+        );
+        assert_eq!(
+            entry("d-alias-off")["api_type"],
+            "systemone",
+            "已停用 fallback 被有效链过滤 → 仅剩 systemone → 标记"
         );
         for id in ["c-model", "c-alias", "mixed-alias"] {
             assert!(
@@ -1058,6 +1093,25 @@ mod tests {
         replace_provider_models(&pool, p_chat.id, &["shared".to_string()])
             .await
             .unwrap();
+        // F1(b)：别名主供应商 systemone + chat fallback——但该用户对 chat 渠道
+        // 无授权，有效链只剩 systemone → 应标记（配置链口径会漏标）
+        crate::store::config::create_route(
+            &pool,
+            "shared-alias",
+            p_sys.id,
+            100,
+            &[p_chat.id],
+            Some("shared"),
+            true,
+            &serde_json::json!({}),
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut st = api_key_state(crate::config::AuthMode::ApiKey);
         st.pool = pool.clone();
@@ -1078,11 +1132,19 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let data = v["data"].as_array().expect("data 数组");
-        assert_eq!(data.len(), 1, "只列授权渠道可见的模型: {data:?}");
-        assert_eq!(data[0]["id"], "shared");
+        let entry = |id: &str| {
+            data.iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("缺少模型 {id}"))
+        };
+        assert_eq!(data.len(), 2, "catalog 1 条 + 别名 1 条: {data:?}");
         assert_eq!(
-            data[0]["api_type"], "systemone",
+            entry("shared")["api_type"], "systemone",
             "可见行集内全是 systemone → 必须标记"
+        );
+        assert_eq!(
+            entry("shared-alias")["api_type"], "systemone",
+            "无权/不可用的 chat fallback 不算有效候选 → 有效链仅 systemone → 必须标记"
         );
     }
 }
