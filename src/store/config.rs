@@ -580,9 +580,9 @@ fn pattern_hits(pattern: &str, model: &str) -> bool {
 
 /// 同步某供应商的模型列表（事务；测试连接/手动刷新时调用）：上游已不存在的
 /// 模型删除，仍存在的保留原行（启停状态、创建时间不变），新模型插入（默认启用）。
-/// 同时为模型库中无任何已启用路由可命中的模型自动创建精确路由（兜底：
-/// 列表中的模型必须可调用；已有通配/精确路由的模型不受影响，尊重手动配置）。
-/// 返回写入的模型数
+/// 同时为本供应商模型库中无任何已启用路由可命中的模型自动创建精确路由（兜底：
+/// 列表中的模型必须可调用；本供应商已有通配/精确路由的模型不受影响，尊重手动
+/// 配置）。返回写入的模型数
 pub async fn replace_provider_models(
     pool: &PgPool,
     provider_id: i64,
@@ -595,10 +595,15 @@ pub async fn replace_provider_models(
         .bind(models)
         .execute(&mut *tx)
         .await?;
-    let enabled_patterns: Vec<(String,)> =
-        sqlx::query_as("SELECT model_pattern FROM model_routes WHERE enabled")
-            .fetch_all(&mut *tx)
-            .await?;
+    // 只看本供应商的启用路由：别家路由（例如另一供应商的 `*` 通配）曾把本
+    // 供应商的新模型顶成「已命中」而跳过兜底建精确路由 → models 有行、
+    // model_routes 无行，该模型（含 systemone 决策模型）无法经任何路由调用
+    let enabled_patterns: Vec<(String,)> = sqlx::query_as(
+        "SELECT model_pattern FROM model_routes WHERE enabled AND provider_id = $1",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut *tx)
+    .await?;
     for m in models {
         sqlx::query(
             "INSERT INTO models (provider_id, model_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1322,5 +1327,83 @@ mod tests {
         // m-* 直指 p2 → 删 p2 时该路由一并删除
         assert!(delete_provider(&pool, p2.id).await.unwrap());
         assert!(list_routes(&pool).await.unwrap().is_empty());
+    }
+
+    /// 回归：兜底建路由只看本供应商的启用路由。别家供应商的 `*` 通配曾让本
+    /// 供应商的新模型被判成「已有路由可命中」而跳过建精确路由 → models 有行、
+    /// model_routes 无行，该模型（systemone 决策模型同款）无法经任何路由调用
+    #[sqlx::test(migrations = "./migrations")]
+    async fn auto_route_fallback_ignores_other_providers_routes(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        let p2 = seed_provider(&pool, "p2").await;
+        // p1 的启用 `*` 通配对任何模型名都命中
+        create_route(
+            &pool,
+            "*",
+            p1.id,
+            100,
+            &[],
+            None,
+            true,
+            &serde_json::json!({}),
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        replace_provider_models(&pool, p2.id, &["m1".to_string()])
+            .await
+            .unwrap();
+
+        let routes = list_routes(&pool).await.unwrap();
+        let own: Vec<_> = routes.iter().filter(|r| r.model_pattern == "m1").collect();
+        assert_eq!(
+            own.len(),
+            1,
+            "别家的 `*` 路由不得吞掉本供应商的兜底路由: {routes:?}"
+        );
+        assert_eq!(own[0].provider_id, p2.id, "兜底路由指向本供应商");
+        assert!(own[0].enabled, "兜底路由默认启用");
+    }
+
+    /// 不回归：本供应商已有启用通配路由时，刷新模型库不新建精确路由
+    /// （尊重手动配置，兜底只补无任何路由可命中的模型）
+    #[sqlx::test(migrations = "./migrations")]
+    async fn auto_route_fallback_respects_own_wildcard(pool: PgPool) {
+        let p1 = seed_provider(&pool, "p1").await;
+        create_route(
+            &pool,
+            "m-*",
+            p1.id,
+            100,
+            &[],
+            None,
+            true,
+            &serde_json::json!({}),
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        replace_provider_models(&pool, p1.id, &["m-9".to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            models_of(&list_models(&pool).await.unwrap(), p1.id)
+                .contains(&("m-9".to_string(), true)),
+            "模型行仍入库"
+        );
+        let routes = list_routes(&pool).await.unwrap();
+        assert_eq!(routes.len(), 1, "本供应商通配已覆盖 m-9 → 不新建精确路由");
+        assert_eq!(routes[0].model_pattern, "m-*");
     }
 }

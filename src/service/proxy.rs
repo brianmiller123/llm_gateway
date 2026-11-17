@@ -1399,8 +1399,10 @@ async fn proxy_authed_inner(
         .into_iter()
         .map(Arc::new)
         .collect();
+    // 路由命中的供应商全部停用 = 配置/可用性问题（客户端可重试、运维可修），
+    // 不是网关内部错误 → 503 而非 500
     if candidates.is_empty() {
-        return Err(AppError::Internal(format!(
+        return Err(AppError::ServiceUnavailable(format!(
             "no enabled provider for route '{}'",
             route.model_pattern
         )));
@@ -7491,5 +7493,45 @@ data: [DONE]\n\n",
             .await
             .expect("上限内应正常收集");
         assert_eq!(ok, b"hello world");
+    }
+
+    /// 路由命中的供应商全部停用（快照里没有）→ 503 而非 500：配置/可用性
+    /// 问题，客户端可重试、运维可修；文案保留 route pattern 便于定位
+    #[tokio::test]
+    async fn empty_candidates_returns_503() {
+        let st = crate::state::AppState::test_fixture();
+        // 路由指向 provider 1，但 providers 快照为空（= 该供应商已停用）
+        *st.routes.write() = vec![test_route("t-model", 1, vec![])];
+        let json = serde_json::json!({
+            "model": "t-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let err = proxy_test(
+            &st,
+            axum::http::HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json).expect("serialize")),
+            Endpoint {
+                api: "/v1/chat/completions",
+                upstream: "/chat/completions",
+                responses: false,
+                anthropic: false,
+                systemone: false,
+            },
+            "127.0.0.1".parse().expect("ip"),
+        )
+        .await
+        .expect_err("候选为空必须报错");
+
+        // proxy_test 在错误外层包 WithRequestId（Display/classify 委托内层），
+        // 因此按客户端可见状态码断言而非匹配外层变体
+        assert_eq!(
+            err.classify().0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "空候选 = 503 语义: {err}"
+        );
+        assert!(
+            err.to_string().contains("no enabled provider for route 't-model'"),
+            "文案保留: {err}"
+        );
     }
 }

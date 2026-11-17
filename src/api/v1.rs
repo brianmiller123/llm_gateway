@@ -379,6 +379,36 @@ fn merge_capability<'a>(acc: Option<&'a str>, next: Option<&'a str>) -> Option<&
     }
 }
 
+/// 模型库目录行：`(model_id, provider_id, context_length, capability, max_output_tokens)`
+type CatalogRow = (String, i64, Option<i64>, Option<String>, Option<i64>);
+
+/// `/v1/models` 的决策模型标记判定：该模型在目录中的所有 provider 都是原生
+/// systemone → 条目带 `"api_type": "systemone"`（只有 `/v1/systemone` 能调用，
+/// 客户端据此避免按 OpenAI 兼容列表直接打 `/v1/chat/completions` 拿 400）。
+/// 混合目录（另有 chat 供应商）或全 chat → 不标记；目录中没有该模型（无证据）
+/// → 不标记；`provider_systemone` 缺该 provider（快照过期）按非 systemone 处理。
+fn model_systemone_only(
+    catalog: &[CatalogRow],
+    model: &str,
+    provider_systemone: &std::collections::HashMap<i64, bool>,
+) -> bool {
+    let mut seen_provider = false;
+    for (m, provider_id, ..) in catalog {
+        if m != model {
+            continue;
+        }
+        seen_provider = true;
+        if !provider_systemone
+            .get(provider_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    seen_provider
+}
+
 async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     // R2-SEC-01：`api_key` 模式的鉴权错误不再被 `.ok()` 吞掉——匿名/无效 Key
     // 请求曾可列出全量模型（与 README 的 Bearer 鉴权契约冲突）；现在缺失/无效
@@ -399,7 +429,11 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
     let mut seen: Vec<String> = Vec::new();
     let mut data: Vec<serde_json::Value> = Vec::new();
-    let mut push = |name: String, ctx: Option<i64>, max_out: Option<i64>, capability: Option<&str>| {
+    let mut push = |name: String,
+                    ctx: Option<i64>,
+                    max_out: Option<i64>,
+                    capability: Option<&str>,
+                    systemone: bool| {
         if seen.contains(&name) {
             return;
         }
@@ -409,6 +443,11 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             "object": "model",
             "owned_by": "llm-gateway",
         });
+        // 决策模型与 chat 模型混列且无方言标记时，客户端按列表打
+        // /v1/chat/completions 必得 400；仅 systemone 上游提供的模型显式打标
+        if systemone {
+            obj["api_type"] = json!("systemone");
+        }
         if let Some(n) = ctx {
             obj["context_length"] = json!(n);
             obj["context_window"] = json!(n);
@@ -427,15 +466,22 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
     // 1) 模型库（测试连接/手动刷新入库的模型）；仅列启用供应商下已启用的模型。
     //    聚合与授权过滤同集合：只对该用户可路由的供应商取最小值——更精确
     //    （不因无权渠道的更小设置而低估可用上下文），且仍不高估。
-    let catalog: Vec<(String, i64, Option<i64>, Option<String>, Option<i64>)> =
-        sqlx::query_as::<_, (String, i64, Option<i64>, Option<String>, Option<i64>)>(
-            "SELECT m.model_id, m.provider_id, m.context_length, m.capability, m.max_output_tokens FROM models m \
-             JOIN providers p ON p.id = m.provider_id AND p.enabled \
-             WHERE m.enabled",
-        )
-        .fetch_all(&st.pool)
-        .await
-        .unwrap_or_default();
+    //    方言标记口径与 /v1/systemone 透传判定同一规则（api_type 大小写不敏感），
+    //    直接复用 provider_native_systemone，不另写一份字符串比较。
+    let provider_systemone: std::collections::HashMap<i64, bool> = st
+        .providers
+        .read()
+        .iter()
+        .map(|p| (p.id, crate::service::systemone::provider_native_systemone(p)))
+        .collect();
+    let catalog: Vec<CatalogRow> = sqlx::query_as::<_, CatalogRow>(
+        "SELECT m.model_id, m.provider_id, m.context_length, m.capability, m.max_output_tokens FROM models m \
+         JOIN providers p ON p.id = m.provider_id AND p.enabled \
+         WHERE m.enabled",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
     let mut catalog_ctx: std::collections::HashMap<&str, Option<i64>> =
         std::collections::HashMap::new();
     let mut catalog_cap: std::collections::HashMap<&str, Option<&str>> =
@@ -463,6 +509,7 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
                 catalog_ctx.get(model.as_str()).copied().flatten(),
                 max_out,
                 cap,
+                model_systemone_only(&catalog, model, &provider_systemone),
             );
         }
     }
@@ -486,7 +533,18 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             continue;
         };
         if can_use(r.provider_id, &r.model_pattern) {
-            push(r.model_pattern.clone(), *ctx, *max_out, cap.as_deref());
+            // 别名路由指向 systemone 供应商 → 同样带方言标记（只列具体 pattern，
+            // 通配符已在上面跳过）
+            push(
+                r.model_pattern.clone(),
+                *ctx,
+                *max_out,
+                cap.as_deref(),
+                provider_systemone
+                    .get(&r.provider_id)
+                    .copied()
+                    .unwrap_or(false),
+            );
         }
     }
     (
@@ -498,7 +556,10 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{BufLimitedBody, Bytes, merge_capability, merge_min_opt, models};
+    use super::{
+        BufLimitedBody, Bytes, CatalogRow, merge_capability, merge_min_opt, model_systemone_only,
+        models,
+    };
     use crate::state::{AppState, BufferBudget};
     use crate::store::keys::ApiKeyRow;
     use axum::body::{Body, to_bytes};
@@ -807,5 +868,38 @@ mod tests {
         assert_eq!(fold(&[Some("vision"), Some("multimodal")]), Some("vision"));
         assert_eq!(fold(&[None, Some("vision")]), None, "任一未标注 → 不下发");
         assert_eq!(fold(&[Some("vision"), None]), None);
+    }
+
+    /// Fix 3：`/v1/models` 的决策模型标记口径——某模型在目录中的所有 provider
+    /// 都是原生 systemone 才标记；混合（另有 chat 供应商）/ 全 chat / 目录无
+    /// 该模型 / 快照缺该 provider 均不标记
+    #[test]
+    fn model_systemone_only_tags_only_pure_decision_models() {
+        let row = |model: &str, provider_id: i64| -> CatalogRow {
+            (model.to_string(), provider_id, None, None, None)
+        };
+        // provider 1 = systemone，2 = chat
+        let dialect = std::collections::HashMap::from([(1i64, true), (2i64, false)]);
+
+        assert!(
+            model_systemone_only(&[row("decision", 1)], "decision", &dialect),
+            "仅 systemone 上游 → 标记"
+        );
+        assert!(
+            !model_systemone_only(&[row("chat", 2)], "chat", &dialect),
+            "全 chat → 不标记"
+        );
+        assert!(
+            !model_systemone_only(&[row("mixed", 1), row("mixed", 2)], "mixed", &dialect),
+            "混合目录（另有 chat 渠道）→ 不标记"
+        );
+        assert!(
+            !model_systemone_only(&[row("decision", 1)], "absent", &dialect),
+            "目录中没有该模型 → 无证据不标记"
+        );
+        assert!(
+            !model_systemone_only(&[row("decision", 3)], "decision", &dialect),
+            "快照缺该 provider（可能已停用）→ 按非 systemone"
+        );
     }
 }

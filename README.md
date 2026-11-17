@@ -150,6 +150,8 @@ curl -sk https://127.0.0.1:8443/v1/systemone \
 
 `model` / `state` / `questions` / `assets` 逐字转发给上游；Prism 侧图像证据字段名为 `images`（base64/data URI 列表；未启 vision tower 时 422），`assets` 仅逐字转发，Prism 不解读。`stream: true` 返回 400（协议层无 SSE）。模型「测试」按方言选择探针——`systemone` 渠道打 `POST {base_url}/systemone`，其余打 `/chat/completions`。仅 `api_type=systemone` 上游原生透传，网关**不做**任何方言转换（其它上游与 `/v1/systemone` 配对一律 400）。
 
+决策模型同样出现在 `GET /v1/models` 列表中（保留可发现性），但条目带 `"api_type": "systemone"` 标记——这类模型只能经 `POST /v1/systemone` 调用，按 OpenAI 兼容口径打 `/v1/chat/completions` 会得到 400。
+
 ## 配置说明（环境变量）
 
 | 变量 | 默认 | 说明 |
