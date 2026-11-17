@@ -382,31 +382,18 @@ fn merge_capability<'a>(acc: Option<&'a str>, next: Option<&'a str>) -> Option<&
 /// 模型库目录行：`(model_id, provider_id, context_length, capability, max_output_tokens)`
 type CatalogRow = (String, i64, Option<i64>, Option<String>, Option<i64>);
 
-/// `/v1/models` 的决策模型标记判定：该模型在目录中的所有 provider 都是原生
-/// systemone → 条目带 `"api_type": "systemone"`（只有 `/v1/systemone` 能调用，
-/// 客户端据此避免按 OpenAI 兼容列表直接打 `/v1/chat/completions` 拿 400）。
-/// 混合目录（另有 chat 供应商）或全 chat → 不标记；目录中没有该模型（无证据）
-/// → 不标记；`provider_systemone` 缺该 provider（快照过期）按非 systemone 处理。
-fn model_systemone_only(
-    catalog: &[CatalogRow],
-    model: &str,
+/// 路由别名的方言标记判定：候选链（主供应商 + 降级链）**全部**是原生
+/// systemone 才标记——proxy 的方言配对只过滤不可行候选、保留可行候选
+/// （`pairing_unsupported`），链上有任一 chat 供应商时该别名实际可走
+/// `/v1/chat/completions`。快照缺 provider（已停用/过期）按非 systemone 处理。
+fn chain_systemone_only(
+    primary: i64,
+    fallbacks: &[i64],
     provider_systemone: &std::collections::HashMap<i64, bool>,
 ) -> bool {
-    let mut seen_provider = false;
-    for (m, provider_id, ..) in catalog {
-        if m != model {
-            continue;
-        }
-        seen_provider = true;
-        if !provider_systemone
-            .get(provider_id)
-            .copied()
-            .unwrap_or(false)
-        {
-            return false;
-        }
-    }
-    seen_provider
+    std::iter::once(&primary)
+        .chain(fallbacks)
+        .all(|pid| provider_systemone.get(pid).copied().unwrap_or(false))
 }
 
 async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
@@ -488,6 +475,10 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         std::collections::HashMap::new();
     let mut catalog_max_out: std::collections::HashMap<&str, Option<i64>> =
         std::collections::HashMap::new();
+    // 标记口径与聚合同集合（授权可见行集）：任一行不是原生 systemone →
+    // 该用户能走 chat，不标记。逐行 AND 入表，避免每条 catalog 行扫全表
+    let mut catalog_systemone: std::collections::HashMap<&str, bool> =
+        std::collections::HashMap::new();
     for (model, provider_id, ctx, cap, max_out) in &catalog {
         if can_use(*provider_id, model) {
             let entry = catalog_ctx.entry(model.as_str()).or_insert(None);
@@ -498,6 +489,11 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             *cap_entry = merge_capability(*cap_entry, cap.as_deref());
             let out_entry = catalog_max_out.entry(model.as_str()).or_insert(None);
             *out_entry = merge_min_opt(*out_entry, *max_out);
+            let sys_entry = catalog_systemone.entry(model.as_str()).or_insert(true);
+            *sys_entry &= provider_systemone
+                .get(provider_id)
+                .copied()
+                .unwrap_or(false);
         }
     }
     for (model, provider_id, _, _, _) in &catalog {
@@ -509,7 +505,10 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
                 catalog_ctx.get(model.as_str()).copied().flatten(),
                 max_out,
                 cap,
-                model_systemone_only(&catalog, model, &provider_systemone),
+                catalog_systemone
+                    .get(model.as_str())
+                    .copied()
+                    .unwrap_or(false),
             );
         }
     }
@@ -533,17 +532,15 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
             continue;
         };
         if can_use(r.provider_id, &r.model_pattern) {
-            // 别名路由指向 systemone 供应商 → 同样带方言标记（只列具体 pattern，
-            // 通配符已在上面跳过）
+            // 标记按候选链判定（主 + 降级链）：链上有 chat 供应商时该别名实际
+            // 可走 /v1/chat/completions，不能标成 decision-only（只列具体
+            // pattern，通配符已在上面跳过）
             push(
                 r.model_pattern.clone(),
                 *ctx,
                 *max_out,
                 cap.as_deref(),
-                provider_systemone
-                    .get(&r.provider_id)
-                    .copied()
-                    .unwrap_or(false),
+                chain_systemone_only(r.provider_id, &r.fallback_ids, &provider_systemone),
             );
         }
     }
@@ -557,8 +554,7 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        BufLimitedBody, Bytes, CatalogRow, merge_capability, merge_min_opt, model_systemone_only,
-        models,
+        BufLimitedBody, Bytes, chain_systemone_only, merge_capability, merge_min_opt, models,
     };
     use crate::state::{AppState, BufferBudget};
     use crate::store::keys::ApiKeyRow;
@@ -870,36 +866,223 @@ mod tests {
         assert_eq!(fold(&[Some("vision"), None]), None);
     }
 
-    /// Fix 3：`/v1/models` 的决策模型标记口径——某模型在目录中的所有 provider
-    /// 都是原生 systemone 才标记；混合（另有 chat 供应商）/ 全 chat / 目录无
-    /// 该模型 / 快照缺该 provider 均不标记
+    /// W1：别名标记按候选链判定——链上全部原生 systemone 才标记；降级链含
+    /// chat 供应商（proxy 保留可行候选，实际可走 chat）或快照缺 provider 均
+    /// 不标记
     #[test]
-    fn model_systemone_only_tags_only_pure_decision_models() {
-        let row = |model: &str, provider_id: i64| -> CatalogRow {
-            (model.to_string(), provider_id, None, None, None)
-        };
-        // provider 1 = systemone，2 = chat
+    fn chain_systemone_only_requires_whole_chain_native() {
+        // provider 1 = systemone，2 = chat，3 = 快照缺失
         let dialect = std::collections::HashMap::from([(1i64, true), (2i64, false)]);
 
         assert!(
-            model_systemone_only(&[row("decision", 1)], "decision", &dialect),
-            "仅 systemone 上游 → 标记"
+            chain_systemone_only(1, &[], &dialect),
+            "纯 systemone 主链 → 标记"
         );
         assert!(
-            !model_systemone_only(&[row("chat", 2)], "chat", &dialect),
-            "全 chat → 不标记"
+            chain_systemone_only(1, &[1], &dialect),
+            "降级链同为 systemone → 标记"
         );
         assert!(
-            !model_systemone_only(&[row("mixed", 1), row("mixed", 2)], "mixed", &dialect),
-            "混合目录（另有 chat 渠道）→ 不标记"
+            !chain_systemone_only(1, &[2], &dialect),
+            "chat fallback → 不标记"
         );
         assert!(
-            !model_systemone_only(&[row("decision", 1)], "absent", &dialect),
-            "目录中没有该模型 → 无证据不标记"
+            !chain_systemone_only(2, &[1], &dialect),
+            "主供应商是 chat → 不标记"
         );
         assert!(
-            !model_systemone_only(&[row("decision", 3)], "decision", &dialect),
-            "快照缺该 provider（可能已停用）→ 按非 systemone"
+            !chain_systemone_only(3, &[], &dialect),
+            "快照缺 provider（已停用/过期）→ 按非 systemone"
+        );
+    }
+
+    /// S3：`/v1/models` 响应级断言——catalog 与别名按方言标记；既有键与列序
+    /// 不变；别名按候选链判定（主 systemone + chat fallback → 不标记）
+    #[sqlx::test(migrations = "./migrations")]
+    async fn models_tags_decision_entries_by_dialect_and_chain(pool: sqlx::PgPool) {
+        use crate::store::config::{create_provider, create_route, replace_provider_models};
+
+        async fn provider(pool: &sqlx::PgPool, name: &str, api_type: &str) {
+            create_provider(
+                pool,
+                name,
+                api_type,
+                "https://example.invalid/v1",
+                "",
+                30_000,
+                true,
+                &serde_json::json!({}),
+                "bearer",
+                &serde_json::json!({}),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        async fn alias(
+            pool: &sqlx::PgPool,
+            pattern: &str,
+            primary: i64,
+            fallbacks: &[i64],
+            upstream: &str,
+        ) {
+            create_route(
+                pool,
+                pattern,
+                primary,
+                100,
+                fallbacks,
+                Some(upstream),
+                true,
+                &serde_json::json!({}),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        provider(&pool, "p-chat", "openai").await;
+        provider(&pool, "p-sys", "SystemOne").await;
+        let providers = crate::store::upstream::load_providers(&pool).await.unwrap();
+        let p_chat = providers.iter().find(|p| p.name == "p-chat").unwrap().id;
+        let p_sys = providers.iter().find(|p| p.name == "p-sys").unwrap().id;
+        // 模型库同步（同时为本供应商各建一条直指精确路由）
+        replace_provider_models(&pool, p_chat, &["c-model".to_string()])
+            .await
+            .unwrap();
+        replace_provider_models(&pool, p_sys, &["d-model".to_string()])
+            .await
+            .unwrap();
+        // 别名：精确 pattern + upstream_model（出站模型须是主供应商库内模型）
+        alias(&pool, "d-alias", p_sys, &[], "d-model").await;
+        alias(&pool, "c-alias", p_chat, &[], "c-model").await;
+        // W1：主供应商 systemone + chat fallback → 实际可走 chat，不标记
+        alias(&pool, "mixed-alias", p_sys, &[p_chat], "d-model").await;
+
+        let mut st = AppState::test_fixture();
+        st.pool = pool.clone();
+        let mut cfg = (*st.cfg).clone();
+        cfg.auth_mode = crate::config::AuthMode::None;
+        st.cfg = std::sync::Arc::new(cfg);
+        *st.providers.write() = crate::store::upstream::load_providers(&pool).await.unwrap();
+        *st.routes.write() = crate::store::upstream::load_routes(&pool).await.unwrap();
+
+        let resp = models(State(st), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().expect("data 数组");
+        let ids: Vec<&str> = data
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["c-model", "d-model", "d-alias", "c-alias", "mixed-alias"],
+            "列序：catalog（入库序）在前、别名按路由序在后"
+        );
+        let entry = |id: &str| {
+            data.iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("缺少模型 {id}"))
+        };
+        assert_eq!(
+            entry("d-model")["api_type"],
+            "systemone",
+            "systemone 供应商的模型带标记"
+        );
+        assert_eq!(
+            entry("d-alias")["api_type"],
+            "systemone",
+            "纯 systemone 别名带标记"
+        );
+        for id in ["c-model", "c-alias", "mixed-alias"] {
+            assert!(
+                entry(id).get("api_type").is_none(),
+                "{id} 不应带方言标记"
+            );
+        }
+        // 既有键不变
+        for id in ["c-model", "d-model", "d-alias"] {
+            let m = entry(id);
+            assert_eq!(m["object"], "model", "{id} object 键不变");
+            assert_eq!(m["owned_by"], "llm-gateway", "{id} owned_by 键不变");
+        }
+    }
+
+    /// W2：标记口径与授权可见行集一致——受限用户只有 systemone 渠道权限、而
+    /// chat 渠道也列同名模型时，条目对该用户仍是 decision-only（可走
+    /// /v1/systemone），必须打标；按全量目录判定会误判成混合
+    #[sqlx::test(migrations = "./migrations")]
+    async fn models_tag_uses_authorized_subset(pool: sqlx::PgPool) {
+        use crate::store::config::{create_provider, replace_provider_models};
+
+        let p_sys = create_provider(
+            &pool,
+            "p-sys",
+            "systemone",
+            "https://example.invalid/v1",
+            "",
+            30_000,
+            true,
+            &serde_json::json!({}),
+            "bearer",
+            &serde_json::json!({}),
+            false,
+        )
+        .await
+        .unwrap();
+        let p_chat = create_provider(
+            &pool,
+            "p-chat",
+            "openai",
+            "https://example.invalid/v1",
+            "",
+            30_000,
+            true,
+            &serde_json::json!({}),
+            "bearer",
+            &serde_json::json!({}),
+            false,
+        )
+        .await
+        .unwrap();
+        // 同名模型在两个渠道各一条
+        replace_provider_models(&pool, p_sys.id, &["shared".to_string()])
+            .await
+            .unwrap();
+        replace_provider_models(&pool, p_chat.id, &["shared".to_string()])
+            .await
+            .unwrap();
+
+        let mut st = api_key_state(crate::config::AuthMode::ApiKey);
+        st.pool = pool.clone();
+        *st.providers.write() = crate::store::upstream::load_providers(&pool).await.unwrap();
+        *st.routes.write() = crate::store::upstream::load_routes(&pool).await.unwrap();
+        // 用户 7 只授权 systemone 供应商（非 admin）
+        st.user_access.write().insert(
+            7,
+            vec![crate::store::access::UserAccessRule {
+                user_id: 7,
+                provider_id: Some(p_sys.id),
+                model_pattern: None,
+            }],
+        );
+
+        let resp = models(State(st), bearer(VALID_KEY)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().expect("data 数组");
+        assert_eq!(data.len(), 1, "只列授权渠道可见的模型: {data:?}");
+        assert_eq!(data[0]["id"], "shared");
+        assert_eq!(
+            data[0]["api_type"], "systemone",
+            "可见行集内全是 systemone → 必须标记"
         );
     }
 }
