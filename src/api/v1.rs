@@ -527,23 +527,27 @@ async fn models(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
         if r.model_pattern.ends_with('*') {
             continue;
         }
-        let upstream_model = r.upstream_model.as_deref().unwrap_or(&r.model_pattern);
+        // 出站名与 proxy 同一推导（upstream_model 优先，否则剥离 `[1m]`）：
+        // 目录键与启停判定都按真正发往上游的模型名查
+        let outbound =
+            crate::service::routing::outbound_model(r.upstream_model.as_deref(), &r.model_pattern);
         let Some((_, _, ctx, cap, max_out)) = catalog
             .iter()
-            .find(|(m, pid, ..)| *pid == r.provider_id && m == upstream_model)
+            .find(|(m, pid, ..)| *pid == r.provider_id && m == &outbound)
         else {
             continue;
         };
         if can_use(r.provider_id, &r.model_pattern) {
-            // 标记按**有效**链判定（与 proxy 候选构造同序同过滤）：快照存在
-            //（已启用）→ 该用户可路由 → 模型目录未禁用。配置里指向已停用/
-            // 无权供应商的 fallback 不是可用候选，不得抑制标记
+            // 标记按**有效**链判定：与 proxy 候选构造同集合、同判定口径（快照
+            // 已启用 + 该用户可路由 + 模型目录未禁用；此处顺序不同但三者均为
+            // AND 过滤，结果等价）。配置里指向已停用/无权供应商或目录已禁用的
+            // fallback 不是可用候选，不得抑制标记
             let effective: Vec<i64> = std::iter::once(r.provider_id)
                 .chain(r.fallback_ids.iter().copied())
                 .filter(|pid| provider_systemone.contains_key(pid))
                 .filter(|pid| can_use(*pid, &r.model_pattern))
                 .filter(|pid| {
-                    !crate::service::routing::model_disabled(&st, *pid, upstream_model)
+                    !crate::service::routing::model_disabled(&st, *pid, &outbound)
                 })
                 .collect();
             push(
@@ -965,17 +969,42 @@ mod tests {
         // 已停用供应商：配置里的 fallback 仍指着它（维护期不自动清理）
         let p_off = provider(&pool, "p-off", "openai", false).await;
         // 模型库同步（同时为本供应商各建一条直指精确路由）；chat 侧同样提供
-        // d-model → d-model 是「可见但混合」，不得标记（F3）
-        replace_provider_models(&pool, p_chat, &["c-model".to_string(), "d-model".to_string()])
+        // d-model → d-model 是「可见但混合」，不得标记（F3）；e-model 在 chat
+        // 侧随后被目录禁用（S1：已禁用模型不算可用候选）
+        replace_provider_models(
+            &pool,
+            p_chat,
+            &[
+                "c-model".to_string(),
+                "d-model".to_string(),
+                "e-model".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        replace_provider_models(&pool, p_sys, &["d-model".to_string(), "e-model".to_string()])
             .await
             .unwrap();
-        replace_provider_models(&pool, p_sys, &["d-model".to_string()])
+        let chat_e = crate::store::config::list_models(&pool)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .find(|m| m.provider_id == p_chat && m.model_id == "e-model")
+            .expect("p-chat/e-model 应已入库");
+        assert!(
+            crate::store::config::set_model_enabled(&pool, chat_e.id, false)
+                .await
+                .unwrap()
+                .is_some(),
+            "禁用 chat 侧的 e-model"
+        );
         // 别名：精确 pattern + upstream_model（出站模型须是主供应商库内模型）
         alias(&pool, "d-alias", p_sys, &[], "d-model").await;
         // F1 回归点：fallback 指向已停用供应商 → 有效链只剩 systemone → 标记
         alias(&pool, "d-alias-off", p_sys, &[p_off], "d-model").await;
+        // S1 回归点：fallback 供应商已启用，但其目录里的出站模型被禁用 →
+        // 不算可用候选 → 有效链只剩 systemone → 标记
+        alias(&pool, "d-alias-disabled", p_sys, &[p_chat], "e-model").await;
         alias(&pool, "c-alias", p_chat, &[], "c-model").await;
         // W1：主供应商 systemone + chat fallback → 实际可走 chat，不标记
         alias(&pool, "mixed-alias", p_sys, &[p_chat], "d-model").await;
@@ -987,6 +1016,8 @@ mod tests {
         st.cfg = std::sync::Arc::new(cfg);
         *st.providers.write() = crate::store::upstream::load_providers(&pool).await.unwrap();
         *st.routes.write() = crate::store::upstream::load_routes(&pool).await.unwrap();
+        *st.disabled_models.write() =
+            crate::store::config::load_disabled_models(&pool).await.unwrap();
 
         let resp = models(State(st), HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -999,10 +1030,16 @@ mod tests {
             .collect();
         // catalog 查询无 ORDER BY：只断言集合；别名段有 ORDER BY priority,id
         // 的合同，断言相对顺序
-        for id in ["c-model", "d-model"] {
+        for id in ["c-model", "d-model", "e-model"] {
             assert!(ids.contains(&id), "catalog 模型必须在结果中: {ids:?}");
         }
-        let alias_ids = ["d-alias", "d-alias-off", "c-alias", "mixed-alias"];
+        let alias_ids = [
+            "d-alias",
+            "d-alias-off",
+            "d-alias-disabled",
+            "c-alias",
+            "mixed-alias",
+        ];
         let seen_aliases: Vec<&str> = ids
             .iter()
             .copied()
@@ -1013,7 +1050,7 @@ mod tests {
             alias_ids,
             "别名段按路由顺序（priority, id）: {ids:?}"
         );
-        assert_eq!(data.len(), 6, "catalog 2 条 + 别名 4 条: {ids:?}");
+        assert_eq!(data.len(), 8, "catalog 3 条 + 别名 5 条: {ids:?}");
 
         let entry = |id: &str| {
             data.iter()
@@ -1034,6 +1071,11 @@ mod tests {
             entry("d-alias-off")["api_type"],
             "systemone",
             "已停用 fallback 被有效链过滤 → 仅剩 systemone → 标记"
+        );
+        assert_eq!(
+            entry("d-alias-disabled")["api_type"],
+            "systemone",
+            "fallback 的目录模型已禁用 → 不算可用候选 → 仅剩 systemone → 标记"
         );
         for id in ["c-model", "c-alias", "mixed-alias"] {
             assert!(

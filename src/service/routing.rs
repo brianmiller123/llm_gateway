@@ -22,6 +22,19 @@ pub fn matches_pattern(pattern: &str, model: &str) -> bool {
     }
 }
 
+/// 出站模型名（真正发往上游的 `model`）：路由配置了映射则用映射值，否则透传
+/// 客户端模型名——但剥离 Claude Code 长上下文 `[1m]` 后缀（防上游 404/400；
+/// cc-switch model_mapper.rs:163-186 同款）。proxy 的发上游与 /v1/models 的
+/// 目录键/启停判定共用这一个推导，避免两处口径漂移。
+pub fn outbound_model(route_upstream_model: Option<&str>, client_model: &str) -> String {
+    route_upstream_model.map(str::to_string).unwrap_or_else(|| {
+        client_model
+            .strip_suffix("[1m]")
+            .map(str::to_string)
+            .unwrap_or_else(|| client_model.to_string())
+    })
+}
+
 /// 模型库启停：该供应商下的（上游侧）模型是否已被管理员禁用。
 /// 代理管线按出站模型名剔除候选，/v1/models 按目录行过滤——同一判定。
 pub fn model_disabled(st: &AppState, provider_id: i64, upstream_model: &str) -> bool {
@@ -100,4 +113,24 @@ pub fn compute_cost(
         cost_micros += bucket(t, micros(p));
     }
     cost_micros as f64 / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outbound_model;
+
+    /// 出站名推导：映射优先（映射存在时 `[1m]` 不参与）；无映射时剥离
+    /// `[1m]` 后缀；其余原样透传
+    #[test]
+    fn outbound_model_prefers_mapping_and_strips_long_context_suffix() {
+        assert_eq!(outbound_model(Some("upstream-x"), "client-x"), "upstream-x");
+        assert_eq!(outbound_model(None, "claude-opus[1m]"), "claude-opus");
+        assert_eq!(outbound_model(None, "gpt-5"), "gpt-5");
+        assert_eq!(
+            outbound_model(Some("mapped"), "client[1m]"),
+            "mapped",
+            "配置了映射时以映射为准"
+        );
+        assert_eq!(outbound_model(None, "m[1m][1m]"), "m[1m]", "只剥一个后缀");
+    }
 }

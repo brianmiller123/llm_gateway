@@ -1408,13 +1408,10 @@ async fn proxy_authed_inner(
         )));
     }
     // P1-20：Claude Code 长上下文 `[1m]` 后缀剥离（路由未配置映射时防上游
-    // 404/400；cc-switch model_mapper.rs:163-186 同款）
-    let outbound_model: String = route.upstream_model.clone().unwrap_or_else(|| {
-        model
-            .strip_suffix("[1m]")
-            .map(str::to_string)
-            .unwrap_or_else(|| model.clone())
-    });
+    // 404/400；cc-switch model_mapper.rs:163-186 同款）。推导与 /v1/models
+    // 共用 routing::outbound_model
+    let outbound_model =
+        crate::service::routing::outbound_model(route.upstream_model.as_deref(), &model);
     // 模型库启停：模型库记录的是上游侧模型名，按出站模型名剔除已禁用的
     // (供应商, 模型) 候选——主上游被禁则走降级链，全部被禁显式 503
     let candidates = {
